@@ -897,8 +897,24 @@ def test_jinja_skips_an_unbalanced_call_without_losing_the_rest():
 
 
 def test_jinja_reads_a_keyword_argument_as_unread():
+    # A keyword argument is left out of args.
     (call,) = jinja_calls("{{ config(materialized='view') }}")
-    assert call.args == (None,)
+    assert call.args == ()
+
+
+@pytest.mark.parametrize(
+    "template,args",
+    [
+        ("{{ ref('dim_orders', v=1) }}", ("dim_orders",)),
+        ("{{ ref('dim_orders', version=1) }}", ("dim_orders",)),
+        ("{{ ref('dim_orders', v = 1) }}", ("dim_orders",)),
+        ("{{ ref('dim_orders', version = 1) }}", ("dim_orders",)),
+        ("{{ ref('pkg', 'dim_orders', version=2) }}", ("pkg", "dim_orders")),
+        ("{{ ref(var('x')) }}", (None,)),
+    ],
+)
+def test_jinja_drops_a_keyword_argument_and_keeps_the_positional_name(template, args):
+    assert jinja_calls(template)[0].args == args
 
 
 def test_jinja_regions_returns_a_region_that_calls_nothing():

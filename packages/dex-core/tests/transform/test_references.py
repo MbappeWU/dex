@@ -203,6 +203,33 @@ def test_the_report_states_whether_it_believes_itself_complete(project):
 # --- resolution edges ------------------------------------------------------------
 
 
+def test_a_version_keyword_on_ref_resolves_to_the_model(project):
+    """`ref('model', v=1)` resolves to the model. The version keyword sits
+    beside the name."""
+
+    _write(
+        project / "models" / "uses_version.sql",
+        "select * from {{ ref('stg_departments', v=1) }}\n"
+        "union all\n"
+        "select * from {{ ref('stg_departments', version=1) }}\n",
+    )
+    index = ReferenceIndex(load(project))
+    hits, _limits = index.references_to("stg_departments", "model")
+    assert {
+        (hit.path, hit.line, hit.form)
+        for hit in hits
+        if hit.path == "models/uses_version.sql"
+    } == {
+        ("models/uses_version.sql", 1, "ref_call"),
+        ("models/uses_version.sql", 3, "ref_call"),
+    }
+    assert [
+        item
+        for item in index.indeterminate_for("model")
+        if item.path == "models/uses_version.sql"
+    ] == []
+
+
 def test_a_two_argument_ref_resolves_to_the_model_not_the_package(tmp_path, project):
     _write(
         project / "models" / "uses_package.sql",

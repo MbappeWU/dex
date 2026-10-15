@@ -757,16 +757,19 @@ _JINJA_COMMENT = re.compile(r"\{#.*?#\}", re.DOTALL)
 _JINJA_REGION = re.compile(r"\{\{(.*?)\}\}|\{%(.*?)%\}", re.DOTALL)
 _CALL_START = re.compile(r"(?<![A-Za-z0-9_.])([A-Za-z_][A-Za-z0-9_.]*)\s*\(")
 _QUOTED_ARG = re.compile(r"^(['\"])([^'\"]*)\1$")
+# `==` is a comparison, not a keyword argument.
+_KEYWORD_ARG = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\s*=(?!=)")
 
 
 class JinjaCall(BaseModel):
     """One call written inside a jinja region, with its arguments as read.
 
     An ``args`` entry is the literal string dex read, or ``None`` where the
-    argument was anything else: a variable, a concatenation, a nested call, a
-    keyword form. ``None`` means *dex did not resolve this*, never *there is
-    nothing here*, and every consumer has to keep that distinction: collapsing
-    the two is how a reference silently goes missing.
+    argument was anything else: a variable, a concatenation, or a nested call.
+    A keyword form is dropped from ``args`` rather than recorded as ``None``.
+    ``None`` means *dex did not resolve this*, never *there is nothing here*,
+    and every consumer has to keep that distinction: collapsing the two is how
+    a reference silently goes missing.
 
     Nested calls are reported in their own right, so ``{{ ref(var('x')) }}``
     yields both the resolved ``var('x')`` and the unresolved ``ref``. Reporting
@@ -927,26 +930,38 @@ def _split_args(inner: str, masked_inner: str, base: int) -> tuple[_Argument, ..
     args: list[_Argument] = []
     depth = 0
     start = 0
+
+    def append(end: int) -> None:
+        parsed = _literal(inner[start:end], base + start)
+        if parsed is not None:
+            args.append(parsed)
+
     for index, char in enumerate(masked_inner):
         if char in "([{":
             depth += 1
         elif char in ")]}":
             depth -= 1
         elif char == "," and depth == 0:
-            args.append(_literal(inner[start:index], base + start))
+            append(index)
             start = index + 1
-    args.append(_literal(inner[start:], base + start))
+    append(len(inner))
     return tuple(args)
 
 
-def _literal(text: str, base: int) -> _Argument:
+def _literal(text: str, base: int) -> _Argument | None:
     """One argument's literal value and the span of its contents, or two ``None``.
 
-    The span covers what is *between* the quotes, so a rewriter replaces the
-    name and leaves the quoting style the author chose alone.
+    Returns ``None`` for a keyword argument (``identifier=...``, optional
+    whitespace around ``=``), which is dropped from ``args`` rather than
+    recorded as an unread value. The span covers what is *between* the quotes,
+    so a rewriter replaces the name and leaves the quoting style the author
+    chose alone.
     """
 
-    quoted = _QUOTED_ARG.match(text.strip())
+    stripped = text.strip()
+    if _KEYWORD_ARG.match(stripped):
+        return None
+    quoted = _QUOTED_ARG.match(stripped)
     if quoted is None:
         return None, None
     offset = base + len(text) - len(text.lstrip())
