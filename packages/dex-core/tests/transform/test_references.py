@@ -496,6 +496,157 @@ def test_names_dbt_resolves_without_an_editable_file_are_declared_not_defined(pr
     assert index.definitions_of("dept_count", "measure") == []
 
 
+def test_a_yaml_snapshot_relation_is_an_occurrence(tmp_path):
+    """A dbt 1.9 snapshot's `relation:` names a source or a model.
+
+    The key is also what declares the snapshot. Recording only the declaration
+    drops the relation, so a query for `raw.orders` never sees this file.
+    """
+
+    root = tmp_path / "analytics"
+    _write(
+        root / "dbt_project.yml",
+        'name: analytics\nversion: "1.0.0"\nprofile: analytics\n',
+    )
+    _write(root / "models" / "stg_departments.sql", "select 1 as id\n")
+    _write(
+        root / "snapshots" / "snapshots.yml",
+        "snapshots:\n"
+        "  - name: orders_snapshot\n"
+        "    relation: source('raw', 'orders')\n"
+        "  - name: dept_snapshot\n"
+        "    relation: ref('stg_departments')\n",
+    )
+    index = ReferenceIndex(load(root))
+
+    sources, _limits = index.references_to("raw.orders", "source")
+    assert [(hit.path, hit.line, hit.form, hit.kind) for hit in sources] == [
+        ("snapshots/snapshots.yml", 3, "yaml_snapshot_relation", "source")
+    ]
+    relation = [
+        hit
+        for hit in index.references_to("stg_departments", "model")[0]
+        if hit.form == "yaml_snapshot_relation"
+    ]
+    assert [(hit.path, hit.line, hit.kind) for hit in relation] == [
+        ("snapshots/snapshots.yml", 5, "model")
+    ]
+
+
+def test_a_python_model_lists_its_ref_and_source_reads(tmp_path):
+    """Literal `dbt.ref` and `dbt.source` calls are occurrences.
+
+    A comment and a string that look like calls are not. When every call is a
+    literal, a model query can still call itself complete.
+    """
+
+    root = tmp_path / "analytics"
+    _write(
+        root / "dbt_project.yml",
+        'name: analytics\nversion: "1.0.0"\nprofile: analytics\n',
+    )
+    _write(root / "models" / "stg_orders.sql", "select 1 as id\n")
+    _write(root / "seeds" / "country_codes.csv", "code\nIT\n")
+    _write(
+        root / "models" / "py_orders.py",
+        "def model(dbt, session):\n"
+        "    # dbt.ref('ghost')\n"
+        "    note = \"dbt.source('raw', 'ghost')\"\n"
+        '    orders = dbt.ref("stg_orders")\n'
+        "    raw = dbt.source('raw', 'orders')\n"
+        "    packaged = dbt.ref('utils', \"stg_orders\")\n"
+        "    codes = dbt.ref('country_codes')\n"
+        "    return orders\n",
+    )
+    index = ReferenceIndex(load(root))
+
+    python_refs = [
+        hit
+        for hit in index.references_to("stg_orders", "model")[0]
+        if hit.form == "python_ref"
+    ]
+    assert [(hit.path, hit.line, hit.qualifier) for hit in python_refs] == [
+        ("models/py_orders.py", 4, None),
+        ("models/py_orders.py", 6, "utils"),
+    ]
+    sources, _limits = index.references_to("raw.orders", "source")
+    assert [(hit.path, hit.line, hit.form) for hit in sources] == [
+        ("models/py_orders.py", 5, "python_source")
+    ]
+    seeds, _limits = index.references_to("country_codes", "seed")
+    assert [(hit.path, hit.line, hit.form, hit.kind) for hit in seeds] == [
+        ("seeds/country_codes.csv", 1, "definition", "seed"),
+        ("models/py_orders.py", 7, "python_ref", "seed"),
+    ]
+    assert index.references_to("ghost", "model")[0] == []
+    assert index.references_to("raw.ghost", "source")[0] == []
+    assert index.parents_of("py_orders") == {"stg_orders", "country_codes"}
+
+    report = find_references(load(root), ["stg_orders"], kind="model")
+    assert report.completeness == "complete"
+    assert report.limits == []
+
+
+def test_an_unresolved_python_ref_makes_model_queries_incomplete(tmp_path):
+    root = tmp_path / "analytics"
+    _write(
+        root / "dbt_project.yml",
+        'name: analytics\nversion: "1.0.0"\nprofile: analytics\n',
+    )
+    _write(root / "models" / "stg_orders.sql", "select 1 as id\n")
+    _write(
+        root / "models" / "py_orders.py",
+        "def model(dbt, session):\n    return dbt.ref(model_name)\n",
+    )
+    index = ReferenceIndex(load(root))
+
+    unresolved = index.indeterminate_for("model")
+    assert [(hit.path, hit.line, hit.form, hit.name) for hit in unresolved] == [
+        ("models/py_orders.py", 2, "python_ref", None)
+    ]
+    report = find_references(load(root), ["stg_orders"], kind="model")
+    assert report.completeness == "incomplete"
+    assert any("could not be resolved" in limit for limit in report.limits)
+
+
+def test_an_unparsed_python_model_limits_relation_queries(tmp_path):
+    """A Python model dex cannot parse may hide a ref or a source.
+
+    Model, source, seed, and snapshot queries say so. A var query did not miss
+    a read by skipping the file, and stays complete.
+    """
+
+    root = tmp_path / "analytics"
+    _write(
+        root / "dbt_project.yml",
+        'name: analytics\nversion: "1.0.0"\nprofile: analytics\n',
+    )
+    _write(root / "models" / "stg_orders.sql", "select 1 as id\n")
+    _write(
+        root / "models" / "py_orders.py",
+        "def model(dbt, session)\n    return dbt.ref('stg_orders')\n",
+    )
+    view = load(root)
+
+    models = find_references(view, ["stg_orders"], kind="model")
+    sources = find_references(view, ["raw.orders"], kind="source")
+    seeds = find_references(view, ["country_codes"], kind="seed")
+    snapshots = find_references(view, ["orders_snapshot"], kind="snapshot")
+    variables = find_references(view, ["using_department"], kind="var")
+    assert models.completeness == "incomplete"
+    assert sources.completeness == "incomplete"
+    assert seeds.completeness == "incomplete"
+    assert snapshots.completeness == "incomplete"
+    assert any(
+        "models/py_orders.py" in limit and "could not be parsed" in limit
+        for limit in models.limits
+    )
+    assert variables.completeness == "complete"
+    assert variables.limits == []
+    hits, _limits = ReferenceIndex(view).references_to("stg_orders", "model")
+    assert {hit.form for hit in hits} == {"definition"}
+
+
 def test_a_python_model_in_a_package_is_declared_by_that_package(project):
     _write(
         project / "dbt_packages" / "utils" / "models" / "py_util.py",

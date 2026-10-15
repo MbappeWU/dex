@@ -27,6 +27,7 @@ absence becomes a stated limit rather than a refusal.
 
 from __future__ import annotations
 
+import ast
 import csv
 from collections import defaultdict, deque
 from io import StringIO
@@ -140,6 +141,11 @@ class ReferenceIndex:
     def __init__(self, view: DbtProjectView, *, scan_packages: bool = True) -> None:
         self.view = view
         self.limits: list[str] = []
+        #: Python models whose text dex could not read. ``dbt.ref`` reaches a
+        #: model, seed, or snapshot, and ``dbt.source`` reaches a source, so
+        #: those queries name the file as a limit. A var query did not miss a
+        #: read by skipping the file.
+        self._python_unread: list[str] = []
         self._by_name: dict[tuple[str, str], list[Reference]] = defaultdict(list)
         self._indeterminate: list[Reference] = []
         self._model_refs: dict[str, set[str]] = defaultdict(set)
@@ -200,7 +206,9 @@ class ReferenceIndex:
         """
 
         if kind != "column":
-            return list(self._by_name.get((kind, name), [])), []
+            return list(self._by_name.get((kind, name), [])), self._python_query_limits(
+                kind
+            )
 
         query_limits = (
             [
@@ -405,24 +413,114 @@ class ReferenceIndex:
                 self._scan_sql(source.content, path, node_kinds, package=package)
             elif family == "seed" and path.endswith(".csv"):
                 self._scan_seed_header(source.content, path, package=package)
-        # dbt builds a Python model and `ref()` reaches it, but the loader reads
-        # SQL models only, so the name is taken from the file on disk and its
-        # content is never read.
+        # The loader reads SQL only, so a Python model's name comes from the
+        # file on disk. `dbt.ref` and `dbt.source` in that file are reads of
+        # other nodes and are indexed here. The model itself stays a
+        # declaration, because dex does not edit `.py`.
         root = Path(view.root)
         for model_path in view.model_paths:
             for python in sorted((root / model_path).rglob("*.py")):
-                self._declared[("model", python.stem)].append(
-                    Reference(
-                        path=f"{prefix}{python.relative_to(root).as_posix()}",
-                        line=1,
-                        form="python_model",
-                        kind="model",
-                        name=python.stem,
-                        package=package,
-                    )
+                self._scan_python_model(
+                    python,
+                    root=root,
+                    prefix=prefix,
+                    package=package,
+                    node_kinds=node_kinds,
                 )
         self._scan_yaml(view, node_kinds, package=package, prefix=prefix)
         self._scan_project_vars(view, package=package, prefix=prefix)
+
+    def _python_query_limits(self, kind: str) -> list[str]:
+        if kind not in ("model", "source", "seed", "snapshot"):
+            return []
+        return list(self._python_unread)
+
+    def _scan_python_model(
+        self,
+        python: Path,
+        *,
+        root: Path,
+        prefix: str,
+        package: str | None,
+        node_kinds: dict[str, str],
+    ) -> None:
+        path = f"{prefix}{python.relative_to(root).as_posix()}"
+        self._declared[("model", python.stem)].append(
+            Reference(
+                path=path,
+                line=1,
+                form="python_model",
+                kind="model",
+                name=python.stem,
+                package=package,
+            )
+        )
+        try:
+            content = python.read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            self._python_unread.append(
+                f"{path}: the Python model could not be read, so its ref() and "
+                "source() calls were not read"
+            )
+            return
+        calls = _python_relation_calls(content)
+        if calls is None:
+            self._python_unread.append(
+                f"{path}: the Python model could not be parsed, so its ref() and "
+                "source() calls were not read"
+            )
+            return
+        for callee, line, args in calls:
+            self._record_python_relation(
+                callee, line, args, path, node_kinds, package=package
+            )
+
+    def _record_python_relation(
+        self,
+        callee: str,
+        line: int,
+        args: tuple[str | None, ...],
+        path: str,
+        node_kinds: dict[str, str],
+        *,
+        package: str | None,
+    ) -> None:
+        """One ``dbt.ref`` or ``dbt.source`` call, recorded like a jinja call.
+
+        The last argument names the relation, which is the same rule
+        ``_record_call`` uses for ``ref('pkg', 'model')``. An argument that is
+        not a string literal leaves the call unresolved rather than dropped.
+        """
+
+        if callee == "ref":
+            target = args[-1] if args else None
+            self._record(
+                Reference(
+                    path=path,
+                    line=line,
+                    form="python_ref",
+                    kind=node_kinds.get(target or "", "model"),
+                    name=target,
+                    resolution=RESOLVED if target else INDETERMINATE,
+                    package=package,
+                    qualifier=args[0] if target and len(args) > 1 else None,
+                )
+            )
+            if target and node_name(path) != target:
+                self._model_refs[node_name(path)].add(target)
+            return
+        resolved = len(args) >= 2 and None not in args[-2:]
+        self._record(
+            Reference(
+                path=path,
+                line=line,
+                form="python_source",
+                kind="source",
+                name=f"{args[-2]}.{args[-1]}" if resolved else None,
+                resolution=RESOLVED if resolved else INDETERMINATE,
+                package=package,
+            )
+        )
 
     @staticmethod
     def _node_kind(view: DbtProjectView, path: str) -> str:
@@ -711,6 +809,10 @@ class ReferenceIndex:
                                 package=package,
                             )
                         )
+                        if marker == "relation":
+                            self._record_snapshot_relation(
+                                entry, path, lines, package=package
+                            )
         parsed_paths = {raw_path for _parsed, raw_path in documents}
         for raw_path in sorted(view.files):
             if raw_path in parsed_paths or not raw_path.endswith((".yml", ".yaml")):
@@ -727,6 +829,36 @@ class ReferenceIndex:
                 self._scan_semantic_model(entry, path, lines, package=package)
             else:
                 self._scan_metric(entry, path, lines, package=package)
+
+    def _record_snapshot_relation(
+        self,
+        entry: dict[str, Any],
+        path: str,
+        lines: _ScalarLines,
+        *,
+        package: str | None,
+    ) -> None:
+        """A dbt 1.9 snapshot's ``relation:`` as a source or model read.
+
+        The key is also what makes the YAML entry a declaration. Recording only
+        that declaration drops the relation the snapshot is built from, so a
+        query for the source or model it names never sees this file.
+        """
+
+        relation = entry.get("relation")
+        target = _relation_from(relation)
+        if target is None:
+            return
+        self._record(
+            Reference(
+                path=path,
+                line=lines.peek(relation if isinstance(relation, str) else None),
+                form="yaml_snapshot_relation",
+                kind="source" if "." in target else "model",
+                name=target,
+                package=package,
+            )
+        )
 
     def _scan_model_entry(
         self,
@@ -1181,6 +1313,46 @@ def _tests_of(entry: dict[str, Any]) -> list[Any]:
 
 def _dicts(value: Any) -> list[dict[str, Any]]:
     return [item for item in (value or []) if isinstance(item, dict)]
+
+
+def _python_relation_calls(
+    content: str,
+) -> list[tuple[str, int, tuple[str | None, ...]]] | None:
+    """``dbt.ref`` and ``dbt.source`` calls in one Python model.
+
+    Each argument is the string literal dex read, or ``None`` when the argument
+    is anything else. ``None`` for the whole list means the file did not parse,
+    which is a different fact from a file that parses and names nothing.
+    """
+
+    try:
+        tree = ast.parse(content)
+    except SyntaxError:
+        return None
+    found: list[tuple[int, int, str, tuple[str | None, ...]]] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if not (
+            isinstance(func, ast.Attribute)
+            and isinstance(func.value, ast.Name)
+            and func.value.id == "dbt"
+            and func.attr in ("ref", "source")
+        ):
+            continue
+        if node.keywords:
+            args: tuple[str | None, ...] = (None,)
+        else:
+            args = tuple(
+                arg.value
+                if isinstance(arg, ast.Constant) and isinstance(arg.value, str)
+                else None
+                for arg in node.args
+            )
+        found.append((node.lineno, node.col_offset, func.attr, args))
+    found.sort()
+    return [(callee, line, args) for line, _col, callee, args in found]
 
 
 def _relation_from(value: Any) -> str | None:
