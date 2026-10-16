@@ -1244,6 +1244,21 @@ def _judge(checks, counts: dict[str, int], counted: set[str] | None = None):
     return verify_mod.row_population_findings(checks, keyed, measured)
 
 
+def _population_text(checks, plan_notes, present: dict[str, int]) -> str:
+    """The sentences a reader sees, plan notes and the count pass together.
+
+    Relations the plan named that are not in ``present`` are absent, which is
+    what ``relation_counts`` reports for an object the warehouse does not have.
+    """
+
+    keyed = {f"{WAREHOUSE}.{name}": rows for name, rows in present.items()}
+    absent = {rel for check in checks for rel in check.relations} - set(keyed)
+    _findings, finding_notes = verify_mod.row_population_findings(
+        checks, keyed, set(keyed), absent
+    )
+    return " ".join([*plan_notes, *finding_notes])
+
+
 def test_an_inner_join_that_loses_a_fifth_of_the_rows_is_reported(tmp_path: Path):
     """#226's first acceptance bullet, in the shape a dbt model actually
     compiles to: the driving parent is behind two CTEs, and the join that
@@ -1489,6 +1504,29 @@ def test_unparseable_compiled_sql_becomes_a_note_not_an_exception(tmp_path: Path
     checks, notes = _plan(tmp_path, {"m.1": _model("broken", "select from from")})
     assert checks == []
     assert "broken" in notes[0]
+
+
+def test_a_model_generated_in_sql_names_no_empty_parent(tmp_path: Path):
+    """#650: a MetricFlow time spine is ``select ... from range(...)``. That
+    generates its rows in SQL and has no parent relation, so the report must
+    not claim one was built at an empty name."""
+
+    checks, notes = _plan(
+        tmp_path,
+        {
+            "m.spine": _model(
+                "metricflow_time_spine",
+                "select cast(range as date) as date_day "
+                "from range(date '2020-01-01', date '2030-01-01', interval 1 day)",
+            )
+        },
+    )
+    text = _population_text(checks, notes, {"metricflow_time_spine": 3652})
+    assert text == (
+        "row population was not compared for metricflow_time_spine "
+        "(generated in SQL; no parent relation to compare against)"
+    )
+    assert checks == []
 
 
 def test_a_parent_with_no_row_count_is_named_rather_than_dropped(tmp_path: Path):
