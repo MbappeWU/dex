@@ -193,11 +193,6 @@ def test_a_shape_gated_cast_never_reaches_a_non_numeric_value(tmp_path: Path):
 
 
 def test_type_contradiction_note_carries_no_raw_value(tmp_path: Path):
-    """#204: the concrete epoch integer, and the concrete date-shaped string,
-    must never reach the generated data-quality note text -- only the
-    fraction, the format/unit name, and (for epoch) the *translated* calendar
-    date, which is derived from an aggregate MIN/MAX, not a row value."""
-
     import duckdb
 
     from exmergo_dex_core.explore.profile import profile
@@ -218,13 +213,14 @@ def test_type_contradiction_note_carries_no_raw_value(tmp_path: Path):
         adapter.close()
 
     notes = " ".join(dataset.data_quality)
-    assert "epoch" in notes.lower()
+    assert "unix-epoch-seconds" in notes
+    assert "100%" in notes
+    assert "implied date range" not in notes
     for i in range(50):
         assert str(1_700_000_000 + i) not in notes, (
             "no concrete epoch value may appear in note text"
         )
-    # The translated calendar date is what appears, not the integer.
-    assert "2023-11-14" in notes
+    assert "2023-11-14" not in notes
 
 
 def test_heterogeneous_key_note_carries_no_raw_value(tmp_path: Path):

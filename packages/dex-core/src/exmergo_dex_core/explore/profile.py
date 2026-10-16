@@ -542,10 +542,9 @@ def _type_contradiction_notes(
 ) -> list[str]:
     """Data-quality notes for a declared type that contradicts its column's
     content (#204): a string holding dates/timestamps, epoch-shaped numbers,
-    or numeric-only text. Fractions, pattern/format names, and (for epoch) a
-    translated calendar date only -- never a raw value. Fail closed: a
-    missing fraction (not requested, ineligible type, PII-flagged, or the
-    dialect could not) yields no note for that detector.
+    or numeric-only text. Fractions and pattern or format names only. Fail
+    closed: a missing fraction (not requested, ineligible type, PII-flagged,
+    or the dialect could not) yields no note for that detector.
     """
 
     if agg is None:
@@ -653,15 +652,11 @@ def _epoch_note(col_name: str, data_type: str, agg: ColumnAggregate) -> str | No
         unit, fraction = "milliseconds", millis
         lo, hi = agg.epoch_millis_min_value, agg.epoch_millis_max_value
     if lo is None or hi is None:
-        return None  # evidence incomplete: fail closed, no unverifiable claim
+        return None
 
-    divisor = 1000 if unit == "milliseconds" else 1
-    lo_date = datetime.fromtimestamp(lo / divisor, tz=UTC).date().isoformat()
-    hi_date = datetime.fromtimestamp(hi / divisor, tz=UTC).date().isoformat()
     return (
         f"{col_name} is declared {data_type} but {fraction:.0%} of values fall "
-        f"in the plausible unix-epoch-{unit} range; implied date range "
-        f"{lo_date} to {hi_date}"
+        f"in the plausible unix-epoch-{unit} range"
     )
 
 
@@ -767,18 +762,17 @@ def _boolean_shaped_flag_note(
     values -- a mixed-encoding defect invisible to anyone who does not ask for
     the domain (issue #218). Firing does not require telling a data-quality
     defect apart from a genuine third state; the tool cannot make that call,
-    and naming the count (and the values, when known) is what lets the caller
-    make it instead.
+    and naming the count is what lets the caller make it instead.
 
     A genuinely ``BOOLEAN``-typed column can only ever hold two values (plus
     null) by construction and is excluded outright, whatever its name.
 
-    Where the value domain (#203) is available, the note names the
-    encodings and their counts. Where it is not, because the column failed
-    one of that feature's own eligibility gates (PII-flagged, a candidate
-    key, or too many distinct values to report), the note still fires on the
-    count alone: the tool not being able to name the values is not evidence
-    there are only two of them.
+    The note never embeds encodings or cell values (issue #572): ``explore map``
+    copies these notes, and the map contract forbids column values. Callers who
+    need the encodings read ``explore profile``, where the value domain lives.
+    When the domain is available it still supplies the distinct count; when it
+    is not (PII-flagged, candidate key, or too many distinct values), the
+    aggregate count is used instead, with ``~`` when approximate.
     """
 
     if not _BOOLEAN_NAME.search(_normalize(col_name)):
@@ -788,21 +782,15 @@ def _boolean_shaped_flag_note(
     if agg is None or agg.distinct_count is None or agg.distinct_count <= 2:
         return None
 
-    if domain is not None and domain.values:
-        total = len(domain.values) + domain.elided
-        encodings = ", ".join(f"{v.value}={v.count}" for v in domain.values)
-        if domain.elided:
-            encodings += f", +{domain.elided} more"
-        return (
-            f"{col_name} looks boolean-shaped by name but holds {total} "
-            f"distinct non-null values: {encodings}; a two-valued read of "
-            "it will misclassify some rows"
-        )
-    marker = "" if agg.distinct_count_exact else "~"
+    if domain is not None and (domain.values or domain.elided):
+        count = str(len(domain.values) + domain.elided)
+    else:
+        marker = "" if agg.distinct_count_exact else "~"
+        count = f"{marker}{agg.distinct_count}"
     return (
-        f"{col_name} looks boolean-shaped by name but holds "
-        f"{marker}{agg.distinct_count} distinct non-null values; a "
-        "two-valued read of it will misclassify some rows"
+        f"{col_name} looks boolean-shaped by name but holds {count} "
+        "distinct non-null values; a two-valued read of it will misclassify "
+        "some rows; see `explore profile`"
     )
 
 

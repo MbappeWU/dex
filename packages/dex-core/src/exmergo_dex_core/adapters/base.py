@@ -89,9 +89,9 @@ class ColumnAggregate:
     avg_token_count: float | None = None
     #: Declared-type-vs-content statistics, computed only for columns the
     #: engine requested via ``type_stats`` (non-PII string/integer columns).
-    #: Fractions and (for epoch) an exact min/max used only to translate into
-    #: a calendar date; never a raw value. ``None`` means not computed (not
-    #: requested, ineligible type, or the dialect could not).
+    #: Fractions, and for epoch the min and max of the values inside the
+    #: epoch window. ``None`` means not computed (not requested, ineligible
+    #: type, or the dialect could not).
     numeric_string_fraction: float | None = None
     integer_string_fraction: float | None = None
     iso_date_fraction: float | None = None
@@ -648,8 +648,8 @@ def type_contradiction_expressions(
     the CASE-returns-NULL trick belongs: it carries a string, so it can raise
     nothing.
 
-    Only fractions and translated-to-date integers (read back and converted to
-    a calendar date by the caller) ever leave the engine through this path.
+    Only fractions and epoch bound integers ever leave the adapter through
+    this path.
     ``qcol`` must already be quoted/escaped by the calling adapter. Returns
     ``[]`` for a column that is neither string- nor integer-typed (nothing to
     check).

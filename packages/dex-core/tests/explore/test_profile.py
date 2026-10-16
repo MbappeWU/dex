@@ -1221,10 +1221,7 @@ def test_the_hex_floor_relabels_short_hex_and_never_hides_a_numeric_mix_real_duc
 # --- boolean-shaped flag with more than two values (#218) ----------------------
 
 
-def test_boolean_shaped_flag_note_names_the_domain_when_known():
-    """The issue's own worked example: a *_yn column with five values, named
-    with counts once the domain (#203) is known."""
-
+def test_boolean_shaped_flag_note_counts_without_naming_values():
     from exmergo_dex_core.cache import ValueCount, ValueDomain
     from exmergo_dex_core.explore.profile import _boolean_shaped_flag_note
 
@@ -1239,9 +1236,13 @@ def test_boolean_shaped_flag_note_names_the_domain_when_known():
         ]
     )
     note = _boolean_shaped_flag_note("primary_ws_yn", "VARCHAR", agg, domain)
-    assert note is not None
-    assert "primary_ws_yn" in note and "5 distinct non-null values" in note
-    assert "Y=40" in note and "No=8" in note
+    assert note == (
+        "primary_ws_yn looks boolean-shaped by name but holds 5 distinct "
+        "non-null values; a two-valued read of it will misclassify some rows; "
+        "see `explore profile`"
+    )
+    for token in ("Y=40", "N=38", "Yes=10", "No=8", "1=4"):
+        assert token not in note
 
 
 @pytest.mark.parametrize(
@@ -1309,6 +1310,9 @@ def test_boolean_shaped_flag_note_decisions(
     note = _boolean_shaped_flag_note(col_name, data_type, agg, None)
     if expect_note:
         assert note is not None and col_name in note
+        assert "`explore profile`" in note
+        if agg_kwargs.get("distinct_count_exact") is False:
+            assert note is not None and "~" in note
     else:
         assert note is None
 
@@ -1321,7 +1325,7 @@ def test_boolean_shaped_flag_note_absent_without_aggregate():
 
 def test_boolean_shaped_flag_end_to_end_real_duckdb(tmp_path: Path):
     """The issue's own four acceptance scenarios, in one table: a *_yn column
-    with five values names them; a clean two-value flag and a genuinely
+    with five values reports the count; a clean two-value flag and a genuinely
     BOOLEAN column stay silent; a three-valued flag still fires."""
 
     import duckdb
@@ -1354,11 +1358,22 @@ def test_boolean_shaped_flag_end_to_end_real_duckdb(tmp_path: Path):
     notes = " ".join(dataset.data_quality)
     assert "primary_ws_yn looks boolean-shaped by name" in notes
     assert "5 distinct non-null values" in notes
-    assert "Y=" in notes and "Yes=" in notes
     assert "onboarding_stage_flag looks boolean-shaped by name" in notes
     assert "3 distinct non-null values" in notes
+    assert "`explore profile`" in notes
+    for token in ("Y=", "Yes=", "No=", "1=", "new=", "active=", "churned="):
+        assert token not in notes
     assert "has_discount" not in notes
     assert "is_native_bool" not in notes
+    yn = next(column for column in dataset.columns if column.name == "primary_ws_yn")
+    assert yn.value_domain is not None
+    assert {item.value for item in yn.value_domain.values} == {
+        "Y",
+        "N",
+        "Yes",
+        "No",
+        "1",
+    }
 
 
 # --- pii_overrides: the durable human decision ---------------------------------

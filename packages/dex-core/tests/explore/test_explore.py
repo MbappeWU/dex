@@ -695,6 +695,33 @@ def test_map_reports_a_profiled_object_that_joins_to_nothing(tmp_path: Path, cap
     )
 
 
+def test_map_data_quality_notes_omit_flag_encodings(tmp_path: Path):
+    import duckdb
+
+    from exmergo_dex_core import DexEngine
+
+    warehouse = tmp_path / "flags.duckdb"
+    conn = duckdb.connect(str(warehouse))
+    conn.execute("CREATE TABLE flags (is_active VARCHAR)")
+    conn.executemany(
+        "INSERT INTO flags VALUES (?)",
+        [("Y",), ("N",), ("yes",)] * 40,
+    )
+    conn.close()
+
+    with DexEngine(connector="duckdb", path=str(warehouse)) as engine:
+        mapped = engine.map()
+
+    notes = [note for obj in mapped.objects for note in obj.data_quality]
+    blob = " ".join(notes)
+    for token in ("Y=", "N=", "yes=", "Y=40", "N=40"):
+        assert token not in blob, notes
+    assert "yes=40" not in blob
+    assert any("is_active looks boolean-shaped by name" in note for note in notes)
+    assert any("3 distinct non-null values" in note for note in notes)
+    assert any("`explore profile`" in note for note in notes)
+
+
 def test_map_payload_carries_no_column_value(duckdb_file: Path, tmp_path: Path, capsys):
     """The cache holds min/max and value domains for the columns that earned them.
     This command deliberately does not read them; `explore profile` is where a
