@@ -324,6 +324,76 @@ def test_cap_columnar_cell_truncation():
     assert data["cells"][0][0] == "abc..."
 
 
+def test_cap_columnar_notes_when_truncated_by_source():
+    # Adapter already returned exactly max_rows with truncated=True; the engine-cap
+    # hint must still land in notes (plain explore query already says this).
+    cells = [[i] for i in range(50)]
+    data = cap_columnar(
+        ["a"],
+        ["int"],
+        cells,
+        max_rows=50,
+        max_cell_chars=256,
+        max_payload_bytes=100_000,
+        truncated_by_source=True,
+    )
+    assert data["row_count"] == 50
+    assert data["truncated"] is True
+    assert data["cells"] == cells
+    note = next(n for n in data["notes"] if "engine cap" in n)
+    assert "truncated to 50 rows" in note
+    assert "query.max_rows" in note
+
+
+def test_semantic_query_warns_when_limit_exceeds_max_rows(monkeypatch):
+    from exmergo_dex_core.explore.semantic.commands import semantic_query
+
+    cells = [[i] for i in range(50)]
+
+    class _Backend:
+        def query(self, q):
+            assert q.limit == 200
+            return SemanticQueryResult(
+                backend="local",
+                columns=["a"],
+                types=["int"],
+                cells=cells,
+                row_count=50,
+                truncated=True,
+            )
+
+    monkeypatch.setattr(sem, "resolve_backend", lambda *a, **k: _Backend())
+    result = semantic_query(_engine(), ["sessions"], limit=200, local=True)
+    assert result.row_count == 50
+    assert result.cells == cells
+    warning = next(w for w in result.warnings if "exceeds query.max_rows" in w)
+    assert "--limit 200" in warning
+    assert "(50)" in warning
+    assert "capped at 50" in warning
+    assert "query.max_rows" in warning
+    assert ".dex/config.yml" in warning
+
+
+def test_semantic_query_no_warning_when_limit_within_max_rows(monkeypatch):
+    from exmergo_dex_core.explore.semantic.commands import semantic_query
+
+    class _Backend:
+        def query(self, q):
+            return SemanticQueryResult(
+                backend="local",
+                columns=["a"],
+                types=["int"],
+                cells=[[1]],
+                row_count=1,
+                truncated=False,
+            )
+
+    monkeypatch.setattr(sem, "resolve_backend", lambda *a, **k: _Backend())
+    result = semantic_query(_engine(), ["sessions"], limit=10, local=True)
+    assert result.row_count == 1
+    assert not any("exceeds query.max_rows" in w for w in result.warnings)
+
+
 def test_resolve_backend_selection(monkeypatch):
     import exmergo_dex_core.explore.semantic.hosted as hosted_mod
     import exmergo_dex_core.explore.semantic.local as local_mod

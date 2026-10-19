@@ -334,9 +334,12 @@ def cap_columnar(
     if len(cells) > max_rows:
         cells = cells[:max_rows]
         truncated = True
+    # Row-cap disclosure matches plain `explore query`: when the adapter already
+    # returned exactly max_rows with truncated=True, len(cells) alone would miss it.
+    if truncated:
         notes.append(
-            f"result truncated to {max_rows} rows (engine cap); refine the query "
-            "or raise query.max_rows in .dex/config.yml"
+            f"result truncated to {max_rows} rows (engine cap); refine "
+            "the query, or raise query.max_rows in .dex/config.yml"
         )
 
     clipped = 0
