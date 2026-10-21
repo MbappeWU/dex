@@ -401,6 +401,45 @@ def check_references(parsed_edits: list[dict[str, Any]], view: DbtProjectView) -
         raise EditValidationError("; ".join(problems))
 
 
+def cumulative_period_agg_warnings(parsed_edits: list[dict[str, Any]]) -> list[str]:
+    """Warn when a cumulative metric omits ``period_agg``.
+
+    MetricFlow fills ``first`` when ``cumulative_type_params.period_agg`` is
+    absent. At week or month grain the metric then reports that period's first
+    day, and the schema still accepts the metric, so plan time is the signal.
+    """
+
+    warnings: list[str] = []
+    for parsed in parsed_edits:
+        if not isinstance(parsed, dict):
+            continue
+        for entry in parsed.get("metrics") or []:
+            if not isinstance(entry, dict) or not entry.get("name"):
+                continue
+            if str(entry.get("type", "")).lower() != "cumulative":
+                continue
+            params = entry.get("type_params")
+            cumulative = (
+                params.get("cumulative_type_params")
+                if isinstance(params, dict)
+                else None
+            )
+            if isinstance(cumulative, dict) and "period_agg" in cumulative:
+                value = cumulative.get("period_agg")
+                if value is not None and not (
+                    isinstance(value, str) and value.strip() == ""
+                ):
+                    continue
+            name = entry["name"]
+            warnings.append(
+                f"metric '{name}' is cumulative with no period_agg; MetricFlow "
+                "defaults to 'first', so at week or month grain it reports each "
+                "period's first day, not its last. Set period_agg: last for a "
+                "running total."
+            )
+    return warnings
+
+
 def check_removals(
     removed: Sequence[DefinitionEdit],
     edits: Sequence[tuple[str, str]],

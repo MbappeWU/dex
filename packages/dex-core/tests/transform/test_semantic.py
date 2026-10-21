@@ -581,6 +581,101 @@ def test_no_time_spine_warning_when_the_project_has_one(
     assert not any("time spine" in w for w in envelope["warnings"])
 
 
+# --- cumulative period_agg (#730) --------------------------------------------
+
+_PERIOD_AGG_WARNING = (
+    "metric 'stars_from_history' is cumulative with no period_agg; MetricFlow "
+    "defaults to 'first', so at week or month grain it reports each period's "
+    "first day, not its last. Set period_agg: last for a running total."
+)
+
+_CUMULATIVE_YAML = """\
+semantic_models:
+  - name: repo_history
+    description: Daily star counts.
+    model: ref('stg_customers')
+    defaults:
+      agg_time_dimension: signup_date
+    entities:
+      - name: repo
+        type: primary
+        expr: id
+    dimensions:
+      - name: signup_date
+        type: time
+        expr: cast('2020-01-01' as date)
+        type_params:
+          time_granularity: day
+    measures:
+      - name: stars
+        agg: sum
+        expr: id
+
+metrics:
+  - name: stars_from_history
+    label: Stars from history
+    type: cumulative
+    type_params:
+      measure: stars
+      cumulative_type_params:
+        grain_to_date: month
+{period_agg}  - name: star_events
+    label: Star events
+    type: simple
+    type_params:
+      measure: stars
+"""
+
+
+def _cumulative_yaml(*, period_agg: str | None) -> str:
+    line = f"        period_agg: {period_agg}\n" if period_agg is not None else ""
+    return _CUMULATIVE_YAML.format(period_agg=line)
+
+
+def _author_semantic(tmp_path: Path, capsys, content: str, mode: str) -> dict:
+    payload = _payload_file(tmp_path, content, name=f"{mode}-stars.json")
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "semantic",
+            mode,
+            "stars",
+            "--edits-file",
+            str(payload),
+        ],
+        capsys,
+    )
+    assert rc == 0, envelope
+    return envelope
+
+
+def test_cumulative_metric_without_period_agg_warns(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    """plan and define share `_semantic_plan`, so both name the default."""
+
+    content = _cumulative_yaml(period_agg=None)
+    for mode in ("plan", "define"):
+        envelope = _author_semantic(tmp_path, capsys, content, mode)
+        assert envelope["status"] == "ok"
+        assert _PERIOD_AGG_WARNING in envelope["warnings"]
+        assert not any(
+            "star_events" in warning and "period_agg" in warning
+            for warning in envelope["warnings"]
+        )
+
+
+def test_period_agg_set_and_a_simple_metric_do_not_warn(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    content = _cumulative_yaml(period_agg="last")
+    for mode in ("plan", "define"):
+        envelope = _author_semantic(tmp_path, capsys, content, mode)
+        assert envelope["status"] == "ok"
+        assert not any("period_agg" in warning for warning in envelope["warnings"])
+
+
 # --- the unchanged class (#109) ----------------------------------------------
 
 

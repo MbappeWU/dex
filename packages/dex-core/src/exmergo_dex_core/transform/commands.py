@@ -3745,6 +3745,7 @@ def _semantic_plan(
         removed, [(e.path, e.new_content or "") for e in edits], view
     )
     spine_warning = _semantic().time_spine_warning(view, parsed_edits)
+    period_agg_warnings = _semantic().cumulative_period_agg_warnings(parsed_edits)
 
     # Declarations render after the semantic-only checks above, because what they
     # produce is a model's properties (`schema_yml`), not a semantic definition,
@@ -3795,6 +3796,7 @@ def _semantic_plan(
         )
     if spine_warning:
         result.warnings.append(spine_warning)
+    result.warnings.extend(period_agg_warnings)
     if parse_warning:
         result.warnings.append(parse_warning)
     result.warnings.extend(parse_deprecations)

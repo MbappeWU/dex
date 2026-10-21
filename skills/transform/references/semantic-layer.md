@@ -62,6 +62,10 @@ Layered so a plan that validates will build:
 dbt cannot parse semantic models without a MetricFlow **time spine**. The engine
 warns when one is missing and defers the parse gate until one exists.
 
+A `cumulative` metric that omits `cumulative_type_params.period_agg` plans with a
+warning. MetricFlow defaults it to `first`, so at week or month grain the metric
+reports each period's first day. Set `period_agg: last` for a running total.
+
 ## Native Apache Ossie: `semantic ossie define|update|plan`
 
 Pass `--edits-file <path|->` with whole documents whose paths are listed in
