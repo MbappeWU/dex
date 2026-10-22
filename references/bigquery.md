@@ -133,6 +133,30 @@ measurement. The per-join results are identical, and `--infer-by-overlap`'s swee
 is batched the same way, which matters more there because it runs up to fifty
 probes.
 
+### What a drift sweep costs
+
+`maintain grain` and the scanning half of `maintain check` ask each table several
+things: an exact distinct count over its proven keys, a distinct count per
+composite or declared grain, one per join whose declared arity makes that side a
+key, a null-fraction survey, and, under `check`, a distinct count for the
+categorical dimensions the semantic layer reads from it. Issued separately, each
+of those paid its own 10 MB floor on the same table, so a sweep's bill tracked how
+many questions it asked rather than what they read.
+
+So a table's probes run as one statement, and the sweep floors once per table it
+scans. The statement reads no column the separate probes would not have, and the
+findings are identical. A table that owes only one probe runs it exactly as
+before. A table large enough to be profiled from a block sample keeps its null
+survey as a statement of its own, since the survey reads the sample and the
+distinct counts must read every row. Where the remaining budget cannot cover the
+combined statement, each probe runs on its own and skips or narrows with its own
+note, as it always has.
+
+Folding several *tables* into one statement would save nothing: the floor is
+charged per table a statement references, not only per statement. `maintain
+volume` runs no query at all; it reads the row counts BigQuery keeps in table
+metadata.
+
 ## Profiling behavior
 
 - Aggregates only (`COUNT`, `APPROX_COUNT_DISTINCT`, `MIN`/`MAX` on safe

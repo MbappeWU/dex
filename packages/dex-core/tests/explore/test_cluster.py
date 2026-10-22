@@ -636,13 +636,13 @@ def test_an_unrecognized_dialect_still_builds_valid_sql():
     sql, method = cluster_mod.build_sample_sql(
         "db.sch.customers",
         ["spend", "visits"],
-        dialect="trino",
+        dialect="sqlite",
         sample_rows=100,
         row_count=1000,
     )
     assert method == cluster_mod.UNRECOGNIZED_DIALECT_NOTE
     assert "SAMPLE" not in sql.upper()
-    assert_select_only(sql, dialect="trino")
+    assert_select_only(sql, dialect="sqlite")
 
 
 @requires_sklearn

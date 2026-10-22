@@ -71,6 +71,7 @@ _EXPORTS = {
     "CredentialDiscoveryError": "connect",
     "DEMO_FILENAME": "demo",
     "Dataset": "cache",
+    "DeclarationError": "transform.declarations",
     "DemoDependencyError": "demo",
     "DemoError": "demo",
     "DemoPathError": "demo",
@@ -124,6 +125,9 @@ _EXPORTS = {
     "StoreContext": "storage",
     "StoreFactory": "storage",
     "StoreRequiredError": "errors",
+    "ResultMode": "values_free",
+    "ValuesFreeCode": "values_free",
+    "ValuesFreeError": "values_free",
     "WarehouseQueryError": "errors",
     "generate_demo_warehouse": "demo",
     "render_er_mermaid": "explore.diagram",
@@ -213,6 +217,7 @@ if TYPE_CHECKING:  # what a type checker and an IDE see; never run
         ScaffoldPrerequisiteError,
         SourcesFileError,
     )
+    from .values_free import ResultMode, ValuesFreeCode, ValuesFreeError
 
 try:
     __version__ = version("exmergo-dex-core")
@@ -243,6 +248,7 @@ __all__ = [
     "CostGuardError",
     "CredentialDiscoveryError",
     "Dataset",
+    "DeclarationError",
     "DemoDependencyError",
     "DemoError",
     "DemoPathError",
@@ -277,6 +283,7 @@ __all__ = [
     "RepoRootRequiredError",
     "RequestError",
     "Result",
+    "ResultMode",
     "ScaffoldError",
     "ScaffoldPrerequisiteError",
     "ScopeError",
@@ -296,6 +303,8 @@ __all__ = [
     "StoreContext",
     "StoreFactory",
     "StoreRequiredError",
+    "ValuesFreeCode",
+    "ValuesFreeError",
     "WarehouseQueryError",
     "__version__",
     "generate_demo_warehouse",

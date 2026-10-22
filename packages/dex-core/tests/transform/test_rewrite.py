@@ -302,6 +302,30 @@ class TestColumnDeclarations:
         assert "          - not_null\n" not in out
         assert "          - accepted_values:\n              values: [1, 2]\n" in out
 
+    def test_a_block_list_item_removed_keeps_the_blank_line_after_it(self):
+        content = (
+            "version: 2\nmodels:\n  - name: orders\n    columns:\n"
+            "      - name: order_id\n"
+            "        tests:\n"
+            "          - unique\n"
+            "          - not_null\n"
+            "\n"
+            "      - name: status\n"
+        )
+
+        out = self._spliced(content, "order_id", ["unique"])
+
+        # The blank line is the separator a human put between two columns, and
+        # it belongs to what follows, the same as it does when an entry is removed.
+        assert out == (
+            "version: 2\nmodels:\n  - name: orders\n    columns:\n"
+            "      - name: order_id\n"
+            "        tests:\n"
+            "          - unique\n"
+            "\n"
+            "      - name: status\n"
+        ), out
+
     def test_a_new_column_takes_the_indent_the_file_already_uses(self):
         content = (
             "version: 2\nmodels:\n  - name: orders\n    columns:\n"
@@ -444,3 +468,161 @@ class TestOutputColumns:
 
     def test_an_alias_is_the_output_name(self):
         assert output_columns("select a as b from {{ ref('x') }}\n", "m.sql") == {"b"}
+
+
+# --- through_ctes: the list a trailing `select * from <cte>` mirrors -----------
+
+SCAFFOLDED = """with source as (
+    select * from {{ source('main', 'payments') }}
+),
+
+renamed as (
+    select
+        payment_id,
+        method,
+        checksum,
+        cast(paid_at as timestamp(6)) as paid_at
+    from source
+)
+
+select * from renamed
+"""
+
+
+class TestThroughCtes:
+    """The dbt scaffold's shape: a final star over the CTE that names the columns.
+
+    The outermost SELECT is a star, so without the option every edit is the
+    star's no-op; with it, the edit lands in the list a person edits.
+    """
+
+    @pytest.mark.parametrize(
+        ("column", "gone"),
+        [
+            ("payment_id", "        payment_id,\n"),
+            ("checksum", "        checksum,\n"),
+        ],
+    )
+    def test_removing_a_column_takes_its_own_line_and_nothing_else(self, column, gone):
+        result = unproject_column_in_sql(SCAFFOLDED, "m.sql", column, through_ctes=True)
+
+        assert result.changed == 1
+        assert result.content == SCAFFOLDED.replace(gone, "", 1)
+
+    def test_the_hand_written_cast_survives_a_neighbour_being_dropped(self):
+        """The issue's diff: dropping `checksum` reverted the cast below it."""
+
+        result = unproject_column_in_sql(
+            SCAFFOLDED, "m.sql", "checksum", through_ctes=True
+        )
+
+        assert "cast(paid_at as timestamp(6)) as paid_at" in result.content
+
+    def test_a_column_projected_through_its_own_cast_goes_whole(self):
+        """The last projection: the cast goes, and so does the comma above it."""
+
+        result = unproject_column_in_sql(
+            SCAFFOLDED, "m.sql", "paid_at", through_ctes=True
+        )
+
+        assert result.content == SCAFFOLDED.replace(
+            "        checksum,\n        cast(paid_at as timestamp(6)) as paid_at\n",
+            "        checksum\n",
+        )
+
+    @pytest.mark.parametrize(
+        ("edited", "named"),
+        [
+            ("checksum as row_checksum,", "projection 'row_checksum'"),
+            ("md5(checksum) as checksum_hash,", "projection 'checksum_hash'"),
+        ],
+    )
+    def test_a_column_read_under_another_name_is_refused_by_name(self, edited, named):
+        sql = SCAFFOLDED.replace("checksum,", edited)
+
+        with pytest.raises(RewriteError, match=named):
+            unproject_column_in_sql(sql, "m.sql", "checksum", through_ctes=True)
+
+    def test_a_column_a_filter_reads_is_refused(self):
+        sql = SCAFFOLDED.replace(
+            "    from source\n", "    from source\n    where checksum is not null\n"
+        )
+
+        with pytest.raises(RewriteError, match="where clause"):
+            unproject_column_in_sql(sql, "m.sql", "checksum", through_ctes=True)
+
+    def test_an_expression_reading_other_columns_too_is_refused(self):
+        sql = SCAFFOLDED.replace("checksum,", "coalesce(checksum, method) as checksum,")
+
+        with pytest.raises(RewriteError, match="also reads other columns"):
+            unproject_column_in_sql(sql, "m.sql", "checksum", through_ctes=True)
+
+    def test_a_literal_under_the_dropped_name_reads_nothing_and_stays(self):
+        sql = SCAFFOLDED.replace("checksum,", "'n/a' as checksum,")
+
+        result = unproject_column_in_sql(sql, "m.sql", "checksum", through_ctes=True)
+
+        assert result.changed == 0 and result.content == sql
+
+    def test_adding_a_column_appends_it_to_the_cte_list(self):
+        result = project_column_in_sql(
+            SCAFFOLDED, "m.sql", "discount", "discount", through_ctes=True
+        )
+
+        assert result.changed == 1
+        assert result.content == SCAFFOLDED.replace(
+            "as paid_at\n    from source",
+            "as paid_at,\n        discount\n    from source",
+        )
+
+    @pytest.mark.parametrize(
+        "edited",
+        ["paid_at", "cast(paid_at as timestamp(6)) as paid_at", "paid_at as paid_on"],
+    )
+    def test_adding_a_column_already_brought_in_is_a_no_op(self, edited):
+        """However a person spelled it: an absorbed drift proposes nothing."""
+
+        sql = SCAFFOLDED.replace("cast(paid_at as timestamp(6)) as paid_at", edited)
+
+        result = project_column_in_sql(
+            sql, "m.sql", "paid_at", "paid_at", through_ctes=True
+        )
+
+        assert result.changed == 0 and result.content == sql
+
+    def test_without_the_option_the_star_is_still_a_star(self):
+        """`transform place` and `remove` keep what they had."""
+
+        assert unproject_column_in_sql(SCAFFOLDED, "m.sql", "checksum").star
+        assert project_column_in_sql(SCAFFOLDED, "m.sql", "d", "d").star
+        assert output_columns(SCAFFOLDED, "m.sql") is None
+        assert output_columns(SCAFFOLDED, "m.sql", through_ctes=True) == {
+            "payment_id",
+            "method",
+            "checksum",
+            "paid_at",
+        }
+
+    def test_a_filter_on_the_final_star_is_seen_through(self):
+        """A `where` decides which rows reach the output, not which columns."""
+
+        sql = SCAFFOLDED.replace(
+            "select * from renamed\n", "select * from renamed where method = 'card'\n"
+        )
+
+        result = unproject_column_in_sql(sql, "m.sql", "checksum", through_ctes=True)
+
+        assert result.changed == 1 and "checksum" not in result.content
+
+    def test_a_star_over_a_join_is_not_followed_and_still_refuses_a_read(self):
+        """The star carries both sides, so the list beneath is not the model's
+        list; the CTE that names the column is still a read of it."""
+
+        sql = SCAFFOLDED.replace(
+            "select * from renamed\n",
+            "select * from renamed join {{ ref('methods') }} using (method)\n",
+        )
+
+        with pytest.raises(RewriteError, match="projection 'checksum'"):
+            unproject_column_in_sql(sql, "m.sql", "checksum", through_ctes=True)
+        assert project_column_in_sql(sql, "m.sql", "d", "d", through_ctes=True).star

@@ -48,6 +48,16 @@ or `.dex/plans/` by hand in place of the command that guards them.
 
 ## Running the engine
 
+Run commands from the user's project directory, so dex finds that project's
+configuration and writes its cache there. The wrapper path is absolute:
+
+- In Claude Code, `${CLAUDE_SKILL_DIR}` is supplied by the host.
+- In Codex or another Agent Skills host, resolve the directory containing this
+  installed `SKILL.md` from the path the host provides. Substitute that absolute
+  directory for `${CLAUDE_SKILL_DIR}` in every command and reference below,
+  including paths in the bundled reference files. Do not assume that environment
+  variable exists, and do not change into the installed skill directory.
+
 ```bash
 uv run --no-project --script "${CLAUDE_SKILL_DIR}/scripts/run.py" <subcommand> [flags]
 ```
@@ -162,9 +172,12 @@ is not described here.
   `maintain snapshot`) before triaging findings one by one. A type change is
   advisory on every format, so read the codes for retypes rather than inferring
   them from the count.
-- **`mechanical`** (schema drift): re-scaffolds a dex-scaffolded staging model,
-  or edits the drifted columns into a declaration. Still a reviewable diff: read
-  it for hand-written logic the scaffold cannot know about before applying.
+- **`mechanical`** (schema drift): edits only the drifted columns into a
+  staging model and into the YAML that already declares it, or into a
+  declaration, and leaves every other line alone. Still a reviewable diff. A
+  dropped column that hand-written logic reads comes back advisory naming the
+  use, readers further downstream are named in `warnings`, and drift the project
+  already reflects is advisory with a `maintain snapshot` hint.
 - **`advisory`** (grain, volume, semantic): a decision for the user, at most
   backed by a test edit that makes the break visible in builds. dex cannot dedup
   a warehouse or decide whether a new `'refunded'` status belongs in a metric, so
@@ -189,7 +202,7 @@ is not described here.
   explicit budget from the user, and re-issue with
   `--confirm --budget <magnitude>` in the estimate's unit: bytes on BigQuery, warehouse-seconds on
   Snowflake and Databricks, compute-seconds on Redshift, database-seconds on
-  Postgres and ClickHouse. On DuckDB nothing prompts.
+  Postgres and ClickHouse, cluster-seconds on Trino. On DuckDB nothing prompts.
 - `check`, `semantic`, and `verify` answer first and offer second: they return
   `ok` with final findings, and the price of the rest under `data.offer`
   (`data.axes_run` says what ran, `data.offer.axes` what the estimate adds).

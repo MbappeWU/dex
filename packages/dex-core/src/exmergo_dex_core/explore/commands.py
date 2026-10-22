@@ -24,6 +24,7 @@ import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -45,6 +46,7 @@ from ..cache import (
     DexCache,
     Relationship,
     RelationshipKind,
+    mask_overridden,
     match_identifier,
     relation_verdict,
 )
@@ -68,6 +70,7 @@ from ..guards.query_firewall import (
     inspect_query,
 )
 from ..guards.sql_guard import referenced_relations, split_statements
+from ..guards.values_free_shape import assert_values_free_shape
 from ..progress import ProgressReporter
 from ..results import BudgetExhaustedError, ConfirmationRequest, to_envelope
 from ..semantic_catalog import (
@@ -76,7 +79,22 @@ from ..semantic_catalog import (
     derive_entity_type,
     entity_joins,
 )
-from ..storage import CacheUnreadableError, Document, ExploreStore, readable_cache
+from ..storage import (
+    CacheUnreadableError,
+    Document,
+    ExploreStore,
+    MaintainStore,
+    readable_cache,
+)
+from ..values_free import (
+    ResultMode,
+    ValuesFreeCode,
+    ValuesFreeError,
+    error_code,
+    withheld_copy,
+    withhold_error,
+    withhold_values,
+)
 from . import cluster as cluster_mod
 from . import cumulative as cumulative_mod
 from . import diagram as diagram_mod
@@ -170,25 +188,6 @@ def _override_mismatches(
                     f"'{entry.column_name}' in {len(matched)} matched dataset(s)"
                 )
     return warnings
-
-
-def _mask_overridden(cache: DexCache, override_paths: set[str]) -> DexCache:
-    """Apply config overrides to a loaded cache in memory, so an override takes
-    effect at query time immediately instead of demanding a re-profile (a billed
-    scan on metered connectors). The persisted cache is untouched; the next
-    profile writes the override through durably."""
-
-    if not override_paths:
-        return cache
-    for dataset in cache.datasets:
-        for column in dataset.columns:
-            if (
-                column.pii is not None
-                and f"{dataset.identifier}.{column.name}".lower() in override_paths
-            ):
-                column.pii_overridden = column.pii.category
-                column.pii = None
-    return cache
 
 
 def _profile_estimate(
@@ -308,6 +307,7 @@ def _dev_schemas(config: DexConfig) -> frozenset[str]:
             config.postgres.dev_schema if config.postgres else None,
             config.redshift.dev_schema if config.redshift else None,
             config.clickhouse.dev_database if config.clickhouse else None,
+            config.trino.dev_schema if config.trino else None,
         ]
         if name
     )
@@ -327,6 +327,7 @@ def inventory(
     rank: bool = False,
     limit: int | None = None,
     show_all: bool = False,
+    result_mode: ResultMode | None = None,
 ) -> InventoryResult:
     """Every object the connection can see, metadata only.
 
@@ -340,6 +341,7 @@ def inventory(
     same as it always has been.
     """
 
+    mode = engine.resolve_result_mode(result_mode)
     adapter = engine._adapter("explore inventory")
     metas = inventory_mod.inventory(adapter)
     cost = command_args.preflight_cost(adapter)
@@ -351,13 +353,34 @@ def inventory(
         # ranked inventory would silently ignore the user's bias.
         scores = rank_mod.rank(metas, None, engine.config.ranking_hints)
         metas = sorted(metas, key=lambda m: scores.get(m.identifier, 0.0), reverse=True)
-        notes.append(
-            "ranked by size (row count), naming convention (fct/dim/stg-style "
-            "prefixes score higher, tmp/scratch-style lower), and shape (column "
-            "count); connectivity (how many objects it joins to) is not part of "
-            "this score, because inventory runs no relationship pass. `explore "
-            "map` ranks with connectivity included"
-        )
+        # Size only orders what reported a count (#717): on Trino no
+        # `information_schema` carries one, so every object ties on that signal
+        # and the order is the catalog's, which a note claiming a size order
+        # would describe wrongly.
+        counted = sum(1 for m in metas if m.row_count is not None)
+        if counted:
+            notes.append(
+                "ranked by size (row count), naming convention (fct/dim/stg-style "
+                "prefixes score higher, tmp/scratch-style lower), and shape (column "
+                "count); connectivity (how many objects it joins to) is not part of "
+                "this score, because inventory runs no relationship pass. `explore "
+                "map` ranks with connectivity included"
+            )
+        else:
+            notes.append(
+                "ranked by naming convention (fct/dim/stg-style prefixes score "
+                "higher, tmp/scratch-style lower) and shape (column count); size "
+                "(row count) contributed nothing, because no object reported a "
+                "count, and objects that tie keep the order the catalog returned. "
+                "Connectivity (how many objects it joins to) is not part of this "
+                "score, because inventory runs no relationship pass. `explore map` "
+                "ranks with connectivity included"
+            )
+        if counted and counted < len(metas):
+            notes.append(
+                f"{len(metas) - counted} of {len(metas)} object(s) reported no row "
+                "count, so size ranked only the rest"
+            )
         if not show_all:
             cap = limit if limit is not None else _INVENTORY_RANK_DEFAULT_LIMIT
             elided = max(0, len(metas) - cap)
@@ -386,6 +409,7 @@ def inventory(
         elided_object_count=elided,
         notes=notes,
         cost=cost,
+        result_mode=mode,
     )
 
 
@@ -549,6 +573,8 @@ def _profile_into_cache(
     identifiers: list[str],
     prior: DexCache | None,
     now: datetime,
+    *,
+    withhold: bool = False,
 ) -> tuple[list[Dataset], DexCache, str, str]:
     """Scan the named objects and fold the profiles into the cache.
 
@@ -565,12 +591,17 @@ def _profile_into_cache(
     Per-object checkpointing runs only on billed connectors: a free connector can
     never exhaust a budget mid-scan and its re-runs cost nothing, so the extra
     full-document writes would buy nothing.
+
+    ``withhold`` is values-free mode (#591): every profile has its values dropped
+    before anything is written, the per-object checkpoints included.
     """
 
     checkpoint = None
     accumulated: list[Dataset] = []
     if command_args.cost_gate(adapter) is not None:
-        checkpoint, accumulated = _profile_checkpointer(store, prior, adapter.name, now)
+        checkpoint, accumulated = _profile_checkpointer(
+            store, prior, adapter.name, now, withhold=withhold
+        )
     reporter = _reporter(len(identifiers), "profiled", "objects")
     try:
         profiled = profile_mod.profile(
@@ -588,6 +619,9 @@ def _profile_into_cache(
     _annotate_grain(
         profiled, defs, high_null_fraction=config.profile_high_null_fraction
     )
+    if withhold:
+        for dataset in profiled:
+            withhold_values(dataset)
     cache, stats = _merge_profiles(prior, profiled, adapter.name, now)
     locator = store.save_cache(cache, now=now)
     note = _persist_note(stats, len(profiled), keeps_relationships=True)
@@ -602,6 +636,7 @@ def profile(
     use_project: bool = False,
     check_cumulative: bool = False,
     show_all_columns: bool = False,
+    result_mode: ResultMode | None = None,
 ) -> ProfileResult:
     """Profile the named objects, reusing fresh cached profiles where they exist.
 
@@ -619,8 +654,14 @@ def profile(
     :meth:`~..cache.Dataset.columns_with_findings`), so the verdict a caller
     asked for -- grain, keys, data quality -- is not the part a truncating
     harness cuts off on a wide table.
+
+    In values-free mode (#591) every dataset returned has its column values
+    withheld, whether it was scanned now or served from the cache, and a scan
+    writes its profile to the cache without them.
     """
 
+    mode = engine.resolve_result_mode(result_mode)
+    values_free = mode is ResultMode.VALUES_FREE
     store = engine.store
     config = engine.config
     defs = _project_definitions(engine, use_project)
@@ -646,6 +687,7 @@ def profile(
         timedelta(hours=config.profile_freshness_hours),
         now,
         refresh=refresh,
+        values_free=values_free,
     )
     estimate, per_table = _profile_estimate(adapter, stale, include_blobs=blob_paths)
     handshake_notes = None
@@ -671,7 +713,7 @@ def profile(
     # freshly profiled are merged; the reused already live in the cache untouched,
     # and prior relationships are preserved because profile runs no inference pass.
     profiled, cache, locator, persist_note = _profile_into_cache(
-        store, adapter, config, defs, stale, prior, now
+        store, adapter, config, defs, stale, prior, now, withhold=values_free
     )
 
     # Freshly profiled plus fresh-cached: the full requested set, whether scanned
@@ -758,6 +800,10 @@ def profile(
                     "awaits confirmation (see hint)"
                 )
 
+    if values_free:
+        # A fresh full entry was served as it is cached; the scanned ones are
+        # already withheld. Copies, so the cache document is not touched.
+        datasets = [withheld_copy(d) for d in datasets]
     result = ProfileResult(
         datasets=datasets,
         profiled_count=len(profiled),
@@ -769,6 +815,7 @@ def profile(
         notes=notes,
         warnings=_override_mismatches(datasets, config.pii_overrides),
         pending_confirmation=cumulative_pending,
+        result_mode=mode,
     )
     return command_args.stamp_spend(result, adapter)
 
@@ -794,6 +841,7 @@ def relationships(
     refresh: bool = False,
     use_project: bool = False,
     use_hosted_semantic_layer: bool = False,
+    result_mode: ResultMode | None = None,
 ) -> RelationshipsResult:
     """Infer joins across every object in scope, optionally probing them.
 
@@ -807,8 +855,13 @@ def relationships(
     independent opt-in phase with the same priced-after-the-fact shape,
     which runs after ``verify`` so at most one checkpoint is ever pending at
     once.
+
+    In values-free mode the profiles it scans are written without their values;
+    the relationships it reports never carried any.
     """
 
+    mode = engine.resolve_result_mode(result_mode)
+    values_free = mode is ResultMode.VALUES_FREE
     store = engine.store
     config = engine.config
     defs = _project_definitions(engine, use_project)
@@ -849,6 +902,7 @@ def relationships(
         timedelta(hours=config.profile_freshness_hours),
         now,
         refresh=refresh,
+        values_free=values_free,
     )
     blob_paths = blob_override_paths(config.blob_overrides)
     estimate, per_table = _profile_estimate(adapter, stale, include_blobs=blob_paths)
@@ -886,7 +940,7 @@ def relationships(
         checkpoint = None
         if command_args.cost_gate(adapter) is not None:
             checkpoint, accumulated = _profile_checkpointer(
-                store, prior, connector, now
+                store, prior, connector, now, withhold=values_free
             )
 
         profile_reporter = _reporter(len(stale), "profiled", "objects")
@@ -1141,6 +1195,11 @@ def relationships(
     # set is authoritative for every identifier it examined; anything with an
     # endpoint outside that (a narrower --scope/--dataset than a prior run) is
     # carried forward above rather than dropped, same as the profiles are.
+    # Values come off here rather than straight after the scan, so inference saw
+    # the same profiles in either mode and reports the same confidences.
+    if values_free:
+        for dataset in profiled:
+            withhold_values(dataset)
     cache, stats = _merge_profiles(
         prior,
         datasets,
@@ -1172,6 +1231,7 @@ def relationships(
         pending_confirmation=verify_pending
         if verify_pending is not None
         else overlap_pending,
+        result_mode=mode,
     )
     return command_args.stamp_spend(result, adapter)
 
@@ -1225,7 +1285,11 @@ class _Batch:
 
 
 def query(
-    engine: DexEngine, sql: str, *, auto_profile: bool | None = None
+    engine: DexEngine,
+    sql: str,
+    *,
+    auto_profile: bool | None = None,
+    result_mode: ResultMode | None = None,
 ) -> QueryResult:
     """Run one caller-authored SELECT through the query firewall.
 
@@ -1236,12 +1300,16 @@ def query(
     is no surviving neighbor for a status field to protect.
     """
 
-    batch, shared = _run_statements(engine, [(sql, None)], auto_profile=auto_profile)
+    mode = engine.resolve_result_mode(result_mode)
+    batch, shared = _run_statements(
+        engine, [(sql, None)], auto_profile=auto_profile, result_mode=mode
+    )
     statement = batch[0]
     if statement.error is not None:
         raise statement.error
 
     record = statement.result
+    record.result_mode = mode
     command_args.stamp_spend(record, shared.adapter)
     if shared.profiled and command_args.cost_gate(shared.adapter) is not None:
         record.notes.append(
@@ -1256,6 +1324,7 @@ def query_batch(
     statements: list[tuple[str, int | None]] | list[str],
     *,
     auto_profile: bool | None = None,
+    result_mode: ResultMode | None = None,
 ) -> QueryBatchResult:
     """Run several caller-authored SELECTs through the query firewall, in order.
 
@@ -1276,8 +1345,11 @@ def query_batch(
     raise: nothing ran, so there is nothing to protect.
     """
 
+    mode = engine.resolve_result_mode(result_mode)
     prepared = [s if isinstance(s, tuple) else (s, None) for s in statements]
-    batch, shared = _run_statements(engine, prepared, auto_profile=auto_profile)
+    batch, shared = _run_statements(
+        engine, prepared, auto_profile=auto_profile, result_mode=mode
+    )
     result = QueryBatchResult(
         results=[
             QueryStatementResult(
@@ -1297,6 +1369,7 @@ def query_batch(
                 stage=(
                     None if statement.error is None else env.stage_for(statement.error)
                 ),
+                code=(None if statement.error is None else error_code(statement.error)),
                 **(
                     {}
                     if statement.result is None
@@ -1318,6 +1391,7 @@ def query_batch(
         ],
         profiled_on_demand=shared.profiled,
         warnings=shared.warnings,
+        result_mode=mode,
     )
     if shared.adapter is not None:
         command_args.stamp_spend(result, shared.adapter)
@@ -1334,6 +1408,7 @@ def _run_statements(
     statements: list[tuple[str, int | None]],
     *,
     auto_profile: bool | None = None,
+    result_mode: ResultMode = ResultMode.FULL,
 ) -> tuple[list[_Statement], _Batch]:
     """Drive every statement of one call through the firewall and the warehouse.
 
@@ -1353,6 +1428,13 @@ def _run_statements(
 
     Every decision, allowed or refused, lands in the query ledger, one entry per
     statement whatever the call carried.
+
+    In values-free mode (#591) each statement must also have the aggregate-only
+    shape :func:`~..guards.values_free_shape.assert_values_free_shape` accepts,
+    checked first, before anything is opened, priced or profiled. What comes back
+    is held to that shape again (one row of numbers, untruncated), every error a
+    statement ends with carries a code in place of anyone else's words, and the
+    ledger records that code rather than the words.
     """
 
     store = engine.store
@@ -1366,12 +1448,34 @@ def _run_statements(
     dialect = get_dialect(engine.connector or config.connector)
     auto = config.auto_profile if auto_profile is None else auto_profile
 
+    values_free = result_mode is ResultMode.VALUES_FREE
+
     batch = [_Statement(i, sql, line) for i, (sql, line) in enumerate(statements)]
     size = len(batch)
     shared = _Batch()
 
     def ledger(statement: _Statement, entry: dict) -> None:
+        if values_free and "reason" in entry:
+            # The ledger is an audit file a host may hand on, so it is held to
+            # the mode like everything else: the code, never the words.
+            entry = {**entry, "reason": _withheld_reason(statement)}
         store.append_query_log({"at": at, **entry, **_batch_marks(statement, size)})
+
+    if values_free:
+        # The mode's own gate, before every other: it reads only the parsed
+        # statement, so a shape the mode refuses never opens a connection,
+        # prices a scan, or profiles a table on its way to being refused.
+        for statement in batch:
+            try:
+                assert_values_free_shape(
+                    assert_query_shape(statement.sql, dialect=dialect)
+                )
+            except (QueryRefusedError, ValuesFreeError) as exc:
+                statement.stop(exc, "refused")
+                ledger(
+                    statement,
+                    {"sql": statement.sql, "decision": "refused", "reason": ""},
+                )
 
     if auto:
         # Read-only first, before anything reaches the warehouse. Resolving a
@@ -1379,6 +1483,8 @@ def _run_statements(
         # statement earns that until it is proven to be a single SELECT.
         reads: dict[int, list[str]] = {}
         for statement in batch:
+            if not statement.live:
+                continue
             try:
                 assert_query_shape(statement.sql, dialect=dialect)
             except QueryRefusedError as exc:
@@ -1446,7 +1552,15 @@ def _run_statements(
             ]
             if to_profile and live:
                 cache, shared.profiled, shared.warnings = _profile_for_statements(
-                    engine, shared.adapter, live, to_profile, cache, now, at, size
+                    engine,
+                    shared.adapter,
+                    live,
+                    to_profile,
+                    cache,
+                    now,
+                    at,
+                    size,
+                    withhold=values_free,
                 )
 
     if cache is None and any(statement.live for statement in batch):
@@ -1456,10 +1570,10 @@ def _run_statements(
         )
 
     if cache is not None:
-        # After the cache write, never before: _mask_overridden edits the datasets
+        # After the cache write, never before: mask_overridden edits the datasets
         # in place, and masking first would persist an in-memory override onto
         # objects this run never re-profiled.
-        cache = _mask_overridden(cache, pii_override_paths(config.pii_overrides))
+        cache = mask_overridden(cache, pii_override_paths(config.pii_overrides))
     for statement in batch:
         if not statement.live:
             continue
@@ -1492,19 +1606,42 @@ def _run_statements(
             statement.stop(exc, "refused")
 
     live = [statement for statement in batch if statement.live]
-    if not live:
-        return batch, shared
+    if live:
+        shared.adapter = shared.adapter or engine._adapter("explore query")
+        # Priced once, above, when a profile was needed: `preflight_command` sets
+        # the reservation rather than adding to it, so a second handshake here
+        # would release the profile's booking. Every statement still passes the
+        # per-statement gate and the server-side cap on its way out.
+        if not shared.profiled:
+            _price_statements(shared.adapter, live, size, ledger)
 
-    shared.adapter = shared.adapter or engine._adapter("explore query")
-    # Priced once, above, when a profile was needed: `preflight_command` sets the
-    # reservation rather than adding to it, so a second handshake here would
-    # release the profile's booking. Every statement still passes the
-    # per-statement gate and the server-side cap on its way out.
-    if not shared.profiled:
-        _price_statements(shared.adapter, live, size, ledger)
-
-    _execute(engine, shared, batch, limits, ledger, cache, dialect)
+        _execute(
+            engine,
+            shared,
+            batch,
+            limits,
+            ledger,
+            cache,
+            dialect,
+            values_free=values_free,
+        )
+    if values_free:
+        for statement in batch:
+            if statement.error is not None:
+                statement.error = withhold_error(statement.error)
     return batch, shared
+
+
+def _withheld_reason(statement: _Statement) -> str:
+    """What a values-free ledger row says in place of an error's words: its code,
+    or, on the paths that ledger before the statement is stopped, only that the
+    words were withheld."""
+
+    if statement.error is None:
+        return "withheld in values-free mode"
+    return (
+        f"withheld in values-free mode ({error_code(withhold_error(statement.error))})"
+    )
 
 
 def _price_statements(
@@ -1559,6 +1696,8 @@ def _execute(
     ledger: Callable[[_Statement, dict], None],
     cache: DexCache,
     dialect: str,
+    *,
+    values_free: bool = False,
 ) -> None:
     """Run each approved statement in order, against one shared payload budget.
 
@@ -1571,6 +1710,11 @@ def _execute(
     A cost-guard refusal partway through stops the call rather than being retried
     per statement: the budget is gone, so every statement after it would meet the
     same wall. What already ran is kept and reported, because it has been paid for.
+
+    In values-free mode a result that is not one untruncated row of numbers is
+    discarded and its statement refused: the shape rule promised that shape, and
+    a dialect that returned something else (DuckDB's AVG over a timestamp is a
+    timestamp) gets a refusal rather than a result.
     """
 
     budget = limits.max_payload_bytes
@@ -1599,8 +1743,8 @@ def _execute(
             }
             if shared.profiled:
                 entry["profiled_on_demand"] = shared.profiled
-            ledger(statement, entry)
             statement.stop(exc, "failed")
+            ledger(statement, entry)
             if isinstance(exc, (CostGuardError, BudgetExhaustedError)):
                 stopped = exc
             continue
@@ -1614,6 +1758,20 @@ def _execute(
             dialect=dialect,
         )
         budget -= payload.pop("payload_bytes")
+        if values_free:
+            broken = _values_free_result_check(payload)
+            if broken is not None:
+                exc = ValuesFreeError(broken)
+                statement.stop(exc, "refused")
+                ledger(
+                    statement,
+                    {
+                        "sql": statement.inspected.sql,
+                        "decision": "refused",
+                        "reason": "",
+                    },
+                )
+                continue
         notes = payload.pop("notes")
         column_notes = payload.pop("column_notes", None)
         query_notes = payload.pop("query_notes", None)
@@ -1732,6 +1890,8 @@ def _profile_for_statements(
     now: datetime,
     at: str,
     size: int,
+    *,
+    withhold: bool = False,
 ) -> tuple[DexCache, list[str], list[str]]:
     """Price and run the profiles a call needs, then hand back the new cache.
 
@@ -1796,6 +1956,7 @@ def _profile_for_statements(
         to_profile,
         prior,
         now,
+        withhold=withhold,
     )
     return cache, to_profile, _auto_profile_warning(to_profile, adapter)
 
@@ -1844,6 +2005,7 @@ def query_across(
     targets: list[str],
     *,
     auto_profile: bool | None = None,
+    result_mode: ResultMode | None = None,
 ) -> QueryBatchResult:
     """Run each template once per target, as one call under one handshake (#545).
 
@@ -1903,7 +2065,9 @@ def query_across(
             expanded.append((sql.replace(ACROSS_PLACEHOLDER, target), line))
             labels.append((template_index, target))
 
-    result = query_batch(engine, expanded, auto_profile=auto_profile)
+    result = query_batch(
+        engine, expanded, auto_profile=auto_profile, result_mode=result_mode
+    )
     for statement, (template_index, target) in zip(result.results, labels, strict=True):
         statement.template = template_index
         statement.target = target
@@ -1935,7 +2099,7 @@ def cmd_query(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
             return to_envelope(
                 query(engine, statements[0][0], auto_profile=_auto_profile(args))
             )
-        except QueryRefusedError as exc:
+        except (QueryRefusedError, ValuesFreeError) as exc:
             return env.error_for(exc, f"query refused: {exc}")
     return _batch_envelope(
         query_batch(engine, statements, auto_profile=_auto_profile(args))
@@ -2041,6 +2205,7 @@ def map(
     refresh: bool = False,
     use_project: bool = False,
     use_hosted_semantic_layer: bool = False,
+    result_mode: ResultMode | None = None,
 ) -> MapResult:
     """The whole landscape in one pass: inventory, ranked profiling, and joins.
 
@@ -2057,8 +2222,14 @@ def map(
     are swept for measured value containment (issue #220), the same opt-in,
     priced-after-the-fact phase :func:`relationships` runs, in the same slot
     after ``verify``.
+
+    In values-free mode the profiles it scans are written without their values,
+    and the cache handed back on the result is a copy with every value withheld.
+    The payload itself never carries a value in either mode.
     """
 
+    mode = engine.resolve_result_mode(result_mode)
+    values_free = mode is ResultMode.VALUES_FREE
     store = engine.store
     config = engine.config
     defs = _project_definitions(engine, use_project)
@@ -2082,6 +2253,7 @@ def map(
 
     metas = inventory_mod.inventory(adapter)
     orphaned = _orphan_candidates(metas, defs)
+    baselined = _baselined_identifiers(store) if orphaned else set()
     # The schema/dataset namespaces this run's inventory actually saw, so
     # carry-forward can tell "out of this run's scope" from "gone from the
     # warehouse" (issue #149) -- an identifier whose own namespace is here but
@@ -2104,6 +2276,7 @@ def map(
         timedelta(hours=config.profile_freshness_hours),
         now,
         refresh=refresh,
+        values_free=values_free,
     )
     # Inventory and ranking are free, so an unconfirmed billed run repeats
     # them on re-issue; only the profiling scans below need the handshake.
@@ -2138,7 +2311,7 @@ def map(
         checkpoint = None
         if command_args.cost_gate(adapter) is not None:
             checkpoint, accumulated = _profile_checkpointer(
-                store, prior, adapter.name, now
+                store, prior, adapter.name, now, withhold=values_free
             )
 
         profile_reporter = _reporter(len(stale), "profiled", "objects")
@@ -2166,6 +2339,7 @@ def map(
         profiled,
         defs,
         orphaned=orphaned,
+        baselined=baselined,
         high_null_fraction=config.profile_high_null_fraction,
     )
     suppressed: list[rel_mod.SuppressedMatch] = []
@@ -2311,6 +2485,10 @@ def map(
         reusable, examined, relationship_set, observed_namespaces=observed_namespaces
     )
     final_scores = rank_mod.rank(metas, relationship_set, hints, orphaned)
+    # After inference, so it saw the same profiles in either mode.
+    if values_free:
+        for dataset in profiled:
+            withhold_values(dataset)
     datasets, carried, out_of_scope, dropped = _compose_datasets(
         metas,
         all_selected,
@@ -2487,8 +2665,14 @@ def map(
     top = sorted(datasets, key=lambda d: (-(d.rank_score or 0.0), d.identifier))[:5]
     view = summarize_map(cache, detail=detail)
     notes.extend(view.notes)
+    if values_free:
+        handed_back = cache.model_copy(deep=True)
+        for dataset in handed_back.datasets:
+            withhold_values(dataset)
+    else:
+        handed_back = cache
     result = MapResult(
-        cache=cache,
+        cache=handed_back,
         cache_path=locator,
         object_count=len(metas),
         profiled_count=len(profiled),
@@ -2519,6 +2703,7 @@ def map(
         pending_confirmation=verify_pending
         if verify_pending is not None
         else overlap_pending,
+        result_mode=mode,
     )
     return command_args.stamp_spend(result, adapter)
 
@@ -2797,7 +2982,9 @@ def _null_drop_note(
     )
 
 
-def diagram(engine: DexEngine, *, full: bool = False) -> DiagramResult:
+def diagram(
+    engine: DexEngine, *, full: bool = False, result_mode: ResultMode | None = None
+) -> DiagramResult:
     """Serialize the cached map as a Mermaid ER diagram.
 
     Free everywhere and on every connector: it reads the exploration cache and
@@ -2810,8 +2997,12 @@ def diagram(engine: DexEngine, *, full: bool = False) -> DiagramResult:
     because the cache *is* the subject. An empty cache is a prerequisite
     failure naming `explore map`, never an empty diagram, because a diagram of
     nothing and a diagram of an unexplored warehouse look identical.
+
+    It draws no column value in any mode (see :mod:`.diagram`), so values-free
+    mode changes nothing here but the stamp on the result.
     """
 
+    mode = engine.resolve_result_mode(result_mode)
     cache = readable_cache(engine.store)
     if cache is None:
         raise CacheRequiredError(
@@ -2837,6 +3028,7 @@ def diagram(engine: DexEngine, *, full: bool = False) -> DiagramResult:
         full=full,
         updated_at=cache.provenance.updated_at or "",
         notes=rendered.notes,
+        result_mode=mode,
     )
 
 
@@ -3036,6 +3228,26 @@ def _select_cluster_features(
             f"choose columns, or profile a table with more numeric columns{why}"
         )
     return features, notes
+
+
+def _values_free_result_check(payload: dict) -> ValuesFreeCode | None:
+    """Why a shaped result cannot be returned in values-free mode, if it cannot.
+
+    The shape rule guarantees one row of aggregates in every dialect it can parse;
+    this holds the warehouse to that rather than trusting the parse. A truncated
+    result is refused rather than cut, since a host relies on a refusal being a
+    refusal. A boolean is a number here (BOOL_AND/BOOL_OR return one).
+    """
+
+    if payload["truncated"]:
+        return ValuesFreeCode.WOULD_TRUNCATE
+    if len(payload["cells"]) > 1:
+        return ValuesFreeCode.MULTI_ROW_RESULT
+    for row in payload["cells"]:
+        for value in row:
+            if value is not None and not isinstance(value, (int, float, Decimal)):
+                return ValuesFreeCode.NON_NUMERIC_RESULT
+    return None
 
 
 def _shape_query_payload(
@@ -3616,6 +3828,10 @@ def _compose_semantic_catalogs(
             **hosted_view.physical_columns,
             **local_view.physical_columns,
         },
+        computed_columns={
+            **hosted_view.computed_columns,
+            **local_view.computed_columns,
+        },
     )
 
 
@@ -3971,10 +4187,10 @@ def _orphan_candidates(
     metas: list[ObjectMeta], defs: dbt_project.ProjectDefinitions
 ) -> set[str]:
     """Identifiers no current model/source builds or sources, restricted to
-    schemas the project *does* build/source at least one other object into --
-    that schema-membership check stands in for maintain's baseline-vs-current
-    comparison, which explore has no snapshot to perform, so a raw, never
-    dbt-modeled schema is never miscast as full of orphans."""
+    schemas the project *does* build/source at least one other object into, so
+    a raw, never dbt-modeled schema is never miscast as full of orphans. A
+    candidate is not necessarily residue: a table the loader just added is one
+    too. :func:`_baselined_identifiers` tells the two apart for the note."""
 
     if not defs.present or not defs.built_relation_names:
         return set()
@@ -3996,6 +4212,22 @@ def _orphan_candidates(
     }
 
 
+def _baselined_identifiers(store: ExploreStore) -> set[str]:
+    """Lowercased identifiers the accepted baseline (``.dex/snapshot.json``)
+    knew. Empty when there is none, the store keeps none, or it cannot be read:
+    the note it selects is advisory, and `maintain` reports a corrupt one."""
+
+    if not isinstance(store, MaintainStore):
+        return set()
+    try:
+        snap = store.load_snapshot()
+    except ValueError:
+        return set()
+    if snap is None:
+        return set()
+    return {d.identifier.lower() for d in snap.warehouse.datasets}
+
+
 def _merged_hints(user_hints: list[str], metric_models: list[str]) -> list[str]:
     """User-configured ranking hints plus the models metric definitions ground
     in. User hints come first and are never displaced; metric-backed models are
@@ -4015,6 +4247,7 @@ def _annotate_grain(
     defs: dbt_project.ProjectDefinitions | None = None,
     *,
     orphaned: set[str] | None = None,
+    baselined: set[str] | None = None,
     high_null_fraction: float = 0.95,
 ) -> None:
     """Attach the interpretation layer to raw profiles: candidate keys, the likely
@@ -4034,7 +4267,9 @@ def _annotate_grain(
     proven single column, in which case the proven single wins and the
     composite is only noted. ``candidate_keys`` stays measurement-only: an
     unmeasured declared key is a claim, and the cache is a drift baseline.
-    ``orphaned`` (map only) badges a relation no current model/source builds.
+    ``orphaned`` (map only) badges a relation no current model/source builds:
+    as likely residue when ``baselined`` (the snapshot's identifiers) knew it,
+    and otherwise as a new relation no source declares yet.
     """
 
     declared_grain: dict[str, str] = {}
@@ -4077,11 +4312,17 @@ def _annotate_grain(
         ds.key_evidence = rel_mod.key_evidence(ds)
         ds.data_quality.extend(rel_mod.data_quality_notes(ds))
         if orphaned and ds.identifier in orphaned:
-            ds.data_quality.append(
-                "no current dbt model or source builds this relation, though "
-                "the project builds/sources others in this schema; likely "
-                "orphaned residue of a rename or removal"
-            )
+            if baselined and ds.identifier.lower() in baselined:
+                ds.data_quality.append(
+                    "no current dbt model or source builds this relation, though "
+                    "the project builds/sources others in this schema; likely "
+                    "orphaned residue of a rename or removal"
+                )
+            else:
+                ds.data_quality.append(
+                    "no dbt source declares this relation yet; add it to the "
+                    "sources file before modelling it"
+                )
 
         grain_column = declared_grain.get(ds.identifier.lower())
         if grain_column is not None:
@@ -4355,6 +4596,7 @@ def _split_fresh_stale(
     now: datetime,
     *,
     refresh: bool,
+    values_free: bool = False,
 ) -> tuple[list[str], dict[str, Dataset]]:
     """Split requested identifiers into (still need profiling, reusable-fresh
     datasets).
@@ -4386,6 +4628,11 @@ def _split_fresh_stale(
     different points — ``map``/``relationships`` from inventory metas, ``profile``
     from resolved arguments — so it works on the identifier strings they have in
     common, not on ``ObjectMeta``.
+
+    A profile written in values-free mode (#591) kept no column values, so it is
+    stale to every caller outside that mode, who would otherwise be served an
+    incomplete profile as a complete one. A caller in the mode can reuse either
+    kind, since it projects the values away before anything leaves.
     """
 
     if (
@@ -4402,6 +4649,9 @@ def _split_fresh_stale(
     for identifier in identifiers:
         prior_ds = prior_by_id.get(identifier)
         if prior_ds is None or prior_ds.profiled_at is None:
+            stale.append(identifier)
+            continue
+        if prior_ds.values_withheld and not values_free:
             stale.append(identifier)
             continue
         try:
@@ -4505,6 +4755,8 @@ def _profile_checkpointer(
     prior: DexCache | None,
     connector: str,
     now: datetime,
+    *,
+    withhold: bool = False,
 ) -> tuple[Callable[[Dataset], None], list[Dataset]]:
     """Persist each profiled dataset as it completes, so a budget-exhaustion
     failure mid-run still leaves the objects already paid for in the cache.
@@ -4518,6 +4770,10 @@ def _profile_checkpointer(
     accumulated: list[Dataset] = []
 
     def checkpoint(ds: Dataset) -> None:
+        if withhold:
+            # In place, so the dataset the scan goes on to return is the
+            # withheld one too, and nothing later writes its values back.
+            withhold_values(ds)
         accumulated.append(ds)
         cache, _ = _merge_profiles(prior, accumulated, connector, now)
         store.save_cache(cache, now=now)

@@ -13,6 +13,7 @@ job is where it runs.
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -36,7 +37,9 @@ from exmergo_dex_core.explore.semantic.backend import (
     resolve_semantic_layer,
 )
 from exmergo_dex_core.explore.semantic.conformance import (
+    REFERENCE_LAYER,
     SemanticBackendContract,
+    SemanticCatalogContract,
     declared_fields,
 )
 from exmergo_dex_core.explore.semantic.slayer import (
@@ -55,6 +58,7 @@ from exmergo_dex_core.semantic_source_conformance import (
     SemanticFingerprintContract,
     SemanticSourceFactoryContract,
 )
+from exmergo_dex_core.slayer.catalog import dimension_token
 from exmergo_dex_core.slayer.loader import FORMAT_VERSION
 from exmergo_dex_core.slayer.project import SlayerSemanticLayer
 
@@ -278,6 +282,158 @@ class TestSlayerBackend(SemanticBackendContract):
         return LocalSlayerLayer(source(self.root, ORDERS, CUSTOMERS))
 
 
+# --- the reference layer, seeded as SLayer model files ------------------------------
+
+
+def reference_slayer_models() -> list[dict[str, Any]]:
+    """`REFERENCE_LAYER` as SLayer model files, derived rather than hand-copied
+    so a wider reference layer is a wider seed.
+
+    The mapping is SLayer's native one, not a lossy one chosen to pass:
+
+    - an entity is its key column (primary on the model it keys), and a shared
+      entity is a join from the model holding it as foreign to the one keying it;
+    - a dimension is a column;
+    - a measure over a bare column aggregates that column, and a measure over an
+      expression aggregates a computed column carrying it;
+    - a simple metric is a saved measure on its measure's model, and a filtered
+      one aggregates a filtered column, which is where SLayer puts a predicate
+      that applies to one metric rather than to every metric on the model;
+    - a ratio is a saved measure dividing its two sides by their saved names.
+    """
+
+    declared = REFERENCE_LAYER["semantic_models"]
+    owner = {m["name"]: model for model in declared for m in model["measures"]}
+    by_measure = {m["name"]: m for model in declared for m in model["measures"]}
+    keyed = {
+        entity["name"]: (model["name"], entity["expr"])
+        for model in declared
+        for entity in model["entities"]
+        if entity["type"] == "primary"
+    }
+    simple = {m["name"]: m for m in REFERENCE_LAYER["metrics"] if m.get("measure")}
+
+    seeded: dict[str, dict[str, Any]] = {}
+    for entry in declared:
+        columns: dict[str, dict[str, Any]] = {}
+        joins = []
+        for entity in entry["entities"]:
+            columns[entity["expr"]] = {
+                "name": entity["expr"],
+                "type": "INT",
+                "label": entity["label"],
+                "description": entity["description"],
+                **({"primary_key": True} if entity["type"] == "primary" else {}),
+            }
+            if entity["type"] == "foreign":
+                target, key = keyed[entity["name"]]
+                joins.append(
+                    {
+                        "target_model": target,
+                        "join_pairs": [[entity["expr"], key]],
+                        "cardinality": "many_to_one",
+                    }
+                )
+        for dimension in entry["dimensions"]:
+            columns[dimension["name"]] = {
+                "name": dimension["name"],
+                "type": "TIMESTAMP" if dimension["type"] == "time" else "TEXT",
+                "label": dimension["label"],
+                "description": dimension["description"],
+            }
+        seeded[entry["name"]] = model(
+            entry["name"],
+            sql_table=entry["relation"],
+            description=entry["description"],
+            default_time_dimension=entry["agg_time_dimension"],
+            columns=columns,
+            measures=[],
+            joins=joins,
+        )
+
+    def aggregated(measure: dict[str, Any], columns: dict, where: str | None) -> str:
+        """The column a measure aggregates, added to the model if it has to be."""
+
+        expr = measure["expr"]
+        if expr.isidentifier() and where is None:
+            columns.setdefault(expr, {"name": expr, "type": "DOUBLE"})
+            return expr
+        name = f"{measure['name']}_where" if where else f"{measure['name']}_value"
+        columns[name] = {
+            "name": name,
+            "type": "DOUBLE",
+            "sql": expr,
+            **({"filter": where} if where else {}),
+        }
+        return name
+
+    for metric in REFERENCE_LAYER["metrics"]:
+        if metric["type"] == "simple":
+            measure = by_measure[metric["measure"]]
+            home = owner[measure["name"]]["name"]
+            where = _sql_predicate(metric.get("filter"))
+            column = aggregated(measure, seeded[home]["columns"], where)
+            formula = f"{measure['agg']}({column})"
+        elif metric["type"] == "ratio":
+            home = owner[simple[metric["numerator"]]["measure"]]["name"]
+            formula = f"{metric['numerator']} / {metric['denominator']}"
+        else:  # pragma: no cover - a reference shape this seed does not map yet
+            raise AssertionError(f"no SLayer seeding for a {metric['type']} metric")
+        seeded[home]["measures"].append(
+            {
+                "name": metric["name"],
+                "formula": formula,
+                "label": metric["label"],
+                "description": metric["description"],
+            }
+        )
+
+    for entry in seeded.values():
+        entry["columns"] = list(entry["columns"].values())
+    return list(seeded.values())
+
+
+def _sql_predicate(template: str | None) -> str | None:
+    """A MetricFlow filter template as the SQL predicate a SLayer column filter
+    takes: `{{ Dimension('entity__column') }}` is the column."""
+
+    if template is None:
+        return None
+    return re.sub(
+        r"\{\{\s*Dimension\('[^']*__([^']+)'\)\s*\}\}", r"\1", template
+    ).strip()
+
+
+# The token SLayer reports for each reference metric: a saved measure is
+# queried as `model.measure`, so the metric's name carries the model it is on.
+REFERENCE_METRIC_TOKENS = {
+    measure["name"]: dimension_token(entry["name"], measure["name"])
+    for entry in reference_slayer_models()
+    for measure in entry["measures"]
+}
+
+
+class TestSlayerReferenceLayer(SemanticCatalogContract):
+    """The catalog contract's content assertions, against the reference layer
+    seeded as SLayer model files. What SLayer cannot carry is a declared gap, so
+    a failure here is a bug in the read, not a shape to skip."""
+
+    @pytest.fixture(autouse=True)
+    def _root(self, tmp_path: Path) -> None:
+        self.root = tmp_path
+
+    def make_reference_backend(self):
+        # Through the engine, because `values` screens a dimension through dex's
+        # own governed spine. The config names no warehouse: the PII gate refuses
+        # before any connection is asked for.
+        return resolve_semantic_layer(
+            DexEngine.from_repo(_repo(self.root, *reference_slayer_models()))
+        )
+
+    def reported_name(self, kind: str, name: str) -> str:
+        return REFERENCE_METRIC_TOKENS[name] if kind == "metrics" else name
+
+
 # --- the declared gaps --------------------------------------------------------------
 
 
@@ -304,6 +460,50 @@ def test_every_catalog_field_is_answered_or_declared_a_gap(tmp_path):
 
     assert undeclared == []
     assert catalog.to_data()["unavailable"] == SLAYER_CATALOG_GAPS
+
+
+def test_a_filtered_column_is_the_filter_of_a_metric_reading_only_it(tmp_path):
+    """SLayer has no per-measure filter: a predicate meant for one metric sits on
+    the column it aggregates. A ratio of that column to an unfiltered one is
+    narrowed in one part only, so the predicate is not the ratio's."""
+
+    tiers = model(
+        "users",
+        filters=["status <> 'test'"],
+        columns=[
+            {"name": "user_id", "type": "INT"},
+            {"name": "tier"},
+            {"name": "paid", "type": "INT", "sql": "1", "filter": "tier <> 'free'"},
+        ],
+        measures=[
+            {"name": "paying", "formula": "sum(paid)"},
+            {"name": "everyone", "formula": "count(user_id)"},
+            {"name": "share", "formula": "paying / everyone"},
+            {"name": "doubled", "formula": "sum(paid) + sum(paid)"},
+        ],
+    )
+    metrics = {m.name: m for m in source(tmp_path, tiers).semantic_catalog().metrics}
+
+    assert metrics["users.paying"].filter == "(status <> 'test') AND (tier <> 'free')"
+    assert metrics["users.doubled"].filter == metrics["users.paying"].filter
+    assert metrics["users.everyone"].filter == "status <> 'test'"
+    assert metrics["users.share"].filter == "status <> 'test'"
+
+
+def test_an_unread_formula_says_its_column_filter_is_unknown(tmp_path, monkeypatch):
+    from exmergo_dex_core.slayer import loader
+
+    tiers = model(
+        "users",
+        columns=[{"name": "paid", "type": "INT", "filter": "tier <> 'free'"}],
+        measures=[{"name": "paying", "formula": "sum(paid)"}],
+    )
+    monkeypatch.setattr(loader, "find_spec", lambda name: None)
+    catalog = source(tmp_path, tiers).semantic_catalog()
+
+    (metric,) = catalog.metrics
+    assert metric.filter is None
+    assert any("'paying' could not be read" in note for note in catalog.notes)
 
 
 def test_a_saved_measure_is_a_formula_metric_and_never_a_measure(tmp_path):
@@ -722,24 +922,34 @@ def test_explore_semantic_list_narrows_by_metric_and_dimension(tmp_path, capsys)
     ]
 
 
-@pytest.mark.parametrize(
-    "argv",
-    [
-        ("explore", "semantic", "query", "orders.revenue"),
-        ("explore", "semantic", "values", "orders.status"),
-    ],
-)
-def test_a_slayer_query_or_values_is_refused_naming_the_governed_route(
-    tmp_path, capsys, argv
-):
+def test_a_slayer_values_reaches_dex_s_own_connection(tmp_path, capsys):
+    """It used to be refused for want of a runtime. Now it is resolved and
+    rendered, and what stops it is dex's connection, which this config names no
+    warehouse for: SLayer opened nothing of its own."""
+
     root = _repo(tmp_path, ORDERS, CUSTOMERS)
 
-    rc, envelope = _run(capsys, root, *argv)
+    rc, envelope = _run(capsys, root, "explore", "semantic", "values", "orders.status")
 
     assert rc != 0
-    assert "explore query" in " ".join(envelope["errors"]) or "profile" in " ".join(
-        envelope["errors"]
-    )
+    assert envelope["errors"] == [
+        "no DuckDB path: pass --path or set duckdb.path in .dex/config.yml"
+    ]
+
+
+def test_a_slayer_query_reaches_dex_s_own_connection(tmp_path, capsys):
+    """It used to be refused for want of a runtime. Now it is translated and
+    rendered, and the only thing between it and a result is dex's connection,
+    which this config names no warehouse for: SLayer opened nothing of its own."""
+
+    root = _repo(tmp_path, ORDERS, CUSTOMERS)
+
+    rc, envelope = _run(capsys, root, "explore", "semantic", "query", "orders.revenue")
+
+    assert rc != 0
+    assert envelope["errors"] == [
+        "no DuckDB path: pass --path or set duckdb.path in .dex/config.yml"
+    ]
 
 
 def test_the_engine_resolves_the_slayer_layer_and_its_declarations(tmp_path):

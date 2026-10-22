@@ -1584,3 +1584,167 @@ def test_a_hand_written_clickhouse_profile_warns_that_it_cannot_be_capped(
     assert warnings
     assert "cannot wind the confirmed budget down" in warnings[0]
     assert "DEX_CLICKHOUSE_MAX_EXECUTION_TIME" in warnings[0]
+
+
+# --- trino --------------------------------------------------------------------
+
+
+def _trino(
+    dbt_project_dir: Path,
+    *,
+    dev_catalog: str = "lake",
+    dev_schema: str = "dbt_dev",
+    session_properties: bool = True,
+    deployment: str = "self_hosted",
+):
+    pytest.importorskip("trino")
+    from fakes.trino import FakeTrinoConnection, FakeTrinoTable
+
+    from exmergo_dex_core.adapters.trino import TrinoAdapter
+    from exmergo_dex_core.config import TrinoTarget
+    from exmergo_dex_core.envelope import Paradigm
+    from exmergo_dex_core.guards.cost_guard import CostGate
+    from exmergo_dex_core.transform.init import trino_session_properties
+
+    connection = FakeTrinoConnection(
+        tables=[
+            FakeTrinoTable(
+                catalog="memory",
+                schema="app",
+                name="orders",
+                columns=[("id", "bigint", True)],
+            )
+        ],
+        catalogs={
+            "memory": "memory",
+            "lake": "iceberg",
+            "tpch": "tpch",
+            "sink": "blackhole",
+            "system": "system",
+        },
+    )
+    adapter = TrinoAdapter(
+        connection=connection,
+        cost_gate=CostGate(
+            paradigm=Paradigm.DB_LOAD,
+            ceiling=None,
+            session_ceiling=None,
+            session_spent=0.0,
+            confirmed=False,
+            connector="trino",
+        ),
+        target=TrinoTarget(),
+        clock=connection.clock,
+    )
+    properties_block = ""
+    if session_properties:
+        properties_block = "      session_properties:\n" + "".join(
+            "        {}: '{}'\n".format(key, str(value).replace("'", "''"))
+            for key, value in trino_session_properties().items()
+        )
+    _write_profile(
+        dbt_project_dir,
+        "      type: trino\n"
+        "      method: none\n"
+        "      user: dbt_dev\n"
+        f"      database: {dev_catalog}\n"
+        f"      schema: {dev_schema}\n" + properties_block,
+    )
+    config = DexConfig(
+        connector="trino",
+        trino=TrinoTarget(
+            dev_catalog=dev_catalog, dev_schema=dev_schema, deployment=deployment
+        ),
+    )
+    return connection, adapter, config
+
+
+def test_a_writable_trino_dev_catalog_passes_with_a_missing_schema(
+    dbt_project_dir: Path, tmp_path: Path, monkeypatch
+):
+    """dbt-trino creates the schema, so only the catalog has to exist."""
+
+    connection, adapter, config = _trino(dbt_project_dir)
+    _fake_open(monkeypatch, adapter)
+    assert dev_target.check(dbt_project_dir, "dev", config, tmp_path) == []
+    assert connection.data_queries == []
+
+
+@pytest.mark.parametrize(
+    ("catalog", "fragment"),
+    [
+        ("tpch", "tpch catalog, which is read-only"),
+        ("nope", "dbt cannot create a catalog"),
+    ],
+)
+def test_an_unwritable_trino_dev_catalog_is_refused_before_dbt_runs(
+    dbt_project_dir: Path, tmp_path: Path, monkeypatch, catalog, fragment
+):
+    _connection, adapter, config = _trino(dbt_project_dir, dev_catalog=catalog)
+    _fake_open(monkeypatch, adapter)
+    with pytest.raises(dev_target.DevTargetError) as exc:
+        dev_target.check(dbt_project_dir, "dev", config, tmp_path)
+    assert fragment in str(exc.value)
+    assert "trino.dev_catalog" in str(exc.value)
+
+
+@pytest.mark.parametrize(
+    ("catalog", "fragment"), [("memory", "restart"), ("sink", "discards every row")]
+)
+def test_a_trino_dev_catalog_that_loses_writes_passes_with_a_warning(
+    dbt_project_dir: Path, tmp_path: Path, monkeypatch, catalog, fragment
+):
+    _connection, adapter, config = _trino(dbt_project_dir, dev_catalog=catalog)
+    _fake_open(monkeypatch, adapter)
+    warnings = dev_target.check(dbt_project_dir, "dev", config, tmp_path)
+    assert any(fragment in w for w in warnings)
+
+
+def test_a_galaxy_trino_target_is_refused_before_anything_opens(
+    dbt_project_dir: Path, tmp_path: Path, monkeypatch
+):
+    """A build whose pricing connection fails degrades to a note and runs dbt
+    anyway, so the refusal has to happen here too, and first."""
+
+    _connection, _adapter, config = _trino(dbt_project_dir, deployment="galaxy")
+
+    def unreachable(**_kwargs):
+        raise AssertionError("a refused deployment opened a connection")
+
+    monkeypatch.setattr("exmergo_dex_core.connect.open_adapter", unreachable)
+    with pytest.raises(dev_target.DevTargetError, match="Starburst Galaxy"):
+        dev_target.check(dbt_project_dir, "dev", config, tmp_path)
+
+
+def test_a_dex_rendered_trino_profile_can_be_capped(
+    dbt_project_dir: Path, tmp_path: Path, monkeypatch
+):
+    _connection, adapter, config = _trino(dbt_project_dir)
+    _fake_open(monkeypatch, adapter)
+    warnings = dev_target.check(dbt_project_dir, "dev", config, tmp_path)
+    assert not any("cannot wind the confirmed budget down" in w for w in warnings)
+
+
+def test_a_hand_written_trino_profile_warns_that_it_cannot_be_capped(
+    dbt_project_dir: Path, tmp_path: Path, monkeypatch
+):
+    _connection, adapter, config = _trino(dbt_project_dir, session_properties=False)
+    _fake_open(monkeypatch, adapter)
+    warnings = dev_target.check(dbt_project_dir, "dev", config, tmp_path)
+    (warning,) = [w for w in warnings if "cannot wind the confirmed budget down" in w]
+    assert "session_properties" in warning
+    assert "DEX_TRINO_QUERY_MAX_RUN_TIME" in warning
+
+
+def test_trino_drift_folds_case_and_reads_the_catalog_as_database(
+    dbt_project_dir: Path, tmp_path: Path, monkeypatch
+):
+    _connection, adapter, config = _trino(dbt_project_dir, dev_catalog="Lake")
+    _fake_open(monkeypatch, adapter)
+    # Profile database "Lake" against config "lake" is one catalog to Trino.
+    config.trino.dev_catalog = "lake"
+    dev_target.check(dbt_project_dir, "dev", config, tmp_path)
+
+    config.trino.dev_catalog = "other"
+    with pytest.raises(dev_target.DevTargetError, match=r"trino\.dev_catalog"):
+        dev_target.check(dbt_project_dir, "dev", config, tmp_path)

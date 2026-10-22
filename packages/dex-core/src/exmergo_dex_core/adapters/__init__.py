@@ -1,5 +1,5 @@
 """Connector adapters: DuckDB, BigQuery, Snowflake, Databricks, Postgres,
-Redshift, and ClickHouse.
+Redshift, ClickHouse, and Trino.
 
 ``get_adapter`` is the single entry point so callers never import a connector
 client directly; the client libraries stay behind their extras and are imported
@@ -26,6 +26,7 @@ _DIALECTS = {
     "postgres": "postgres",
     "redshift": "redshift",
     "clickhouse": "clickhouse",
+    "trino": "trino",
 }
 
 
@@ -64,6 +65,10 @@ def _adapter_class(connector: str):
         from .clickhouse import ClickHouseAdapter
 
         return ClickHouseAdapter
+    if connector == "trino":
+        from .trino import TrinoAdapter
+
+        return TrinoAdapter
     raise ValueError(f"unknown connector '{connector}'")
 
 
@@ -205,6 +210,7 @@ _RELATION_RULES: dict[str, _RelationRule] = {
     "postgres": _RelationRule(parts=3, fold="lower"),
     "redshift": _RelationRule(parts=3, fold="lower"),
     "clickhouse": _RelationRule(parts=2, fold=None),
+    "trino": _RelationRule(parts=3, fold="lower"),
 }
 
 # An unquoted identifier part, anchored. Deliberately narrow: a leading letter or

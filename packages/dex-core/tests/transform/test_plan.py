@@ -257,14 +257,25 @@ def test_plan_rejects_paths_outside_model_paths(
     assert envelope["status"] == "error"
 
 
-def test_plan_rejects_invalid_yaml(dbt_project_dir: Path, tmp_path: Path, capsys):
+@pytest.mark.parametrize("existing", [False, True], ids=["create", "update"])
+def test_plan_rejects_invalid_yaml(
+    dbt_project_dir: Path, tmp_path: Path, capsys, existing: bool
+):
+    target = dbt_project_dir / "models/staging/bad.yml"
+    if existing:
+        target.write_text("version: 2\nmodels: []\n", encoding="utf-8")
+    before = {
+        path.relative_to(dbt_project_dir): path.read_bytes()
+        for path in dbt_project_dir.rglob("*")
+        if path.is_file()
+    }
     payload = _write_payload(
         tmp_path,
         [
             {
                 "path": "models/staging/bad.yml",
                 "kind": "schema_yml",
-                "content": "version: 2\nmodels:\n  - name: [unclosed\n",
+                "content": "version: 2\ndescription: Collected signal: more\n",
             }
         ],
     )
@@ -282,6 +293,17 @@ def test_plan_rejects_invalid_yaml(dbt_project_dir: Path, tmp_path: Path, capsys
     )
     assert rc == 1
     assert envelope["status"] == "error"
+
+    message = "\n".join(envelope["errors"])
+    assert "models/staging/bad.yml: invalid YAML:" in message
+    assert "line 2, column 30" in message
+    after = {
+        path.relative_to(dbt_project_dir): path.read_bytes()
+        for path in dbt_project_dir.rglob("*")
+        if path.is_file()
+    }
+    assert after == before
+    assert not (tmp_path / ".dex" / "plans").exists()
 
 
 def test_plan_without_content_is_a_clean_error(

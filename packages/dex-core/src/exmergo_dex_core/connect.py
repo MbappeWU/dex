@@ -39,6 +39,7 @@ import yaml
 from .adapters import get_adapter
 from .adapters.base import scope_within
 from .config import (
+    GALAXY_HOST_SUFFIX,
     SEMANTIC_ENVIRONMENT,
     BigQueryTarget,
     ClickHouseTarget,
@@ -47,6 +48,7 @@ from .config import (
     PostgresTarget,
     RedshiftTarget,
     SnowflakeTarget,
+    TrinoTarget,
     load_config,
 )
 from .envelope import Paradigm
@@ -68,23 +70,67 @@ _PARADIGMS = {
     "redshift": Paradigm.COMPUTE_TIME,
     "postgres": Paradigm.DB_LOAD,
     "clickhouse": Paradigm.DB_LOAD,
+    "trino": Paradigm.DB_LOAD,
+}
+
+# Deployments that bill differently from their connector's default. A managed
+# service bills the uptime of capacity it runs for you, which is compute time,
+# where the self-hosted server it is built from bills nothing but load.
+_DEPLOYMENT_PARADIGMS = {
+    ("clickhouse", "cloud"): Paradigm.COMPUTE_TIME,
+    ("trino", "galaxy"): Paradigm.COMPUTE_TIME,
 }
 
 
 def paradigm_for(connector: str | None, config: DexConfig | None = None) -> Paradigm:
     """The cost paradigm a connector bills in, free/local when it bills nothing.
 
-    ClickHouse is the one connector whose paradigm is deployment-dependent.
-    Config-free callers deliberately retain the historical self-hosted answer;
-    callers that resolved a project config must pass it so Cloud refusals and
-    error envelopes are denominated in compute-seconds before an adapter opens.
+    A connector with a ``deployment`` axis (ClickHouse, Trino) bills in the
+    paradigm its declared deployment does. Config-free callers deliberately get
+    the self-hosted answer; callers that resolved a project config must pass it,
+    so that refusals and error envelopes for a managed deployment are
+    denominated in compute-seconds before any adapter opens.
     """
 
-    if connector == "clickhouse" and config is not None:
-        target = config.clickhouse or ClickHouseTarget()
-        if target.deployment == "cloud":
-            return Paradigm.COMPUTE_TIME
+    if connector and config is not None:
+        deployment = getattr(getattr(config, connector, None), "deployment", None)
+        paradigm = _DEPLOYMENT_PARADIGMS.get((connector, deployment))
+        if paradigm is not None:
+            return paradigm
     return _PARADIGMS.get(connector or "", Paradigm.FREE_LOCAL)
+
+
+# Deployments a connector's configuration accepts, so the committed shape is
+# already final, and that dex refuses by name until it can guard them. Refusing
+# beats connecting: a guard denominated in the wrong unit is silent about the
+# spend it cannot see.
+_UNSUPPORTED_DEPLOYMENTS = {
+    ("trino", "galaxy"): (
+        "Starburst Galaxy bills credits for every second a cluster runs, "
+        "including the resume and the idle time before it suspends, and dex does "
+        "not yet model that uptime, so it cannot bound what a command would "
+        "cost. Point dex at a self-hosted Trino or Starburst Enterprise cluster "
+        "(deployment: self_hosted)"
+    ),
+}
+
+
+def assert_deployment_supported(connector: str | None, config: DexConfig) -> None:
+    """Refuse a declared deployment dex cannot guard yet, before anything opens.
+
+    Called on every path that can spend against it: opening an adapter, the
+    dev-target preflight before a build, and ``transform init``. The build path
+    matters most, because a build whose pricing connection fails degrades to a
+    note and runs dbt anyway, so a refusal at connect time alone would let dbt
+    spend uncapped on a deployment the guard was never able to see.
+    """
+
+    deployment = getattr(getattr(config, connector or "", None), "deployment", None)
+    reason = _UNSUPPORTED_DEPLOYMENTS.get((connector, deployment))
+    if reason is not None:
+        raise ConfigurationError(
+            f"{connector}.deployment '{deployment}' is not supported yet: {reason}"
+        )
 
 
 @dataclass(frozen=True)
@@ -168,7 +214,15 @@ class SemanticSource:
 # is a local file dex opens read-only itself, and accepting an outside handle would
 # mean trusting that it is read-only.
 _INJECTABLE = frozenset(
-    {"bigquery", "snowflake", "databricks", "postgres", "redshift", "clickhouse"}
+    {
+        "bigquery",
+        "snowflake",
+        "databricks",
+        "postgres",
+        "redshift",
+        "clickhouse",
+        "trino",
+    }
 )
 
 
@@ -358,6 +412,7 @@ _SCOPE_FIELDS = {
     "postgres": "schemas",
     "redshift": "schemas",
     "clickhouse": "databases",
+    "trino": "catalogs",
 }
 _SCOPE_GRAMMAR = {
     "bigquery": "--scope <dataset> (or <project>.<dataset>)",
@@ -366,6 +421,7 @@ _SCOPE_GRAMMAR = {
     "postgres": "--scope <schema>",
     "redshift": "--scope <schema>",
     "clickhouse": "--scope <database>",
+    "trino": "--scope <catalog> (or <catalog>.<schema>)",
 }
 
 
@@ -427,6 +483,7 @@ def open_adapter(
         connector, project=project, datasets=datasets, scopes=scopes
     )
     assert_connection_source(connector, connection)
+    assert_deployment_supported(connector, config)
 
     if connector == "duckdb":
         if path:
@@ -513,6 +570,18 @@ def open_adapter(
 
     if connector == "clickhouse":
         return _open_clickhouse(
+            config,
+            repo_root,
+            store=_require_store(store, connector),
+            budget=budget,
+            confirmed=confirmed,
+            command=command,
+            scope_override=scopes,
+            connection=connection,
+        )
+
+    if connector == "trino":
+        return _open_trino(
             config,
             repo_root,
             store=_require_store(store, connector),
@@ -659,6 +728,10 @@ def dev_target_scope(connector: str, target) -> str | None:
         return target.dev_schema or None
     if connector == "clickhouse":
         return target.dev_database or None
+    if connector == "trino":
+        if target.dev_catalog and target.dev_schema:
+            return f"{target.dev_catalog}.{target.dev_schema}"
+        return None
     return None
 
 
@@ -1608,6 +1681,336 @@ def _clickhouse_from_dbt_profiles(
                 params["secure"] = str(secure).lower() in ("1", "true", "yes", "on")
             return params
     return None
+
+
+def _open_trino(
+    config: DexConfig,
+    repo_root: str | Path,
+    *,
+    store: ExploreStore,
+    budget: float | None,
+    confirmed: bool,
+    command: str | None,
+    scope_override: list[str] | None = None,
+    connection: ConnectionSource | None = None,
+):
+    target = config.trino or TrinoTarget()
+    target = narrow_target(target, "trino", scope_override)
+    warnings: list[str] = []
+
+    if connection is not None:
+        # The host built the connection; the caps still ride every statement,
+        # because the adapter sets them as session properties through its own
+        # door rather than trusting how the connection was configured.
+        conn = connection.connect()
+        method = connection.auth_method
+        host = target.host
+    else:
+        params, method, warnings = resolve_trino_connection(
+            target, os.environ, repo_root
+        )
+        host = params["host"]
+        _refuse_undeclared_galaxy(host, target)
+        try:
+            import trino
+        except ImportError as exc:
+            raise CredentialDiscoveryError(
+                "the Trino client is not installed; install the connector extra: "
+                "exmergo-dex-core[trino]"
+            ) from exc
+
+        auth = None
+        if params.get("password") is not None:
+            auth = trino.auth.BasicAuthentication(params["user"], params["password"])
+        elif params.get("jwt_token") is not None:
+            auth = trino.auth.JWTAuthentication(params["jwt_token"])
+        conn = trino.dbapi.connect(
+            host=host,
+            port=params["port"],
+            user=params["user"],
+            http_scheme=params["http_scheme"],
+            auth=auth,
+            # No session catalog or schema, ever: every relation is written
+            # catalog.schema.table, so the one the firewall approved is the one
+            # Trino reads.
+            catalog=None,
+            schema=None,
+            # Attribution: an operator can see dex's queries and route them to a
+            # constrained resource group, the server-side backstop dex cannot
+            # raise from inside a session.
+            source="dex",
+            client_tags=["dex"],
+        )
+
+    gate = new_cost_gate(
+        "trino",
+        config,
+        store,
+        budget=budget,
+        confirmed=confirmed,
+        command=command,
+    )
+    return get_adapter(
+        "trino",
+        connection=conn,
+        owns_connection=connection is None,
+        cost_gate=gate,
+        target=target,
+        host=host,
+        auth_method=method,
+        scope_origin=scope_origin("trino", "--scope" if scope_override else None),
+        connection_warnings=warnings,
+    )
+
+
+def _refuse_undeclared_galaxy(host: str, target: TrinoTarget) -> None:
+    """Refuse a Galaxy host reached under a ``self_hosted`` declaration.
+
+    The committed config is validated for this already; a host that arrives
+    from the environment or a dbt profile is checked here, because the guard
+    would otherwise count load on a cluster that bills uptime.
+    """
+
+    if target.deployment == "self_hosted" and host.strip().lower().rstrip(".").endswith(
+        GALAXY_HOST_SUFFIX
+    ):
+        raise ConfigurationError(
+            f"the discovered Trino host {host} is a Starburst Galaxy cluster, but "
+            "trino.deployment is 'self_hosted'. Galaxy bills cluster uptime, which "
+            "a self-hosted declaration would never count; set trino.deployment: "
+            "galaxy in .dex/config.yml"
+        )
+
+
+# Authentication methods a dbt-trino profile may name that dex refuses, with
+# why. Agent sessions are non-interactive, and dex hands the same profile to a
+# dbt subprocess that cannot answer a browser or a ticket prompt either.
+_TRINO_REFUSED_METHODS = {
+    "oauth": "OAuth2 opens a browser to sign in",
+    "oauth_console": "OAuth2 waits for a sign-in at the console",
+    "kerberos": "Kerberos needs a ticket cache dex does not manage",
+    "certificate": "certificate auth needs client key files dex does not manage",
+}
+
+
+def resolve_trino_connection(
+    target: TrinoTarget,
+    env: dict | os._Environ,
+    repo_root: str | Path = ".",
+) -> tuple[dict, str, list[str]]:
+    """Discover Trino connection parameters, never prompting.
+
+    Returns ``(params, auth_method, warnings)``. ``params`` carries ``host``,
+    ``port``, ``user``, ``http_scheme`` and at most one of ``password`` and
+    ``jwt_token``; ``auth_method`` is a coarse class safe to surface; parameter
+    values, including any credential, never leave the engine process.
+    ``warnings`` ride ``connect test``.
+
+    Order: ``TRINO_URL``, the ``TRINO_*`` environment, the committed non-secret
+    target plus ``TRINO_PASSWORD`` or ``TRINO_JWT_TOKEN``, then a dbt profile's
+    trino output with ``env_var`` expanded.
+
+    ``TRINO_URL`` takes only its own credential. ``TRINO_PASSWORD`` and
+    ``TRINO_JWT_TOKEN`` are what a dex-rendered dbt profile reads, so a dbt
+    identity that writes and a dex identity that reads stay separable: the URL
+    for dex, the variables for dbt.
+
+    Password and JWT ride HTTP basic and bearer headers, so a credential over
+    plain HTTP is refused here with the fix rather than left to the client's
+    own refusal; dex never sets the client's ``allow_insecure_auth``.
+    """
+
+    warnings: list[str] = []
+    url = env.get("TRINO_URL")
+    if url:
+        params, warnings = _trino_from_url(url)
+        return _checked_trino_params(params, "TRINO_URL"), "environment:dsn", warnings
+
+    host = env.get("TRINO_HOST")
+    if host:
+        params = {
+            "host": host,
+            "port": env.get("TRINO_PORT"),
+            "user": env.get("TRINO_USER"),
+            "http_scheme": env.get("TRINO_HTTP_SCHEME"),
+            "password": env.get("TRINO_PASSWORD") or None,
+            "jwt_token": env.get("TRINO_JWT_TOKEN") or None,
+        }
+        params = _checked_trino_params(params, "TRINO_HOST")
+        return params, f"environment:{_trino_credential_kind(params)}", warnings
+
+    if target.host:
+        params = {
+            "host": target.host,
+            "port": target.port,
+            # Only the committed user: TRINO_USER is what a dex-rendered dbt
+            # profile reads for the identity that writes, which is usually not
+            # the one dex reads as.
+            "user": target.user,
+            "http_scheme": target.http_scheme,
+            "password": env.get("TRINO_PASSWORD") or None,
+            "jwt_token": env.get("TRINO_JWT_TOKEN") or None,
+        }
+        params = _checked_trino_params(params, "trino.host in .dex/config.yml")
+        return params, f"config_target:{_trino_credential_kind(params)}", warnings
+
+    params, refused = _trino_from_dbt_profiles(repo_root, env)
+    if params is not None:
+        params = _checked_trino_params(params, "the dbt profile's trino output")
+        return params, f"dbt_profile:{_trino_credential_kind(params)}", warnings
+
+    refusal = ""
+    if refused:
+        refusal = (
+            " The dbt profile's trino output was skipped because dex does not use "
+            + "; ".join(sorted(refused))
+            + "; use method: none, ldap (password), or jwt."
+        )
+    raise CredentialDiscoveryError(
+        "no Trino connection could be discovered. Set TRINO_URL (for example "
+        "http://dex_ro@localhost:8080), or TRINO_HOST with TRINO_USER, or commit "
+        "trino.host and trino.user in .dex/config.yml, or add a trino output to "
+        "your dbt profiles.yml." + refusal
+    )
+
+
+def _trino_from_url(url: str) -> tuple[dict, list[str]]:
+    """``trino://`` or ``http(s)://`` with an optional ``user[:password]@``.
+
+    A path (``/catalog/schema``, the client's own URL form) is ignored and
+    warned on rather than honored: dex never sets a session catalog or schema.
+    """
+
+    from urllib.parse import unquote, urlsplit
+
+    parts = urlsplit(url.strip())
+    if parts.scheme not in ("trino", "http", "https") or not parts.hostname:
+        raise CredentialDiscoveryError(
+            "TRINO_URL must look like trino://user@host:port, http://user@host:port "
+            "or https://user[:password]@host:port"
+        )
+    warnings: list[str] = []
+    if parts.path.strip("/") or parts.query:
+        warnings.append(
+            "TRINO_URL names a catalog, schema, or session options; dex ignores "
+            "them, because it never sets a session catalog or schema: every "
+            "relation is read as catalog.schema.table"
+        )
+    params = {
+        "host": parts.hostname,
+        "port": parts.port,
+        "user": unquote(parts.username) if parts.username else None,
+        "http_scheme": parts.scheme if parts.scheme != "trino" else None,
+        "password": unquote(parts.password) if parts.password else None,
+        "jwt_token": None,
+    }
+    return params, warnings
+
+
+def _checked_trino_params(params: dict, source: str) -> dict:
+    """Fill the scheme and port defaults and refuse what cannot work.
+
+    The scheme defaults to https when the port is 443 or a credential is
+    present (the cluster then has TLS, or the credential cannot be sent), and
+    to http otherwise; the port then defaults from the scheme.
+    """
+
+    if not params.get("user"):
+        raise CredentialDiscoveryError(
+            f"{source} names no Trino user; every query runs as a user, which "
+            "the cluster's access control decides on. Set TRINO_USER, or put the "
+            "user in the URL (http://dex_ro@host:8080)"
+        )
+    port = params.get("port")
+    port = int(port) if port not in (None, "") else None
+    credential = (
+        params.get("password") is not None or params.get("jwt_token") is not None
+    )
+    scheme = params.get("http_scheme") or (
+        "https" if credential or port == 443 else "http"
+    )
+    if scheme not in ("http", "https"):
+        raise CredentialDiscoveryError(
+            f"{source}: http_scheme must be http or https, got '{scheme}'"
+        )
+    if credential and scheme == "http":
+        raise CredentialDiscoveryError(
+            f"{source} supplies a password or token over plain HTTP. Trino sends "
+            "both as headers, so they are refused without TLS; use https (set "
+            "TRINO_HTTP_SCHEME=https, or an https:// URL) against a coordinator "
+            "with TLS, or connect without a credential on a cluster that needs none"
+        )
+    return {
+        **params,
+        "port": port if port is not None else (443 if scheme == "https" else 8080),
+        "http_scheme": scheme,
+    }
+
+
+def _trino_credential_kind(params: dict) -> str:
+    """The coarse credential class, never the credential."""
+
+    if params.get("jwt_token") is not None:
+        return "jwt"
+    if params.get("password") is not None:
+        return "password"
+    return "none"
+
+
+def _trino_from_dbt_profiles(
+    repo_root: str | Path, env: dict | os._Environ
+) -> tuple[dict | None, set[str]]:
+    """Best-effort: the connection fields of a ``type: trino`` output in the
+    discovered dbt project's profiles, and the refused auth methods it skipped.
+    Any failure reading the file means "not found".
+
+    dex's own rendered profiles keep the password and token as ``env_var``
+    references; an output whose credential the environment cannot render is
+    skipped rather than connected with a hole where the credential should be.
+    """
+
+    try:
+        from .dbt_project import PROFILES_FILE, find_project, profiles_dir
+
+        project_dir = find_project(repo_root)
+        profiles_path = profiles_dir(project_dir) / PROFILES_FILE
+        profiles = yaml.safe_load(profiles_path.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return None, set()
+    refused: set[str] = set()
+    for profile in profiles.values():
+        if not isinstance(profile, dict):
+            continue
+        for output in (profile.get("outputs") or {}).values():
+            if not isinstance(output, dict) or output.get("type") != "trino":
+                continue
+            method = str(output.get("method") or "none").lower()
+            if method in _TRINO_REFUSED_METHODS:
+                refused.add(f"method: {method} ({_TRINO_REFUSED_METHODS[method]})")
+                continue
+            host = _profile_scalar(output.get("host"), env)
+            if not host:
+                continue
+            params: dict = {
+                "host": host,
+                "port": _profile_scalar(output.get("port"), env),
+                "user": _profile_scalar(output.get("user"), env),
+                "http_scheme": _profile_scalar(output.get("http_scheme"), env),
+                "password": None,
+                "jwt_token": None,
+            }
+            if method == "ldap":
+                params["password"] = _profile_scalar(output.get("password"), env)
+                if not params["password"]:
+                    continue
+            elif method == "jwt":
+                params["jwt_token"] = _profile_scalar(output.get("jwt_token"), env)
+                if not params["jwt_token"]:
+                    continue
+            elif method != "none":
+                continue
+            return params, refused
+    return None, refused
 
 
 def _postgres_from_dbt_profiles(repo_root: str | Path) -> dict | None:

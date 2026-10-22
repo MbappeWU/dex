@@ -3,7 +3,13 @@ reaches the same way, tested once here rather than six times over."""
 
 from __future__ import annotations
 
-from exmergo_dex_core.adapters.base import affordable_combinations
+from exmergo_dex_core.adapters.base import (
+    affordable_combinations,
+    key_shape_expressions,
+    shape_stat_expressions,
+    temporal_alignment_expressions,
+    type_contradiction_expressions,
+)
 from exmergo_dex_core.envelope import Paradigm
 from exmergo_dex_core.guards.cost_guard import CostGate
 
@@ -98,3 +104,55 @@ def test_a_refused_charge_leaves_the_gate_where_it_found_it():
     assert gate.try_charge(60.0) is False
     assert gate.try_charge(60.0) is False
     assert gate.try_charge(50.0) is True
+
+
+# --- fraction literals ----------------------------------------------------------
+
+
+def _regexp(qcol: str, pattern: str) -> str:
+    return f"regexp_like({qcol}, '{pattern}')"
+
+
+def _fraction_builders(**literals) -> list[str]:
+    return [
+        *shape_stat_expressions('"c"', 0, _regexp, **literals),
+        *type_contradiction_expressions(
+            '"c"',
+            0,
+            is_string=True,
+            is_integer=False,
+            regexp_predicate=_regexp,
+            bigint_type="BIGINT",
+            **literals,
+        ),
+        *key_shape_expressions('"c"', 0, _regexp, **literals),
+        *temporal_alignment_expressions(
+            '"c"', 0, lambda q, unit: f"date_trunc('{unit}', {q})", **literals
+        ),
+    ]
+
+
+def test_every_fraction_builder_keeps_its_decimal_literals_by_default():
+    """Every shipped adapter calls the builders without the keyword, so the SQL
+    each of them sends is exactly what it was before the keyword existed."""
+
+    default = _fraction_builders()
+    assert default == _fraction_builders(fraction_literals=("1.0", "0.0"))
+    assert shape_stat_expressions('"c"', 0, _regexp)[0] == (
+        "AVG(CASE WHEN regexp_like(\"c\", '^[A-Z]+([ -][A-Z]+)*$') THEN 1.0 "
+        'WHEN "c" IS NOT NULL THEN 0.0 END) AS su_0'
+    )
+
+
+def test_double_literals_reach_every_fraction():
+    """Trino types 1.0 as decimal(2,1) and AVG keeps that scale, so a fraction of
+    1/3 comes back as 0.3. Every fraction a builder emits has to take the
+    literals it is given, or one statistic silently stays rounded."""
+
+    default = " ".join(_fraction_builders())
+    doubled = " ".join(_fraction_builders(fraction_literals=("1e0", "0e0")))
+    fractions = default.count("THEN 1.0 ")
+    assert fractions > 0
+    assert doubled.count("THEN 1e0 ") == fractions
+    assert doubled.count("THEN 0e0 END") == default.count("THEN 0.0 END")
+    assert "THEN 1.0 " not in doubled and "THEN 0.0 END" not in doubled

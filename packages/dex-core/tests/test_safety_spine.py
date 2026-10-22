@@ -364,6 +364,7 @@ def test_combination_probe_sql_is_select_only_in_every_dialect():
         "postgres",
         "redshift",
         "clickhouse",
+        "trino",
     )
     for dialect in dialects:
         assert assert_select_only(sql, dialect=dialect) == sql
@@ -572,7 +573,15 @@ def test_cost_guard_blocks_over_ceiling():
 
 @pytest.mark.parametrize(
     "connector",
-    ["bigquery", "snowflake", "databricks", "redshift", "postgres", "clickhouse"],
+    [
+        "bigquery",
+        "snowflake",
+        "databricks",
+        "redshift",
+        "postgres",
+        "clickhouse",
+        "trino",
+    ],
 )
 def test_row_attribution_never_spends_unasked_on_a_metered_connector(
     connector, dbt_project_dir: Path, monkeypatch
@@ -618,7 +627,15 @@ def test_row_attribution_never_spends_unasked_on_a_metered_connector(
 
 @pytest.mark.parametrize(
     "connector",
-    ["bigquery", "snowflake", "databricks", "redshift", "postgres", "clickhouse"],
+    [
+        "bigquery",
+        "snowflake",
+        "databricks",
+        "redshift",
+        "postgres",
+        "clickhouse",
+        "trino",
+    ],
 )
 def test_build_verification_never_spends_unasked_on_a_metered_connector(
     connector, dbt_project_dir: Path, monkeypatch
@@ -718,7 +735,15 @@ class _EstimatingAdapter:
 
 @pytest.mark.parametrize(
     "connector",
-    ["bigquery", "snowflake", "databricks", "redshift", "postgres", "clickhouse"],
+    [
+        "bigquery",
+        "snowflake",
+        "databricks",
+        "redshift",
+        "postgres",
+        "clickhouse",
+        "trino",
+    ],
 )
 def test_mutation_coverage_prices_its_whole_batch_before_running_any_of_it(
     connector, dbt_project_dir: Path, monkeypatch
@@ -901,7 +926,15 @@ def _mutation_dbt(invoked: list[str], *, show_stdout: str = "", on_run=None):
 
 @pytest.mark.parametrize(
     "connector",
-    ["bigquery", "snowflake", "databricks", "redshift", "postgres", "clickhouse"],
+    [
+        "bigquery",
+        "snowflake",
+        "databricks",
+        "redshift",
+        "postgres",
+        "clickhouse",
+        "trino",
+    ],
 )
 def test_the_equivalence_check_is_priced_into_the_one_batch_estimate(
     connector, dbt_project_dir: Path, monkeypatch
@@ -955,7 +988,15 @@ def test_the_equivalence_check_is_priced_into_the_one_batch_estimate(
 
 @pytest.mark.parametrize(
     "connector",
-    ["bigquery", "snowflake", "databricks", "redshift", "postgres", "clickhouse"],
+    [
+        "bigquery",
+        "snowflake",
+        "databricks",
+        "redshift",
+        "postgres",
+        "clickhouse",
+        "trino",
+    ],
 )
 def test_mutation_coverage_refuses_a_cap_above_the_engine_ceiling(
     connector, dbt_project_dir: Path, monkeypatch
@@ -1362,6 +1403,7 @@ def test_a_scope_flag_cannot_widen_the_committed_allowlist():
             "databases",
             config_mod.ClickHouseTarget(databases=["app"]),
         ),
+        ("trino", "catalogs", config_mod.TrinoTarget(catalogs=["lake"])),
     ):
         narrowed = narrow_target(target, connector, [getattr(target, field)[0]])
         assert getattr(narrowed, field) == getattr(target, field)
@@ -1534,6 +1576,12 @@ def test_query_firewall_unnest_reshapes_but_never_smuggles():
         # is a Join node rather than a FROM source, so the taint rule reaches
         # it by a different path than every other dialect here.
         "clickhouse": "FROM events ARRAY JOIN JSONExtractKeysAndValuesRaw({col}) AS k",
+        # Trino unnests maps and arrays, not JSON, so the document is parsed and
+        # cast to one first; the cast is what the per-dialect allowlist admits.
+        "trino": (
+            "FROM events CROSS JOIN "
+            "UNNEST(CAST(json_parse({col}) AS ARRAY(JSON))) AS u(k)"
+        ),
     }
     for dialect, idiom in idioms.items():
         allowed = "SELECT k " + idiom.format(col="doc")
@@ -1544,6 +1592,55 @@ def test_query_firewall_unnest_reshapes_but_never_smuggles():
         flagged = "SELECT k " + idiom.format(col="payload")
         with pytest.raises(QueryRefusedError):
             inspect_query(flagged, cache, QueryLimits(), dialect=dialect)
+
+
+def test_query_firewall_never_reads_a_past_version_of_a_table():
+    # The cache and its PII verdicts describe each table as it is now. A past
+    # snapshot keeps the schema it had then, so SELECT * over one returns a
+    # column dropped since and never profiled, and a change stream returns rows
+    # the table no longer holds. Every dialect's time-travel spelling is refused,
+    # inside a subquery too, while the plain read beside it is admitted.
+    from exmergo_dex_core.cache import ColumnProfile, Dataset, DexCache
+    from exmergo_dex_core.config import QueryLimits
+    from exmergo_dex_core.guards.query_firewall import (
+        QueryRefusedError,
+        inspect_query,
+    )
+
+    cache = DexCache(
+        datasets=[
+            Dataset(
+                identifier="db.main.events",
+                columns=[ColumnProfile(name="id", data_type="INTEGER")],
+            )
+        ]
+    )
+    spellings = {
+        "trino": (
+            "FOR VERSION AS OF 3",
+            "FOR TIMESTAMP AS OF TIMESTAMP '2026-01-01 00:00:00 UTC'",
+        ),
+        "databricks": ("VERSION AS OF 3", "TIMESTAMP AS OF '2026-01-01'"),
+        "bigquery": ("FOR SYSTEM_TIME AS OF TIMESTAMP '2026-01-01'",),
+        "snowflake": (
+            "AT(OFFSET => -60)",
+            "BEFORE(STATEMENT => '8e5d0ca9-005e-44e6-b858-a8f5b37c5726')",
+            "CHANGES(INFORMATION => DEFAULT) AT(OFFSET => -60)",
+        ),
+        "duckdb": ("AT (VERSION => 3)",),
+    }
+    for dialect, clauses in spellings.items():
+        inspect_query(
+            "SELECT id FROM db.main.events", cache, QueryLimits(), dialect=dialect
+        )
+        for clause in clauses:
+            for sql in (
+                f"SELECT * FROM db.main.events {clause}",  # noqa: S608
+                "SELECT id FROM db.main.events WHERE id IN "  # noqa: S608
+                f"(SELECT id FROM db.main.events {clause})",
+            ):
+                with pytest.raises(QueryRefusedError, match="time travel"):
+                    inspect_query(sql, cache, QueryLimits(), dialect=dialect)
 
 
 def test_firewall_block_threshold_is_a_hard_coded_engine_constant():
@@ -4607,6 +4704,7 @@ def test_the_dev_target_is_the_one_scope_that_may_be_absent(
     fake_redshift_connection,
     fake_clickhouse_connection,
     fake_sf_connection,
+    fake_trino_connection,
 ):
     # Family 2, and its one deliberate exception. A verified build reads the
     # namespace dbt writes into, which dbt creates on a first build, so before
@@ -4638,6 +4736,7 @@ def test_the_dev_target_is_the_one_scope_that_may_be_absent(
         SnowflakeAdapter,
         SnowflakeConnectionError,
     )
+    from exmergo_dex_core.adapters.trino import TrinoAdapter, TrinoConnectionError
     from exmergo_dex_core.config import (
         BigQueryTarget,
         ClickHouseTarget,
@@ -4645,6 +4744,7 @@ def test_the_dev_target_is_the_one_scope_that_may_be_absent(
         PostgresTarget,
         RedshiftTarget,
         SnowflakeTarget,
+        TrinoTarget,
     )
     from exmergo_dex_core.guards.cost_guard import CostGate
 
@@ -4719,6 +4819,16 @@ def test_the_dev_target_is_the_one_scope_that_may_be_absent(
             ("shop", "__not_a_database__", "dbt_dev"),
             ClickHouseConnectionError,
         ),
+        "trino": (
+            lambda scope: TrinoAdapter(
+                connection=fake_trino_connection,
+                cost_gate=gate(env.Paradigm.DB_LOAD, "trino"),
+                target=TrinoTarget(catalogs=[scope]),
+                clock=fake_trino_connection.clock,
+            ),
+            ("memory.shop", "memory.__not_a_schema__", "memory.dbt_dev"),
+            TrinoConnectionError,
+        ),
     }
 
     for name, (make, (committed, missing, dev), error) in connectors.items():
@@ -4739,6 +4849,7 @@ def test_the_dev_target_is_the_one_scope_that_may_be_absent(
     assert fake_pg_connection.data_statements == []
     assert fake_redshift_connection.data_statements == []
     assert fake_clickhouse_connection.data_queries == []
+    assert fake_trino_connection.data_queries == []
 
 
 def test_a_scope_flag_cannot_reach_the_dev_target(fake_sf_connection):
@@ -5043,6 +5154,13 @@ def test_ledgers_never_mix_paradigms(tmp_path: Path):
             "billed_seconds": 13.0,
         }
     )
+    store.append_spend_log(
+        {
+            "at": "2026-07-05T00:00:06+00:00",
+            "connector": "trino",
+            "billed_seconds": 17.0,
+        }
+    )
     assert store.spend_since("2026-07-05T00:00:00+00:00", connector="bigquery") == 5000
     assert (
         store.spend_since(
@@ -5067,6 +5185,12 @@ def test_ledgers_never_mix_paradigms(tmp_path: Path):
             "2026-07-05T00:00:00+00:00", field="billed_seconds", connector="redshift"
         )
         == 13.0
+    )
+    assert (
+        store.spend_since(
+            "2026-07-05T00:00:00+00:00", field="billed_seconds", connector="trino"
+        )
+        == 17.0
     )
 
 
@@ -6213,6 +6337,335 @@ def test_clickhouse_spend_ledger_holds_no_sql_or_values(
     assert "SELECT" not in _json.dumps(entry)
     assert entry["billed_seconds"] > 0
     assert entry["statement_sha256"]
+
+
+# --- Trino: the third db-load connector exercises every family ------------------
+#
+# These run against the fake connection (tests/fakes/trino.py): deterministic,
+# offline, free. They importorskip on the [trino] extra, which CI and the release
+# gate install, so trimming that extra from a workflow would silently skip
+# release-blocking families; keep `--extra trino` in ci.yml and release.yml.
+#
+# What is specific to this engine: one cluster serves many catalogs, dex never
+# sets a session catalog so every relation must be fully qualified, there is no
+# read-only session mode to lean on, and a decimal literal silently rounds every
+# profiled fraction. Each is pinned here with the sibling that must still pass.
+
+
+def _trino_adapter(fake_trino_connection, *, ceiling=600.0, confirmed=True):
+    from exmergo_dex_core.adapters.trino import TrinoAdapter
+    from exmergo_dex_core.config import TrinoTarget
+    from exmergo_dex_core.guards.cost_guard import CostGate
+
+    gate = CostGate(
+        paradigm=env.Paradigm.DB_LOAD,
+        ceiling=ceiling,
+        session_ceiling=None,
+        session_spent=0.0,
+        confirmed=confirmed,
+        connector="trino",
+    )
+    return TrinoAdapter(
+        connection=fake_trino_connection,
+        cost_gate=gate,
+        target=TrinoTarget(),
+        auth_method="environment:none",
+        clock=fake_trino_connection.clock,
+    )
+
+
+def test_trino_generated_sql_is_select_only_and_fully_qualified(fake_trino_connection):
+    # Family 1: every data statement the adapter generates passes the guard in
+    # its own dialect, and names every relation catalog.schema.table.
+    from exmergo_dex_core.adapters.trino import guard
+    from exmergo_dex_core.guards.sql_guard import assert_select_only
+
+    adapter = _trino_adapter(fake_trino_connection)
+    _meta, columns = adapter.table_metadata("memory.shop.customers")
+    sql, _plan = adapter._build_aggregate_sql(
+        "memory.shop.customers",
+        columns,
+        {"created_at"},
+        {"email"},
+        {"email"},
+        {"email"},
+        {"created_at"},
+    )
+    assert assert_select_only(sql, dialect="trino") == sql
+    assert guard(sql) == sql
+    assert '"memory"."shop"."customers"' in sql
+    for prefix in ("nn_", "d_", "su_", "sp_", "st_", "tp_d_", "tg_d_"):
+        assert prefix in sql
+
+
+def test_trino_guard_refuses_what_a_session_could_do_and_admits_the_sibling():
+    # Family 1: refusals that only matter on Trino, each beside the statement
+    # that must still pass. EXPLAIN ANALYZE executes the query it explains;
+    # CALL runs connector procedures (rollback_to_snapshot); SET and RESET
+    # SESSION would let a statement lift the caps; a table function sends opaque
+    # SQL to a federated database; a partial name resolves against a session
+    # catalog dex never set; "$path" and "t$files" are values no cache profiled.
+    from exmergo_dex_core.adapters.trino import guard
+    from exmergo_dex_core.guards.sql_guard import NotSelectOnlyError
+
+    refused_and_sibling = [
+        ("SELECT id FROM shop.customers", "SELECT id FROM memory.shop.customers"),
+        (
+            "SELECT * FROM TABLE(pg.system.query(query => 'DELETE FROM t'))",
+            "SELECT * FROM pg.public.accounts",
+        ),
+        (
+            'SELECT "$path" FROM lake.app.orders',
+            "SELECT orderkey FROM lake.app.orders",
+        ),
+        ('SELECT * FROM lake.app."orders$files"', "SELECT * FROM lake.app.orders"),
+        (
+            "SELECT * FROM lake.app.orders FOR VERSION AS OF 1",
+            "SELECT * FROM lake.app.orders",
+        ),
+        ("EXPLAIN ANALYZE SELECT 1", "SELECT 1"),
+        ("CALL lake.system.rollback_to_snapshot('app', 'orders', 1)", "SELECT 1"),
+        ("EXECUTE prepared", "SELECT 1"),
+        ("SET SESSION query_max_run_time = '100d'", "SELECT 1"),
+        ("RESET SESSION query_max_run_time", "SELECT 1"),
+        ("USE memory.shop", "SELECT 1"),
+        ("ANALYZE lake.app.orders", "SELECT COUNT(*) FROM lake.app.orders"),
+    ]
+    for refused, sibling in refused_and_sibling:
+        with pytest.raises(NotSelectOnlyError):
+            guard(refused)
+        assert guard(sibling) == sibling
+
+
+def test_trino_explain_analyze_stays_refused_if_the_parser_ever_models_it():
+    # Family 1: EXPLAIN ANALYZE is refused today only because sqlglot parses it
+    # as a Command. A parser upgrade that modeled it as Describe would pass the
+    # base guard, which admits DESCRIBE as introspection, so the Trino guard
+    # refuses Describe itself: the adapter never issues one.
+    from exmergo_dex_core.adapters.trino import guard
+    from exmergo_dex_core.guards.sql_guard import NotSelectOnlyError, assert_select_only
+
+    assert_select_only("DESCRIBE memory.shop.customers", dialect="trino")
+    with pytest.raises(NotSelectOnlyError):
+        guard("DESCRIBE memory.shop.customers")
+
+
+def test_trino_profiled_fractions_cannot_round_to_one_decimal(fake_trino_connection):
+    # Family 1's honesty half: a detector that rounds silently is worse than an
+    # absent one, because a wrong fraction reads as a measurement. Trino types
+    # 1.0 as decimal(2,1) and avg(decimal) keeps that scale, so a fraction of 1/3
+    # comes back as 0.3. Measured live: 0.3 with the decimal literals, 0.333
+    # with double ones. Every fraction must carry the double literals.
+    adapter = _trino_adapter(fake_trino_connection)
+    _meta, columns = adapter.table_metadata("memory.shop.customers")
+    sql, _plan = adapter._build_aggregate_sql(
+        "memory.shop.customers",
+        columns,
+        set(),
+        {"email"},
+        {"email"},
+        {"email"},
+        {"created_at"},
+    )
+    assert sql.count("THEN 1e0 ") > 0
+    assert "THEN 1.0 " not in sql
+    assert "THEN 0.0 END" not in sql
+
+
+def test_trino_nested_types_never_reach_a_value_statistic(fake_trino_connection):
+    # Family 1: array(varchar) contains VARCHAR, so the shared predicates ask
+    # for a regexp_like over it, and one FUNCTION_NOT_FOUND kills the whole
+    # batch, silently dropping every other column's statistics with it.
+    adapter = _trino_adapter(fake_trino_connection)
+    _meta, columns = adapter.table_metadata("memory.shop.customers")
+    tags = [c for c in columns if c.name == "tags"]
+    sql, _plan = adapter._build_aggregate_sql(
+        "memory.shop.customers", tags, {"tags"}, {"tags"}, {"tags"}, {"tags"}, set()
+    )
+    assert "regexp_like" not in sql and "approx_distinct" not in sql
+    assert 'COUNT("tags")' in sql
+
+
+def test_trino_unconfirmed_scan_never_executes(fake_trino_connection):
+    # Family 2: the gate binds before anything reaches the cluster.
+    from exmergo_dex_core.guards.cost_guard import ConfirmationRequiredError
+
+    adapter = _trino_adapter(fake_trino_connection, confirmed=False)
+    _meta, columns = adapter.table_metadata("memory.shop.customers")
+    with pytest.raises(ConfirmationRequiredError):
+        adapter.column_aggregates("memory.shop.customers", columns)
+    assert fake_trino_connection.data_queries == []
+
+
+def test_trino_confirmed_run_without_a_ceiling_is_refused(fake_trino_connection):
+    # Family 2: nothing executes unbudgeted.
+    from exmergo_dex_core.guards.cost_guard import CostGuardError
+
+    adapter = _trino_adapter(fake_trino_connection, ceiling=None)
+    _meta, columns = adapter.table_metadata("memory.shop.customers")
+    with pytest.raises(CostGuardError):
+        adapter.column_aggregates("memory.shop.customers", columns)
+    assert fake_trino_connection.data_queries == []
+
+
+def test_trino_over_ceiling_cannot_be_confirmed_through(fake_trino_connection):
+    # Family 2: an over-ceiling estimate refuses first, and confirmation cannot
+    # override it.
+    from exmergo_dex_core.guards.cost_guard import OverCeilingError
+
+    adapter = _trino_adapter(fake_trino_connection, ceiling=0.001)
+    _meta, columns = adapter.table_metadata("memory.shop.events")
+    with pytest.raises(OverCeilingError):
+        adapter.column_aggregates("memory.shop.events", columns)
+    assert fake_trino_connection.data_queries == []
+
+
+def test_trino_every_billed_statement_is_server_capped_and_free_doors_are_not(
+    fake_trino_connection,
+):
+    # Family 2: the layer that binds when the estimate is wrong. The caps live in
+    # the session, so this also pins the other half: a free metadata read after
+    # a billed statement runs under its own fixed wall cap and no byte cap,
+    # never the billed statement's leftovers.
+    adapter = _trino_adapter(fake_trino_connection, ceiling=600.0)
+    _meta, columns = adapter.table_metadata("memory.shop.customers")
+    adapter.column_aggregates("memory.shop.customers", columns)
+    billed = fake_trino_connection.data_queries
+    assert billed
+    for query in billed:
+        assert query.properties["query_max_run_time"].endswith("s")
+        assert int(query.properties["query_max_run_time"][:-1]) >= 1
+        assert query.properties["query_max_scan_physical_bytes"].endswith("B")
+    adapter.forget_metadata()
+    adapter.list_objects()
+    reads = [q for q in fake_trino_connection.queries if "information_schema" in q.sql]
+    assert reads[-1].properties == {"query_max_run_time": "60s"}
+
+
+def test_query_firewall_blocks_trino_value_carrying_shapes():
+    # Family 3: PII is flagged and never surfaced, in this dialect's idioms.
+    from exmergo_dex_core.cache import (
+        ColumnProfile,
+        Dataset,
+        DexCache,
+        PIICategory,
+        PIIFlag,
+    )
+    from exmergo_dex_core.config import QueryLimits
+    from exmergo_dex_core.guards.query_firewall import QueryRefusedError, inspect_query
+
+    cache = DexCache(
+        datasets=[
+            Dataset(
+                identifier="memory.shop.customers",
+                object_type="table",
+                row_count=100,
+                columns=[
+                    ColumnProfile(name="id", data_type="bigint"),
+                    ColumnProfile(
+                        name="email",
+                        data_type="varchar",
+                        pii=PIIFlag(category=PIICategory.EMAIL, confidence=0.95),
+                    ),
+                    ColumnProfile(name="attrs", data_type="varchar"),
+                ],
+            )
+        ]
+    )
+    limits = QueryLimits()
+
+    # Carrying shapes stay refused, including Trino's own spellings: arbitrary
+    # and array_agg return values, split synthesizes rows from one, and a table
+    # function or a past snapshot reads something the cache never profiled.
+    for sql in (
+        "SELECT email FROM memory.shop.customers",
+        "SELECT arbitrary(email) FROM memory.shop.customers",
+        "SELECT array_agg(email) FROM memory.shop.customers",
+        "SELECT e FROM memory.shop.customers "
+        "CROSS JOIN UNNEST(split(email, '@')) AS u(e)",
+        "SELECT * FROM TABLE(pg.system.query(query => 'SELECT email FROM users'))",
+        "SELECT * FROM memory.shop.customers FOR VERSION AS OF 1",
+    ):
+        with pytest.raises(QueryRefusedError):
+            inspect_query(sql, cache, limits, dialect="trino")
+
+    # Measuring shapes still pass, so the gate is a taint rule rather than a
+    # column blocklist.
+    for sql in (
+        "SELECT count(*) FROM memory.shop.customers",
+        "SELECT approx_distinct(email) FROM memory.shop.customers",
+        "SELECT count_if(email LIKE '%@example.com') FROM memory.shop.customers",
+        "SELECT bool_and(email IS NOT NULL), every(id > 0) FROM memory.shop.customers",
+        "SELECT k, count(*) FROM memory.shop.customers "
+        "CROSS JOIN UNNEST(CAST(json_parse(attrs) AS MAP(VARCHAR, JSON))) AS u(k, v) "
+        "GROUP BY k",
+    ):
+        inspect_query(sql, cache, limits, dialect="trino")
+
+
+def test_init_trino_profile_is_dev_only_with_no_secrets(tmp_path, monkeypatch):
+    # Family 4 and 5: the rendered profile writes only to the dev catalog and
+    # schema and carries no credential value; the build caps survive the yaml
+    # round trip as live references.
+    import yaml as _yaml
+
+    from exmergo_dex_core.config import DexConfig, TrinoTarget
+    from exmergo_dex_core.transform.init import _trino_profile
+
+    for var in ("TRINO_URL", "TRINO_JWT_TOKEN"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("TRINO_HOST", "trino.internal")
+    monkeypatch.setenv("TRINO_USER", "dbt_dev")
+    monkeypatch.setenv("TRINO_PASSWORD", "super-secret")
+    config = DexConfig(
+        connector="trino",
+        trino=TrinoTarget(catalogs=["lake.app"], dev_catalog="lake"),
+    )
+    rendered = _trino_profile("proj", None, config, tmp_path)
+
+    assert "super-secret" not in rendered
+    output = _yaml.safe_load(rendered)["proj"]["outputs"]["dev"]
+    assert output["type"] == "trino"
+    assert (output["database"], output["schema"]) == ("lake", "dbt_dev")
+    assert output["method"] == "ldap"
+    assert output["password"].startswith("{{ env_var(")
+    for value in output["session_properties"].values():
+        assert value.startswith("{{ env_var(") and value.endswith(") }}")
+
+
+def test_trino_capabilities_pass_the_sanitizer(fake_trino_connection):
+    # Family 5: nothing in the free probe trips the secret-key scan.
+    adapter = _trino_adapter(fake_trino_connection)
+    env.sanitize(env.ok(adapter.capabilities()))
+
+
+def test_trino_spend_ledger_holds_no_sql_or_values(tmp_path, fake_trino_connection):
+    # Family 5: the ledger records a hash, a number and the query id, never
+    # statement text.
+    import json as _json
+
+    from fakes.trino import FakeResult
+
+    from exmergo_dex_core.storage.filesystem import FilesystemStore
+
+    store = FilesystemStore(tmp_path)
+    fake_trino_connection.explain_override = {"memory.shop.customers": 1_000_000}
+    fake_trino_connection.row_resolver = lambda sql: FakeResult(
+        rows=[{"n": 1}], seconds=0.4
+    )
+    adapter = _trino_adapter(fake_trino_connection)
+    adapter.cost_gate._record = store.append_spend_log
+    adapter.run_query(
+        'SELECT COUNT(*) AS n FROM "memory"."shop"."customers"',
+        max_rows=10,
+        timeout_seconds=200,
+    )
+    lines = (tmp_path / ".dex" / "spend.jsonl").read_text().splitlines()
+    entry = _json.loads(lines[-1])
+    assert "SELECT" not in _json.dumps(entry)
+    assert entry["billed_seconds"] > 0
+    assert entry["statement_sha256"]
+    assert entry["job_id"]
 
 
 # --- Maintain: drift detection and reconcile exercise every family -------------

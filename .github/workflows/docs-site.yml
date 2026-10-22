@@ -18,11 +18,16 @@ name: Docs site
 #     section into a copy of exmergo/docs and validate the whole site, so a
 #     broken link, an MDX parse error or a menu the shared site cannot read
 #     fails review.
-#   - from release.yml, after PyPI publish: build, validate, and commit dex/ to
-#     exmergo/docs. Docs never go live for a release that failed to publish, and
-#     they always describe what `pip install` gives you.
-#   - by hand (workflow_dispatch): publish the newest final release tag, or any
-#     ref with allow_untagged (bootstrap or rollback only).
+#   - by dispatch (workflow_dispatch): build, validate, and commit dex/ to
+#     exmergo/docs. release.yml dispatches it for each new final release tag,
+#     after PyPI publish, so docs never go live for a release that failed to
+#     publish and always describe what `pip install` gives you. By hand it
+#     publishes the newest final release tag, or any ref with allow_untagged
+#     (bootstrap or rollback only).
+#
+# There is no workflow_call entry: a reusable-workflow call does not receive the
+# docs-site environment's secrets, which the deploy needs, so release.yml starts
+# this workflow as a run of its own instead.
 #
 # The deploy writes dex/ in exmergo/docs and nothing else, as an ordinary commit
 # on its main branch: another product publishing at the same time cannot be
@@ -38,14 +43,6 @@ name: Docs site
 #   - Never edit dex/ in exmergo/docs: every release replaces it.
 
 on:
-  workflow_call:
-    inputs:
-      ref:
-        type: string
-        required: true
-      deploy:
-        type: boolean
-        default: false
   workflow_dispatch:
     inputs:
       ref:
@@ -103,7 +100,6 @@ jobs:
         env:
           EVENT: ${{ github.event_name }}
           CALL_REF: ${{ inputs.ref }}
-          CALL_DEPLOY: ${{ inputs.deploy }}
           ALLOW_UNTAGGED: ${{ inputs.allow_untagged }}
         run: |
           set -euo pipefail
@@ -122,16 +118,6 @@ jobs:
             else
               echo "::error::${ref} is not the newest final release (${newest}). Set allow_untagged to publish it anyway."
               exit 1
-            fi
-          elif [ "$CALL_DEPLOY" = "true" ]; then
-            ref="$CALL_REF"
-            if ! printf '%s' "$ref" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
-              echo "::notice::${ref} is a pre-release; the docs are built but not published."
-            elif [ "$ref" != "$newest" ]; then
-              echo "::notice::${ref} is not the newest release (${newest}); a backport never replaces newer docs."
-            else
-              deploy=true
-              release="$ref"
             fi
           fi
           if [ -n "$ref" ]; then

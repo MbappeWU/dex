@@ -997,6 +997,22 @@ class SemanticBackendContract:
             found = backend.filter_refs([clause])
             assert found is None or isinstance(found, list)
 
+    # --- the time axis -------------------------------------------------------------
+
+    def test_a_metric_it_does_not_have_has_no_time_axis(self) -> None:
+        """``time_axis_refs`` answers for every backend, and never raises.
+
+        A time grouping projects columns the caller never named, so the PII gate
+        asks the backend which dimensions it buckets. None is the stated position
+        that it cannot say, which leaves the time token on the name heuristic and
+        the result disclosing it; a metric the layer does not have is the case
+        every backend can state that position for.
+        """
+
+        backend = self.make_backend()
+
+        assert backend.time_axis_refs(["__no_such_metric__"]) is None
+
 
 class SemanticCatalogContract:
     """What the catalog has to say about a layer whose contents are known. Mix in
@@ -1015,12 +1031,30 @@ class SemanticCatalogContract:
     to be handed a backend already answering :data:`REFERENCE_LAYER`. Seed it
     however your format is seeded; :func:`reference_dbt_manifest` renders the layer
     in dbt's compiled shape for a format that reads that.
+
+    A kind or field your format cannot carry is named in ``catalog_gaps``, and the
+    assertions here read those declarations: a kind with no ``name`` to report is
+    not counted, and an assertion about a field you declared absent asks the
+    question where your format does answer it, or not at all. What fails is a
+    field left silent without a declaration.
     """
 
     def make_reference_backend(self) -> Any:
         """A backend answering :data:`REFERENCE_LAYER`."""
 
         raise NotImplementedError
+
+    def reported_name(self, kind: str, name: str) -> str:
+        """The name this backend reports for the reference element ``name`` of
+        ``kind``. The identity unless overridden.
+
+        For a format that names an element differently by construction: a SLayer
+        saved measure is queried as ``model.measure``, so that is the metric's
+        name in its catalog. It maps a name and nothing else, so a backend that
+        drops an element or invents one still fails.
+        """
+
+        return name
 
     def test_the_reference_layer_arrives_whole(self) -> None:
         """Every semantic model, metric, entity and measure the layer declares.
@@ -1034,19 +1068,28 @@ class SemanticCatalogContract:
 
         catalog = self.make_reference_backend().list_definitions()
         declared = REFERENCE_LAYER["semantic_models"]
+        expected = {
+            "semantic_models": [model["name"] for model in declared],
+            "metrics": [metric["name"] for metric in REFERENCE_LAYER["metrics"]],
+            "entities": [
+                entity["name"] for model in declared for entity in model["entities"]
+            ],
+            "measures": [
+                measure["name"] for model in declared for measure in model["measures"]
+            ],
+        }
 
-        assert {model.name for model in catalog.semantic_models} == {
-            model["name"] for model in declared
-        }
-        assert {metric.name for metric in catalog.metrics} == {
-            metric["name"] for metric in REFERENCE_LAYER["metrics"]
-        }
-        assert {entity.name for entity in catalog.entities} == {
-            entity["name"] for model in declared for entity in model["entities"]
-        }
-        assert {measure.name for measure in catalog.measures} == {
-            measure["name"] for model in declared for measure in model["measures"]
-        }
+        for kind, names in expected.items():
+            if "name" in set(catalog.unavailable.get(kind, ())):
+                # A kind this format has no element for at all. That it is then
+                # empty is the backend contract's to assert, not this one's.
+                continue
+            reported = {element.name for element in getattr(catalog, kind)}
+            wanted = {self.reported_name(kind, name) for name in names}
+            assert reported == wanted, (
+                f"the reference layer's {kind} did not arrive whole: missing "
+                f"{sorted(wanted - reported)}, unexpected {sorted(reported - wanted)}"
+            )
 
     def test_a_join_resolved_read_reports_every_token_a_query_can_use(self) -> None:
         """The dimension list is what an agent budgeting one discovery call reads.
@@ -1071,7 +1114,9 @@ class SemanticCatalogContract:
                 "per-metric lists are the single-hop set by design"
             )
         declared = {
-            metric["name"]: set(metric["groupable"])
+            self.reported_name("metrics", metric["name"]): {
+                self.reported_name("dimensions", token) for token in metric["groupable"]
+            }
             for metric in REFERENCE_LAYER["metrics"]
         }
 
@@ -1139,9 +1184,17 @@ class SemanticCatalogContract:
         spell the join key differently. That is the join no name-based inference
         can find and the one the layer states outright, so both declarations and
         both keys have to survive the read.
+
+        A format with no entity in its catalog still states the join, through
+        the declaration channel, so there the join and both models' keys are
+        asserted instead. The gap excuses the catalog field, never the join.
         """
 
-        catalog = self.make_reference_backend().list_definitions()
+        backend = self.make_reference_backend()
+        catalog = backend.list_definitions()
+        if "roles" in set(catalog.unavailable.get("entities", ())):
+            self._assert_the_shared_entity_is_a_declared_join(backend)
+            return
         user = next(entity for entity in catalog.entities if entity.name == "user")
         by_model = {role.semantic_model: role for role in user.roles}
 
@@ -1151,6 +1204,26 @@ class SemanticCatalogContract:
         assert by_model["users_sm"].column == "user_id"
         assert by_model["sessions_sm"].column == "visitor_id"
         assert user.type == "primary"
+
+    def _assert_the_shared_entity_is_a_declared_join(self, backend: Any) -> None:
+        users = self.reported_name("semantic_models", "users_sm")
+        sessions = self.reported_name("semantic_models", "sessions_sm")
+
+        joins = {
+            (relationship.model, relationship.to_model): relationship.column_pairs
+            for relationship in backend.declared_relationships()
+        }
+        assert [tuple(pair) for pair in joins.get((sessions, users), ())] == [
+            ("visitor_id", "user_id")
+        ], (
+            "the entity catalog is a declared gap, and the join the shared `user` "
+            f"entity states did not arrive as a declared relationship either: {joins}"
+        )
+
+        keys, _ = backend.declared_keys()
+        assert {(users, "user_id"), (sessions, "session_key")} <= {
+            (key.model, key.column) for key in keys
+        }, "a primary entity's key did not arrive as a declared key"
 
     def test_a_computed_element_carries_no_column_and_a_referencing_one_does(
         self,
@@ -1175,6 +1248,8 @@ class SemanticCatalogContract:
         """
 
         catalog = self.make_reference_backend().list_definitions()
+        if "column" in set(catalog.unavailable.get("measures", ())):
+            pytest.skip("this backend declares it cannot name a measure's column")
         measures = {measure.name: measure for measure in catalog.measures}
 
         assert measures["paying_user_count"].column is None
@@ -1220,6 +1295,38 @@ class SemanticCatalogContract:
         assert tier.name in groupable
         assert tier.name != tier.definition
         assert tier.name.endswith("pricing_tier")
+
+    def test_the_time_token_resolves_to_the_metrics_time_axis_or_declines(
+        self,
+    ) -> None:
+        """A time grouping is screened as the dimensions it buckets, or the
+        backend says it cannot resolve them.
+
+        ``time_axis_refs`` is what the PII gate screens in place of the time
+        token (``metric_time``, or the column a ``--grain`` buckets), so a token
+        it returns has to be one a query could group by, sitting on the column
+        the metric's ``time_axis`` names: anything else screens the wrong column
+        and reports that as evidence. None is a position rather than a failure,
+        and the gate discloses the name-only screening it leads to.
+        """
+
+        backend = self.make_reference_backend()
+        catalog = backend.list_definitions()
+        rows = {dimension.name: dimension for dimension in catalog.dimensions}
+
+        for metric in catalog.metrics:
+            if not metric.time_axis:
+                continue
+            found = backend.time_axis_refs([metric.name])
+            if found is None:
+                continue
+            assert found, f"{metric.name}: an empty answer claims no time axis"
+            for token in found:
+                assert token in rows, f"{metric.name}: {token} is not a dimension"
+                assert rows[token].definition in metric.time_axis, (
+                    f"{metric.name}: {token} is not on the metric's time axis "
+                    f"{metric.time_axis}"
+                )
 
     def test_the_values_of_a_pii_dimension_are_refused(self) -> None:
         """PII is flagged, never surfaced, and this command's whole output is

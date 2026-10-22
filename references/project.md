@@ -413,7 +413,10 @@ takes its indent from the entries already there rather than from a convention, a
 model declaring no columns is declined instead of being given a `columns:` block it
 never had. A `tests` list stays flow if it was flow and block if it was block, the
 file's own choice between `tests` and `data_tests` is kept, and removing the last
-test removes the key rather than leaving an empty list. A test written as a mapping
+test removes the key rather than leaving an empty list. A dropped column takes the
+comment lines written directly above it at its own indent, since those describe
+it; a comment set apart by a blank line is a header for what follows and stays.
+A blank line between two entries stays wherever the edit happens beside it. A test written as a mapping
 is counted and never rewritten, so a configured `accepted_values` survives an edit to
 the plain names beside it. A file dex cannot span safely, one indented with tabs, one
 holding several YAML documents, or one using anchors and aliases, is declined by name
@@ -426,6 +429,44 @@ same content hash, so the second would overwrite the first and the change a revi
 approved would not be the change that got written. Everything folds into one edit per
 path, and an edit that would have reproduced the file you already have is dropped
 rather than offered.
+
+**Where a dbt model is declared is read, not assumed.** For the shipped dbt format,
+`edit_path` answers with the file that already declares `stg_<table>` (a shared
+`_staging.yml` included) and the folder that already holds its SQL, using the same
+lookup `transform place` and model declarations use. The
+`models/staging/stg_<table>.<suffix>` convention answers only for a model the project
+does not have yet. Reconcile and declarations therefore agree on where a model lives,
+and a re-scaffold that would land beside a model the project keeps elsewhere is
+refused as misplaced rather than written as a second copy.
+
+## Declaring what a model means
+
+Separate from the format declarations above, which say where a format's files live,
+a **model declaration** says what one model means: what one row is (`grain`), which
+rows are in (`population`), what each column is (`role`, `null_rule`, `aggregation`,
+`additivity`, `unit`, `references`), and the decisions it rests on (`assumptions`,
+each with its `evidence`). It is authored beside the edits in the plan payload:
+
+```json
+{"edits": [...],
+ "declarations": [{"model": "fct_orders", "grain": ["order_id"], "columns": {...},
+                   "assumptions": [{"decision": "...", "chosen": "...",
+                                    "evidence": "precedent"}]}]}
+```
+
+`transform plan` and `semantic define|update|plan` accept it; a command that does
+not (`transform rename`, `transform remove`) refuses a payload carrying it rather
+than dropping it. dex renders each declaration into the model's existing YAML entry
+with the splice primitives above, writing dbt's own constructs where they exist
+(`description`, `unique`/`not_null`/`relationships` tests) and `config.meta.dex` for
+the rest, and creates an entry beside the model's SQL only when there is none. A
+malformed declaration is refused with the fix named; missing intent is a warning,
+never a refusal. A plan carrying declarations or `schema_yml` edits is parsed by
+dbt before it is stored, and the plan, apply and build envelopes report the declared
+assumptions under `data.decisions`.
+
+Every field, its allowed values, and what it renders into:
+[`skills/transform/references/declarations.md`](../skills/transform/references/declarations.md).
 
 ## The one rule that is not visible in the signatures
 

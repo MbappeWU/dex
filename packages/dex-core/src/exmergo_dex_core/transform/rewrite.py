@@ -143,14 +143,73 @@ def _projects_star(select: exp.Select) -> bool:
     )
 
 
-def output_columns(content: str, path: str) -> set[str] | None:
+def _passes_through(select: exp.Select) -> bool:
+    """Whether ``select`` is a bare ``select * from <one relation>``.
+
+    A filter, an ordering, a limit or a ``distinct`` changes which rows reach the
+    output and not which columns, so the list beneath is still the model's list.
+    A join or a lateral adds the other side's columns to the star, and a grouping
+    makes the star something else, so following any of those would put an edit
+    in a list the output does not simply mirror.
+    """
+
+    if len(select.expressions) != 1 or not isinstance(select.expressions[0], exp.Star):
+        return False
+    from_ = select.args.get("from_") or select.args.get("from")
+    if from_ is None or not isinstance(from_.this, exp.Table):
+        return False
+    return not any(
+        select.args.get(key) for key in ("joins", "laterals", "group", "having")
+    )
+
+
+def _projecting_select(
+    parsed: exp.Expression, select: exp.Select, through_ctes: bool
+) -> tuple[exp.Select, str | None]:
+    """The SELECT that names the model's columns, and the CTE it is the body of.
+
+    Without ``through_ctes`` that is the outermost SELECT and no CTE, which is
+    what every caller saw before the option existed. With it, a final
+    ``select * from renamed`` is followed into ``renamed``, and on through any
+    chain of bare stars, to the first list that names columns: the shape the dbt
+    scaffold writes, and the one where a column is added or removed by a person.
+    A star over something that is not one of this query's CTEs (a ``source()``,
+    a table) stops the walk where it is, so the caller still sees a star.
+    """
+
+    if not through_ctes:
+        return select, None
+    with_ = parsed.args.get("with_") or parsed.args.get("with")
+    ctes = {
+        cte.alias.lower(): cte.this
+        for cte in (with_.expressions if with_ is not None else [])
+        if isinstance(cte, exp.CTE) and isinstance(cte.this, exp.Select)
+    }
+    current, name, seen = select, None, set()
+    while _passes_through(current):
+        from_ = current.args.get("from_") or current.args.get("from")
+        table = from_.this
+        target = table.name.lower()
+        if table.args.get("db") or target not in ctes or target in seen:
+            break
+        seen.add(target)
+        current, name = ctes[target], target
+    return current, name
+
+
+def output_columns(
+    content: str, path: str, *, through_ctes: bool = False
+) -> set[str] | None:
     """The lowercased output column names, or ``None`` where a star hides them.
 
     ``None`` is *unknown*, never *empty*. A caller proving an ancestor has the
     inputs a derivation needs cannot treat a star as proof of anything.
+    ``through_ctes`` reads the list a trailing ``select * from <cte>`` mirrors
+    (see :func:`_projecting_select`) rather than the star itself.
     """
 
-    _blanked, _parsed, select = _parse_model(content, path)
+    _blanked, parsed, outer = _parse_model(content, path)
+    select, _cte = _projecting_select(parsed, outer, through_ctes)
     if _projects_star(select):
         return None
     names = set()
@@ -229,7 +288,12 @@ def _verify_rename(before: str, after: str, path: str, old: str, new: str) -> No
 
 
 def project_column_in_sql(
-    content: str, path: str, expression: str, alias: str
+    content: str,
+    path: str,
+    expression: str,
+    alias: str,
+    *,
+    through_ctes: bool = False,
 ) -> SqlRewrite:
     """Add one projection to a model's outermost SELECT.
 
@@ -239,21 +303,32 @@ def project_column_in_sql(
     A model projecting a star is returned untouched: it already carries the
     column, and adding it explicitly would shadow the star's copy with a second
     one of the same name.
+
+    ``through_ctes`` adds to the list a trailing ``select * from <cte>`` mirrors
+    instead (see :func:`_projecting_select`). It also counts a bare column as
+    already there when any projection reads it, however it is spelled or
+    aliased: ``cast(x as ...) as x`` and ``x as x_label`` both mean a person
+    already brought the column in, and a second copy beside theirs would be a
+    duplicate, not a fix.
     """
 
-    blanked, _parsed, select = _parse_model(content, path)
+    blanked, parsed, outer = _parse_model(content, path)
+    select, cte = _projecting_select(parsed, outer, through_ctes)
     if _projects_star(select):
         return SqlRewrite(content=content, changed=0, star=True)
-    if alias.lower() in (output_columns(content, path) or set()):
+    projected = {(p.alias_or_name or "").lower() for p in select.expressions}
+    if alias.lower() in projected:
+        return SqlRewrite(content=content, changed=0)
+    if through_ctes and expression == alias and _reads(select.expressions, alias):
         return SqlRewrite(content=content, changed=0)
     _refuse_ungrouped(select, path, expression, alias)
 
-    insert_at = _projection_end(blanked, path)
+    insert_at = _projection_end(blanked, path, cte)
     projection = expression if expression == alias else f"{expression} as {alias}"
     indent = _indent_before(content, insert_at)
     rewritten = splice(content, [(insert_at, insert_at, f",\n{indent}{projection}")])
 
-    now = output_columns(rewritten, path)
+    now = output_columns(rewritten, path, through_ctes=through_ctes)
     if now is None or alias.lower() not in now:
         raise RewriteError(
             f"{path}: adding '{alias}' did not produce a column called that, so "
@@ -294,7 +369,9 @@ def _refuse_ungrouped(
     )
 
 
-def _projection_spans(blanked: str, path: str) -> list[tuple[int, int]]:
+def _projection_spans(
+    blanked: str, path: str, cte: str | None = None
+) -> list[tuple[int, int]]:
     """The span of each projection in the outermost SELECT, in source order.
 
     Read off the token stream rather than the parse tree because a projection is
@@ -306,12 +383,18 @@ def _projection_spans(blanked: str, path: str) -> list[tuple[int, int]]:
     subquery's out of this: only the top-level pair bounds the list, and only a
     top-level comma separates it. Positionally aligned with
     ``select.expressions``, since both are in source order.
+
+    ``cte`` reads the list inside that CTE's body instead, measured the same way
+    from inside its parentheses. Token offsets are offsets into the whole file,
+    so the spans need no translating either way.
     """
 
     try:
         tokens = sqlglot.tokenize(blanked)
     except Exception as exc:
         raise RewriteError(f"{path}: dex could not read this model's SQL") from exc
+    if cte is not None:
+        tokens = _cte_body(tokens, cte, path)
 
     depth = 0
     inside: list[Any] = []
@@ -349,10 +432,47 @@ def _projection_spans(blanked: str, path: str) -> list[tuple[int, int]]:
     return spans
 
 
-def _projection_end(blanked: str, path: str) -> int:
-    """The offset just past the last projection of the outermost SELECT."""
+def _cte_body(tokens: list[Any], cte: str, path: str) -> list[Any]:
+    """The tokens between the parentheses of ``<cte> as ( ... )``.
 
-    spans = _projection_spans(blanked, path)
+    Matched at the depth a ``with`` list sits at, so a subquery aliased the same
+    way inside some other CTE is never mistaken for it.
+    """
+
+    depth = 0
+    for index, token in enumerate(tokens):
+        if token.token_type is sqlglot.TokenType.L_PAREN:
+            depth += 1
+        elif token.token_type is sqlglot.TokenType.R_PAREN:
+            depth -= 1
+        elif (
+            depth == 0
+            and token.text.strip('"`').lower() == cte
+            and index + 2 < len(tokens)
+            and tokens[index + 1].token_type is sqlglot.TokenType.ALIAS
+            and tokens[index + 2].token_type is sqlglot.TokenType.L_PAREN
+        ):
+            inner, level = [], 0
+            for candidate in tokens[index + 3 :]:
+                if candidate.token_type is sqlglot.TokenType.L_PAREN:
+                    level += 1
+                elif candidate.token_type is sqlglot.TokenType.R_PAREN:
+                    if level == 0:
+                        return inner
+                    level -= 1
+                inner.append(candidate)
+            break
+    raise RewriteError(
+        f"{path}: dex could not find the body of the '{cte}' CTE, so it will not "
+        "change its column list"
+    )
+
+
+def _projection_end(blanked: str, path: str, cte: str | None = None) -> int:
+    """The offset just past the last projection of the outermost SELECT, or of
+    ``cte``'s SELECT when one is named."""
+
+    spans = _projection_spans(blanked, path, cte)
     if not spans:
         raise RewriteError(
             f"{path}: this model projects no columns, so dex has nothing to add to"
@@ -360,7 +480,9 @@ def _projection_end(blanked: str, path: str) -> int:
     return spans[-1][1]
 
 
-def unproject_column_in_sql(content: str, path: str, column: str) -> SqlRewrite:
+def unproject_column_in_sql(
+    content: str, path: str, column: str, *, through_ctes: bool = False
+) -> SqlRewrite:
     """Remove one projection from a model's outermost SELECT.
 
     The comma that separated it goes with it, chosen from whichever side exists
@@ -369,24 +491,47 @@ def unproject_column_in_sql(content: str, path: str, column: str) -> SqlRewrite:
     A model projecting a star is left alone and says so: the column is not named
     there, and dex will not rewrite a star into an explicit list to exclude one
     column, because that would freeze every other column at today's shape.
+
+    ``through_ctes`` removes it from the list a trailing ``select * from <cte>``
+    mirrors instead (see :func:`_projecting_select`), and is the mode for a
+    column that is *gone upstream* rather than one being retired by choice. Only
+    a projection that is the column itself goes, ``status`` or
+    ``cast(paid_at as timestamp(6)) as paid_at``: every column it reads is this
+    one and it keeps the name. Any other read of the column anywhere in the model
+    (``status as order_status``, ``md5(status)``, a ``where`` on it) is refused
+    with what it is, because what that logic should become without its input is
+    a decision about the model, and deleting it would be making it.
     """
 
-    blanked, _parsed, select = _parse_model(content, path)
+    blanked, parsed, outer = _parse_model(content, path)
+    select, cte = _projecting_select(parsed, outer, through_ctes)
     if _projects_star(select):
+        if through_ctes:
+            # A star the walk could not see past (one over a join) still leaves
+            # every list beneath it naming the column, so a read anywhere is
+            # refused here exactly as it is below.
+            _refuse_hand_written_reads(select, parsed, [], column, blanked, path)
         return SqlRewrite(content=content, changed=0, star=True)
 
-    spans = _projection_spans(blanked, path)
+    spans = _projection_spans(blanked, path, cte)
     if len(spans) != len(select.expressions):
         raise RewriteError(
             f"{path}: dex read {len(spans)} column(s) in this model where its "
             f"parser read {len(select.expressions)}, so it will not edit the "
             "list. Make this edit by hand"
         )
+    target = column.lower()
     matched = [
         index
         for index, projection in enumerate(select.expressions)
-        if (projection.alias_or_name or "").lower() == column.lower()
+        if (projection.alias_or_name or "").lower() == target
     ]
+    if through_ctes:
+        _refuse_hand_written_reads(select, parsed, matched, column, blanked, path)
+        if matched and not _reads([select.expressions[matched[0]]], target):
+            # `'n/a' as status` keeps its name and reads nothing upstream, so the
+            # column going away upstream does not touch it.
+            matched = []
     if not matched:
         return SqlRewrite(content=content, changed=0)
     if len(spans) == 1:
@@ -415,7 +560,7 @@ def unproject_column_in_sql(content: str, path: str, column: str) -> SqlRewrite:
             edits.append((comma, comma + 1, ""))
     rewritten = splice(content, edits)
 
-    now = output_columns(rewritten, path)
+    now = output_columns(rewritten, path, through_ctes=through_ctes)
     if now is None or column.lower() in now:
         raise RewriteError(
             f"{path}: removing '{column}' left it still projected, so nothing "
@@ -423,6 +568,85 @@ def unproject_column_in_sql(content: str, path: str, column: str) -> SqlRewrite:
             "please report it"
         )
     return SqlRewrite(content=rewritten, changed=1)
+
+
+def _refuse_hand_written_reads(
+    select: exp.Select,
+    parsed: exp.Expression,
+    matched: list[int],
+    column: str,
+    blanked: str,
+    path: str,
+) -> None:
+    """Refuse a removal that would take, or leave broken, logic a person wrote.
+
+    The one projection that may go is the column itself under its own name; every
+    other read of it is named in the refusal so the reader knows what to look at.
+    """
+
+    target = column.lower()
+    own = select.expressions[matched[0]] if matched else None
+    if own is not None and _reads([own], target) and not _only_reads(own, target):
+        raise RewriteError(
+            f"{path}: '{column}' is projected from an expression that also reads "
+            "other columns, so dex removed nothing: what it becomes without "
+            f"'{column}' is a decision about the model. Change it by hand or with "
+            "`transform plan`"
+        )
+    owned = (
+        {id(node) for node in own.find_all(exp.Column)} if own is not None else set()
+    )
+    elsewhere = [
+        node
+        for node in parsed.find_all(exp.Column)
+        if node.name.lower() == target and id(node) not in owned
+    ]
+    if elsewhere:
+        raise RewriteError(
+            f"{path}: '{column}' is read by hand-written logic in this model "
+            f"({_where_read(elsewhere[0], blanked)}), so dex removed nothing: what "
+            "that logic becomes without the column is a decision about the model. "
+            "Change it by hand or with `transform plan`"
+        )
+
+
+def _reads(projections: list[exp.Expression], column: str) -> bool:
+    """Whether any of ``projections`` reads ``column``, under any alias."""
+
+    target = column.lower()
+    return any(
+        node.name.lower() == target
+        for projection in projections
+        for node in projection.find_all(exp.Column)
+    )
+
+
+def _only_reads(projection: exp.Expression, column: str) -> bool:
+    """Whether every column ``projection`` reads is ``column``, and it reads one."""
+
+    names = {node.name.lower() for node in projection.find_all(exp.Column)}
+    return names == {column}
+
+
+def _where_read(node: exp.Expression, blanked: str) -> str:
+    """A short, honest label for where ``node`` sits: the projection it is part
+    of, by output name, or the clause that holds it."""
+
+    current: Any = node
+    while current.parent is not None:
+        parent = current.parent
+        if isinstance(parent, exp.Select):
+            slot = next(
+                (key for key, value in parent.args.items() if value is current), None
+            )
+            if any(e is current for e in parent.expressions):
+                name = current.alias_or_name
+                return f"in the projection '{name}'" if name else "in a projection"
+            return f"in a {slot.rstrip('_')} clause" if slot else "in the query"
+        if isinstance(parent, (exp.Where, exp.Group, exp.Having, exp.Join)):
+            return f"in a {parent.key} clause"
+        current = parent
+    return "in the query"
 
 
 def _own_lines(content: str, start: int, end: int) -> tuple[int, int] | None:
@@ -1062,7 +1286,8 @@ def column_tests_span(
                 return (current.items[index - 1][1], span[1], "")
             return (span[0], current.items[index + 1][0], "")
         start = content.rfind("\n", 0, span[0]) + 1
-        return (start, block_end(content, start, indent_of(content, start)), "")
+        end = block_end(content, start, indent_of(content, start))
+        return (start, before_trailing_blanks(content, end), "")
 
     name = added[0]
     if current.key is None:

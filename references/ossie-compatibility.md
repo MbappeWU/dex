@@ -98,8 +98,8 @@ deterministic:
 2. otherwise `ANSI_SQL`;
 3. otherwise the first supported SQL dialect in declaration order.
 
-Four of dex's seven connectors (DuckDB, Postgres, Redshift, ClickHouse) have no
-token in Ossie's enum. They fall to `ANSI_SQL` rather than to something close,
+Five of dex's eight connectors (DuckDB, Postgres, Redshift, ClickHouse, Trino)
+have no token in Ossie's enum. They fall to `ANSI_SQL` rather than to something close,
 because a wrong dialect is a worse answer than the portable one. Every declared
 expression is preserved whichever one dex reads. Cases:
 `dialect_selection`, `dialect_selection_falls_back_to_portable`.

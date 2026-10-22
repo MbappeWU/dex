@@ -37,6 +37,7 @@ from .config_document import (
 )
 from .errors import ConfigurationError, RequestError
 from .results import ConfirmationRequest, Result, to_envelope
+from .values_free import CALLER_ONLY_KEYS, CALLER_ONLY_MESSAGE
 
 # Flags every subcommand accepts that change one run rather than the project.
 # The config verbs read and write the committed file and build no engine, so
@@ -166,6 +167,10 @@ def config_set(
     keys = pairs[0::2]
     if repeated := sorted({key for key in keys if keys.count(key) > 1}):
         raise RequestError(f"{', '.join(repeated)} is set more than once in one call")
+    if caller_only := sorted(
+        {key for key in keys if key.split(".", 1)[0] in CALLER_ONLY_KEYS}
+    ):
+        raise RequestError(f"{', '.join(caller_only)} {CALLER_ONLY_MESSAGE}")
     path = _committed_config(root)
     before = ConfigDocument.read(path)
     after = before

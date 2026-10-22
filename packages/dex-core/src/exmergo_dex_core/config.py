@@ -261,6 +261,85 @@ class ClickHouseTarget(BaseModel):
         return self
 
 
+#: The host suffix every Starburst Galaxy cluster is reached under. Matched only
+#: to refuse a ``self_hosted`` declaration that points at one; the deployment
+#: itself is always declared, never sniffed from the host.
+GALAXY_HOST_SUFFIX = ".galaxy.starburst.io"
+
+
+class TrinoTarget(BaseModel):
+    """Non-secret Trino connection target. Credentials are never here: auth is
+    discovered at runtime by connect.py (TRINO_URL, the TRINO_* environment,
+    this committed target plus TRINO_PASSWORD or TRINO_JWT_TOKEN, or a dbt
+    profile), and passwords and tokens are never written or logged.
+
+    Trino relations are three-part, ``catalog.schema.table``, and one cluster
+    serves many catalogs of different kinds (memory, iceberg, a federated
+    postgresql), so ``catalogs`` is the source allowlist with entries
+    ``catalog`` or ``catalog.schema``; empty means every catalog the identity
+    can see except ``system``. dex never sets a session catalog or schema.
+    ``dev_catalog``/``dev_schema`` are where dbt dev builds write, refused as a
+    source so reads and writes never share a schema. dbt creates the schema but
+    never the catalog, so ``dev_catalog`` must already exist and be writable.
+
+    ``deployment`` declares which Trino this is, and is a cost decision rather
+    than a connection one. ``self_hosted`` (Trino, Starburst Enterprise, Trino
+    on EMR) bills no currency, so dex guards it as cluster-seconds
+    (``db_load``). ``galaxy`` is Starburst Galaxy, which bills credits per
+    worker-hour of cluster uptime; it is accepted here so the configuration is
+    already in its final shape, and refused by name until its uptime model
+    exists. ``credit_price_usd`` is Galaxy's optional dollar translation and is
+    refused under ``self_hosted``, where it would otherwise be accepted and
+    ignored.
+
+    ``max_full_profile_bytes`` opts large tables into sampled profiling
+    (``TABLESAMPLE BERNOULLI``), measured against the plan's own byte estimate.
+    BERNOULLI still reads every split, so it saves CPU rather than the scan.
+    """
+
+    host: str | None = None
+    port: int | None = None
+    user: str | None = None
+    http_scheme: str | None = None
+    catalogs: list[str] = Field(default_factory=list)
+    dev_catalog: str | None = None
+    dev_schema: str | None = None
+    deployment: str = "self_hosted"
+    credit_price_usd: float | None = None
+    max_full_profile_bytes: int | None = None
+
+    @model_validator(mode="after")
+    def _check_deployment(self) -> TrinoTarget:
+        allowed = ("self_hosted", "galaxy")
+        if self.deployment not in allowed:
+            raise ValueError(
+                f"trino.deployment must be one of {', '.join(allowed)}, "
+                f"got '{self.deployment}'"
+            )
+        if self.http_scheme is not None and self.http_scheme not in ("http", "https"):
+            raise ValueError(
+                f"trino.http_scheme must be http or https, got '{self.http_scheme}'"
+            )
+        if self.deployment == "self_hosted":
+            if self.credit_price_usd is not None:
+                raise ValueError(
+                    "trino.credit_price_usd applies to deployment: galaxy, which "
+                    "bills credits. A self-hosted cluster bills no currency, so "
+                    "dex guards it in cluster-seconds and would never spend this "
+                    "number. Remove it, or set deployment: galaxy"
+                )
+            if self.host and self.host.strip().lower().rstrip(".").endswith(
+                GALAXY_HOST_SUFFIX
+            ):
+                raise ValueError(
+                    f"trino.host '{self.host}' is a Starburst Galaxy cluster, but "
+                    "trino.deployment is 'self_hosted'. Galaxy bills cluster "
+                    "uptime, which a self-hosted declaration would never count; "
+                    "set deployment: galaxy"
+                )
+        return self
+
+
 class QueryLimits(BaseModel):
     """Hard bounds on `explore query` results, enforced in the engine.
 
@@ -1023,6 +1102,7 @@ class DexConfig(BaseModel):
     postgres: PostgresTarget | None = None
     redshift: RedshiftTarget | None = None
     clickhouse: ClickHouseTarget | None = None
+    trino: TrinoTarget | None = None
     dbt_target: str | None = None
     # Which format owns the source of truth. Defaults to dbt, so a repo that
     # selects nothing behaves exactly as it did before this setting existed.

@@ -1,7 +1,8 @@
 """Reading SLayer model files, and judging whether each one is a model.
 
-The one module in dex that imports SLayer. Everything else reaches the validated
-models through :func:`load_models`, which is reached only through a source that
+One of the three modules in dex that import SLayer, beside :mod:`.schema` and
+:mod:`.render`. Everything else reaches the validated models through
+:func:`load_models`, which is reached only through a source that
 :func:`.dependency.ensure_available` let construct, so a base install never
 imports it.
 
@@ -40,6 +41,12 @@ from looking like "this declares nothing".
 """
 
 from __future__ import annotations
+
+# First, before any SLayer import: importing SLayer rewrites sqlglot's reserved
+# keywords process-wide, and this module undoes that (see `sqlglot_keywords`).
+from . import sqlglot_keywords  # noqa: F401
+
+# isort: split
 
 import types
 from collections.abc import Iterator, Mapping, Sequence
@@ -104,6 +111,69 @@ class LoadedModel:
 
     file: str
     model: SlayerModel
+
+    def aggregated_columns(self, measure: Any) -> list[str] | None:
+        """The column references a saved measure's formula aggregates, as
+        SLayer's own parser reads it.
+
+        A bare-name reference to a sibling measure is expanded first, so a ratio
+        of two saved measures reports both sides' columns. ``*`` is a row count
+        and a dotted name is a column reached through a join; both come back as
+        written for the caller to resolve.
+
+        ``None`` means the formula was not read: SLayer's parser refused it, or
+        the ``[sql]`` extra it validates scalar calls with is absent (see
+        :func:`formula_problems`). A caller must not read that as a formula that
+        aggregates nothing.
+        """
+
+        if find_spec("sqlglot") is None:
+            return None
+        from slayer.core.formula import parse_formula
+
+        named = {
+            m.name: m.formula
+            for m in self.model.measures
+            if m.name and m.name != measure.name
+        }
+        try:
+            spec = parse_formula(
+                measure.formula,
+                extra_agg_names=frozenset(a.name for a in self.model.aggregations),
+                named_measures=named,
+            )
+        except (ValueError, RecursionError):
+            return None
+        refs = _aggregated_refs(spec)
+        return None if refs is None else [ref.measure_name for ref in refs]
+
+
+def _aggregated_refs(spec: Any) -> list[Any] | None:
+    """Every aggregated reference in a parsed formula, or ``None`` for a shape
+    this release does not know, which is unread rather than empty."""
+
+    from slayer.core.formula import (
+        AggregatedMeasureRef,
+        ArithmeticField,
+        MixedArithmeticField,
+        TransformField,
+    )
+
+    if isinstance(spec, AggregatedMeasureRef):
+        return [spec]
+    if isinstance(spec, TransformField):
+        return _aggregated_refs(spec.inner)
+    if isinstance(spec, ArithmeticField):
+        return list(spec.agg_refs.values())
+    if isinstance(spec, MixedArithmeticField):
+        found = list(spec.agg_refs.values())
+        for _, transform in spec.sub_transforms:
+            inner = _aggregated_refs(transform)
+            if inner is None:
+                return None
+            found.extend(inner)
+        return found
+    return None
 
 
 @dataclass

@@ -22,6 +22,7 @@ from exmergo_dex_core.config import (
     PostgresTarget,
     RedshiftTarget,
     SnowflakeTarget,
+    TrinoTarget,
 )
 from exmergo_dex_core.connect import ConnectionSource, open_adapter
 from exmergo_dex_core.storage import MemoryStore
@@ -34,6 +35,7 @@ _DISCOVERY = (
     "resolve_postgres_connection",
     "resolve_redshift_connection",
     "resolve_clickhouse_connection",
+    "resolve_trino_connection",
 )
 
 
@@ -91,6 +93,27 @@ def test_postgres_opens_from_a_host_connection(fake_pg_connection):
     assert adapter.capabilities()["auth_method"] == "host_supplied:mtls"
     adapter.close()
     assert fake_pg_connection.closed is False
+
+
+def test_trino_opens_from_a_host_connection(fake_trino_connection):
+    """The caps ride the session properties the adapter sets through its own
+    door, so a connection the host built is capped exactly like one dex built,
+    and the host's connection is never closed by dex."""
+
+    config = DexConfig(
+        connector="trino", trino=TrinoTarget(host="trino.internal", catalogs=["memory"])
+    )
+    source = ConnectionSource(
+        connect=lambda: fake_trino_connection, auth_method="host_supplied:jwt"
+    )
+    adapter = _open(config, source)
+
+    assert adapter.name == "trino"
+    caps = adapter.capabilities()
+    assert caps["auth_method"] == "host_supplied:jwt"
+    assert caps["host"] == "trino.internal"
+    adapter.close()
+    assert fake_trino_connection.closed is False
 
 
 def test_redshift_opens_from_a_host_connection(fake_redshift_connection):

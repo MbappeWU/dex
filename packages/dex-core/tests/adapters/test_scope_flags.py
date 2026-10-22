@@ -19,6 +19,7 @@ from exmergo_dex_core.config import (
     PostgresTarget,
     RedshiftTarget,
     SnowflakeTarget,
+    TrinoTarget,
 )
 from exmergo_dex_core.connect import (
     ScopeError,
@@ -38,7 +39,8 @@ def _assert(connector, *, project=None, datasets=None, scopes=None):
 
 
 @pytest.mark.parametrize(
-    "connector", ["snowflake", "databricks", "postgres", "redshift", "clickhouse"]
+    "connector",
+    ["snowflake", "databricks", "postgres", "redshift", "clickhouse", "trino"],
 )
 @pytest.mark.parametrize(
     ("flag", "kwargs"),
@@ -70,7 +72,15 @@ def test_bigquery_accepts_its_own_flags():
 
 @pytest.mark.parametrize(
     "connector",
-    ["bigquery", "snowflake", "databricks", "postgres", "redshift", "clickhouse"],
+    [
+        "bigquery",
+        "snowflake",
+        "databricks",
+        "postgres",
+        "redshift",
+        "clickhouse",
+        "trino",
+    ],
 )
 def test_scope_is_accepted_on_every_warehouse_connector(connector):
     _assert(connector, scopes=["analytics"])
@@ -91,6 +101,7 @@ def test_no_flags_is_always_fine():
         "postgres",
         "redshift",
         "clickhouse",
+        "trino",
     ):
         _assert(connector)
 
@@ -183,6 +194,11 @@ def test_clickhouse_scope_narrows_and_never_widens():
         ("postgres", PostgresTarget(dev_schema="dbt_dev"), "dbt_dev"),
         ("redshift", RedshiftTarget(dev_schema="dbt_dev"), "dbt_dev"),
         ("clickhouse", ClickHouseTarget(dev_database="dbt_dev"), "dbt_dev"),
+        (
+            "trino",
+            TrinoTarget(dev_catalog="lake", dev_schema="dbt_dev"),
+            "lake.dbt_dev",
+        ),
     ],
 )
 def test_the_dev_target_is_spelled_in_each_connector_s_own_vocabulary(
@@ -201,11 +217,14 @@ def test_the_dev_target_is_spelled_in_each_connector_s_own_vocabulary(
         ("snowflake", SnowflakeTarget(dev_database="ANALYTICS")),
         ("databricks", DatabricksTarget(dev_schema="dbt_dev")),
         ("databricks", DatabricksTarget(dev_catalog="main")),
+        ("trino", TrinoTarget(dev_schema="dbt_dev")),
+        ("trino", TrinoTarget(dev_catalog="lake")),
     ],
 )
-def test_snowflake_and_databricks_need_both_parts_of_the_dev_target(connector, target):
-    """Both scope by the container above the schema, so a bare dev schema names
-    nothing they could read, and a bare container would read all of it."""
+def test_three_part_connectors_need_both_parts_of_the_dev_target(connector, target):
+    """Snowflake, Databricks and Trino scope by the container above the schema,
+    so a bare dev schema names nothing they could read, and a bare container
+    would read all of it."""
 
     assert dev_target_scope(connector, target) is None
 

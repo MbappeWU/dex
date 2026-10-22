@@ -1,14 +1,14 @@
 {
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "dex",
-  "version": "1.14.0",
+  "version": "1.15.2",
   "description": "Analytics engineering for Claude Code and any agent: data warehouse exploration, dbt transformation and semantic modeling, and schema-drift maintenance on dbt.",
   "author": {
     "name": "Exmergo, Inc.",
     "email": "support@exmergo.com",
     "url": "https://www.exmergo.com"
   },
-  "homepage": "https://www.exmergo.com/dex",
+  "homepage": "https://docs.exmergo.com/dex",
   "repository": "https://github.com/exmergo/dex",
   "license": "Apache-2.0",
   "keywords": [
@@ -28,6 +28,7 @@
     "data-contracts",
     "redshift",
     "postgres",
-    "clickhouse"
+    "clickhouse",
+    "trino"
   ]
 }

@@ -53,14 +53,9 @@ def test_drift_added_column_honors_pii_override():
     aggregates exist yet, so it blocks until the next profile); an override
     clears it with the audit recorded."""
 
-    from exmergo_dex_core.cache import ColumnProfile, Dataset
     from exmergo_dex_core.maintain.drift import DriftFinding
-    from exmergo_dex_core.maintain.reconcile import _patched_dataset
+    from exmergo_dex_core.maintain.reconcile import _added_column
 
-    base = Dataset(
-        identifier="db.main.orders",
-        columns=[ColumnProfile(name="id", data_type="INTEGER")],
-    )
     finding = DriftFinding(
         axis="schema",
         code="column_added",
@@ -70,12 +65,10 @@ def test_drift_added_column_honors_pii_override():
         data={"data_type": "VARCHAR"},
     )
 
-    plain = _patched_dataset(base, [finding], set())
-    added = next(c for c in plain.columns if c.name == "customer_name")
+    added = _added_column("db.main.orders", finding, set())
     assert added.pii is not None and added.pii.confidence == 0.6
 
-    cleared = _patched_dataset(base, [finding], {"db.main.orders.customer_name"})
-    added = next(c for c in cleared.columns if c.name == "customer_name")
+    added = _added_column("db.main.orders", finding, {"db.main.orders.customer_name"})
     assert added.pii is None
     assert added.pii_overridden is not None
 
@@ -85,15 +78,10 @@ def test_drift_added_column_honors_pattern_pii_override():
     columns the same way an exact override does: this is the path
     `maintain/commands.py` feeds through `pii_override_paths()`."""
 
-    from exmergo_dex_core.cache import ColumnProfile, Dataset
     from exmergo_dex_core.config import PIIOverride, pii_override_paths
     from exmergo_dex_core.maintain.drift import DriftFinding
-    from exmergo_dex_core.maintain.reconcile import _patched_dataset
+    from exmergo_dex_core.maintain.reconcile import _added_column
 
-    base = Dataset(
-        identifier="db.raw_orders_qa",
-        columns=[ColumnProfile(name="id", data_type="INTEGER")],
-    )
     finding = DriftFinding(
         axis="schema",
         code="column_added",
@@ -106,8 +94,7 @@ def test_drift_added_column_honors_pattern_pii_override():
         [PIIOverride(column_name="customer_name", scope="db.raw_*")]
     )
 
-    cleared = _patched_dataset(base, [finding], matcher)
-    added = next(c for c in cleared.columns if c.name == "customer_name")
+    added = _added_column("db.raw_orders_qa", finding, matcher)
     assert added.pii is None
     assert added.pii_overridden is not None
 
@@ -190,8 +177,8 @@ def test_no_drift_reconciles_to_nothing(maintain_repo):
     assert "no drift" in payload["data"]["hint"]
 
 
-def test_schema_drift_is_mechanical_and_rescaffolds(maintain_repo):
-    # Give reconcile a dex-scaffolded staging model to rebuild.
+def test_schema_drift_is_mechanical_and_splices_the_model(maintain_repo):
+    # A dex-scaffolded staging model, which reconcile edits in place.
     rc, payload = maintain_repo.dex(
         "transform", "plan", "--scaffold", "orders", "scaffold stg_orders"
     )
@@ -212,7 +199,7 @@ def test_schema_drift_is_mechanical_and_rescaffolds(maintain_repo):
     assert proposal["kind"] == "mechanical"
     assert "models/staging/stg_orders.sql" in proposal["paths"]
 
-    # The re-scaffolded model reflects the drift: discount in, status out.
+    # The spliced model reflects the drift: discount in, status out.
     sql_diff = next(
         d for d in payload["diffs"] if d["path"] == "models/staging/stg_orders.sql"
     )
@@ -763,3 +750,218 @@ def test_the_no_format_fallback_answers_exactly_what_dbt_answers():
         EditKind.ANALYSIS_SQL,
     ):
         assert _placed(None, unplaced, "orders") is None
+
+
+# --- #713: minimal edits, never a regenerated model ----------------------------
+
+_STG_SQL = "models/staging/stg_orders.sql"
+_STG_YML = "models/staging/stg_orders.yml"
+
+
+def _edit_sql(repo, old: str, new: str) -> None:
+    path = repo.root / _STG_SQL
+    content = path.read_text(encoding="utf-8")
+    assert old in content, content
+    path.write_text(content.replace(old, new, 1), encoding="utf-8")
+
+
+def _reconcile_after(repo, *statements: str) -> dict:
+    repo.dex("explore", "map")
+    repo.snapshot()
+    repo.sql(*statements)
+    repo.dex("maintain", "schema")
+    _rc, payload = repo.dex("maintain", "reconcile", "schema")
+    assert payload["status"] == "ok", payload.get("errors")
+    return payload
+
+
+def _diff(payload: dict, path: str) -> dict:
+    return next(d for d in payload["diffs"] if d["path"] == path)
+
+
+def test_a_hand_edited_staging_model_keeps_its_edit_when_a_column_drops(
+    maintain_repo,
+):
+    """The issue's repro: one dropped column, one hand-written cast beside it.
+
+    Regenerating from the scaffold template reverted the cast while removing the
+    column, under a `mechanical` label. The splice removes the one line.
+    """
+
+    _edit_sql(
+        maintain_repo,
+        "        amount,\n",
+        "        cast(amount as decimal(12,2)) as amount,\n",
+    )
+
+    payload = _reconcile_after(maintain_repo, "ALTER TABLE orders DROP status")
+
+    mechanical = [p for p in payload["data"]["proposals"] if p["kind"] == "mechanical"]
+    assert len(mechanical) == 1 and _STG_SQL in mechanical[0]["paths"]
+    diff = _diff(payload, _STG_SQL)
+    assert (diff["additions"], diff["deletions"]) == (0, 1), diff["unified"]
+    assert "-        status," in diff["unified"]
+
+    maintain_repo.dex("transform", "apply", payload["data"]["plan_id"])
+    written = (maintain_repo.root / _STG_SQL).read_text(encoding="utf-8")
+    assert "cast(amount as decimal(12,2)) as amount" in written
+    assert "status" not in written
+
+
+def test_a_dropped_column_projected_through_its_own_cast_loses_only_that_line(
+    maintain_repo,
+):
+    _edit_sql(
+        maintain_repo,
+        "        status,\n",
+        "        cast(status as varchar) as status,\n",
+    )
+
+    payload = _reconcile_after(maintain_repo, "ALTER TABLE orders DROP status")
+
+    diff = _diff(payload, _STG_SQL)
+    assert (diff["additions"], diff["deletions"]) == (0, 1), diff["unified"]
+    assert "-        cast(status as varchar) as status," in diff["unified"]
+
+
+def test_a_dropped_column_hand_written_logic_reads_is_advisory_and_unedited(
+    maintain_repo,
+):
+    """What `order_status` becomes without its input is the model's decision."""
+
+    _edit_sql(maintain_repo, "        status,\n", "        status as order_status,\n")
+
+    payload = _reconcile_after(maintain_repo, "ALTER TABLE orders DROP status")
+
+    assert payload["data"]["mechanical_count"] == 0
+    assert payload["data"].get("plan_id") is None
+    dropped = next(
+        p for p in payload["data"]["proposals"] if p["finding_code"] == "column_dropped"
+    )
+    assert dropped["kind"] == "advisory"
+    assert "order_status" in dropped["action"]
+
+
+def test_an_unedited_model_still_gets_a_mechanical_add_of_one_line(maintain_repo):
+    payload = _reconcile_after(
+        maintain_repo, "ALTER TABLE orders ADD COLUMN discount DOUBLE"
+    )
+
+    assert payload["data"]["mechanical_count"] == 1
+    sql = _diff(payload, _STG_SQL)
+    assert "+        discount" in sql["unified"]
+    assert (sql["additions"], sql["deletions"]) == (2, 1), sql["unified"]  # the comma
+    yml = _diff(payload, _STG_YML)
+    assert (yml["additions"], yml["deletions"]) == (1, 0), yml["unified"]
+
+
+def test_a_model_documented_in_a_shared_schema_yml_is_edited_there(maintain_repo):
+    """Comment item 1: no parallel `stg_orders.yml`, which dbt refuses at parse."""
+
+    staged = maintain_repo.root / _STG_YML
+    shared = maintain_repo.root / "models" / "schema.yml"
+    shared.write_text(staged.read_text(encoding="utf-8"), encoding="utf-8")
+    staged.unlink()
+
+    payload = _reconcile_after(
+        maintain_repo, "ALTER TABLE orders ADD COLUMN discount DOUBLE"
+    )
+
+    paths = sorted(d["path"] for d in payload["diffs"])
+    assert paths == ["models/schema.yml", _STG_SQL], paths
+    maintain_repo.dex("transform", "apply", payload["data"]["plan_id"])
+    assert not staged.exists()
+    assert "- name: discount" in shared.read_text(encoding="utf-8")
+
+
+def test_a_model_declared_in_two_files_is_named_rather_than_guessed(maintain_repo):
+    staged = maintain_repo.root / _STG_YML
+    for name in ("a.yml", "b.yml"):
+        (maintain_repo.root / "models" / name).write_text(
+            staged.read_text(encoding="utf-8"), encoding="utf-8"
+        )
+    staged.unlink()
+
+    payload = _reconcile_after(
+        maintain_repo, "ALTER TABLE orders ADD COLUMN discount DOUBLE"
+    )
+
+    assert [d["path"] for d in payload["diffs"]] == [_STG_SQL]
+    assert any("more than one file" in w for w in payload["warnings"])
+
+
+def test_no_test_is_invented_for_an_added_column(maintain_repo):
+    """Comment item 2: the template put `unique` on a column one profile found
+    distinct, which is a guess about the grain rather than a fact."""
+
+    payload = _reconcile_after(
+        maintain_repo,
+        "ALTER TABLE orders ADD COLUMN captured_at TIMESTAMP",
+        "UPDATE orders SET captured_at = "
+        "TIMESTAMP '2024-01-01' + order_id * INTERVAL 1 MINUTE",
+    )
+
+    added = [
+        line
+        for line in _diff(payload, _STG_YML)["unified"].splitlines()
+        if line.startswith("+") and not line.startswith("+++")
+    ]
+    assert added == ["+      - name: captured_at"], added
+
+
+def test_drift_the_project_already_reflects_is_advisory_and_stores_no_plan(
+    maintain_repo,
+):
+    """Comment item 4: a plan already applied the change, so there is no edit."""
+
+    maintain_repo.dex("explore", "map")
+    maintain_repo.snapshot()
+    maintain_repo.sql("ALTER TABLE orders ADD COLUMN discount DOUBLE")
+    _edit_sql(
+        maintain_repo, "        ordered_at\n", "        ordered_at,\n        discount\n"
+    )
+    yml = maintain_repo.root / _STG_YML
+    yml.write_text(
+        yml.read_text(encoding="utf-8") + "      - name: discount\n", encoding="utf-8"
+    )
+    maintain_repo.dex("maintain", "schema")
+
+    _rc, payload = maintain_repo.dex("maintain", "reconcile", "schema")
+
+    assert payload["data"]["mechanical_count"] == 0
+    assert payload["data"].get("plan_id") is None
+    assert not payload.get("diffs")
+    covered = next(
+        p for p in payload["data"]["proposals"] if p["finding_code"] == "schema_drift"
+    )
+    assert covered["kind"] == "advisory"
+    assert "already reflects" in covered["action"]
+    assert "maintain snapshot" in covered["action"]
+
+
+def test_a_model_still_reading_a_dropped_column_downstream_is_named(maintain_repo):
+    maintain_repo.edit(
+        "models/marts/fct_orders.sql",
+        "select order_id, status from {{ ref('stg_orders') }}\n",
+    )
+
+    payload = _reconcile_after(maintain_repo, "ALTER TABLE orders DROP status")
+
+    assert payload["data"]["mechanical_count"] == 1
+    reader = next(w for w in payload["warnings"] if "still read it" in w)
+    assert "models/marts/fct_orders.sql:1" in reader
+
+
+def test_a_declaration_spelled_in_another_case_is_still_the_column(maintain_repo):
+    """Snowflake reports `CHECKSUM` for the `checksum` a person wrote. Matching
+    by exact case read the entry as already gone and called the drift covered."""
+
+    yml = maintain_repo.root / _STG_YML
+    yml.write_text(
+        yml.read_text(encoding="utf-8") + "      - name: STATUS\n", encoding="utf-8"
+    )
+
+    payload = _reconcile_after(maintain_repo, "ALTER TABLE orders DROP status")
+
+    assert payload["data"]["mechanical_count"] == 1
+    assert "-      - name: STATUS" in _diff(payload, _STG_YML)["unified"]

@@ -1,8 +1,6 @@
 name: CI
 
 on:
-  push:
-    branches: [main]
   pull_request:
     branches: [main]
 
@@ -11,7 +9,7 @@ permissions:
 
 jobs:
   # Tier 1: engine correctness + the safety-critical assertions. Deterministic,
-  # fast, free (DuckDB is the test engine). The always-on release gate.
+  # fast, free (DuckDB is the test engine). The merge gate.
   tests:
     runs-on: ubuntu-latest
     strategy:
@@ -29,8 +27,8 @@ jobs:
       # The cloud extras are included so their unit tests and safety families
       # run here (they are offline against fake clients, but they importorskip
       # on the client libraries; without the extras they would silently skip).
-      - name: Sync (duckdb + bigquery + snowflake + databricks + postgres + redshift + clickhouse + dev extras)
-        run: uv sync --extra duckdb --extra bigquery --extra snowflake --extra databricks --extra postgres --extra redshift --extra clickhouse --extra dev --python ${{ matrix.python-version }}
+      - name: Sync (duckdb + bigquery + snowflake + databricks + postgres + redshift + clickhouse + trino + dev extras)
+        run: uv sync --extra duckdb --extra bigquery --extra snowflake --extra databricks --extra postgres --extra redshift --extra clickhouse --extra trino --extra dev --python ${{ matrix.python-version }}
       - name: Tier-1 unit tests
         run: uv run pytest -q
 
@@ -48,56 +46,10 @@ jobs:
       - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           enable-cache: true
-      - name: Sync (duckdb + bigquery + snowflake + databricks + postgres + redshift + clickhouse + dev extras)
-        run: uv sync --extra duckdb --extra bigquery --extra snowflake --extra databricks --extra postgres --extra redshift --extra clickhouse --extra dev
+      - name: Sync (duckdb + bigquery + snowflake + databricks + postgres + redshift + clickhouse + trino + dev extras)
+        run: uv sync --extra duckdb --extra bigquery --extra snowflake --extra databricks --extra postgres --extra redshift --extra clickhouse --extra trino --extra dev
       - name: Safety-critical assertions
         run: uv run pytest -q tests/test_safety_spine.py
-
-  # The query firewall matches sqlglot expression classes by name at module scope,
-  # so a sqlglot major that renames one breaks every install that resolves it. The
-  # declared dependency is therefore capped, and this job is how the cap stays
-  # honest: it installs the newest sqlglot over the cap and re-runs the suite
-  # against it, so a breaking release surfaces here on the next push instead of on
-  # a user's machine after we raise the ceiling blind.
-  #
-  # Deliberately a mirror of the `tests` job rather than a narrower selection: the
-  # firewall is not the only dialect-dependent code (relationship probes and drift
-  # checks transpile per connector), and this job is only informative if a red run
-  # means "the new sqlglot broke something" rather than "the canary environment was
-  # missing something". Two safety-spine tests import boto3 and httpx unguarded and
-  # get them transitively from the [redshift] and [databricks] extras, so a narrower
-  # sync fails for reasons that have nothing to do with sqlglot. Packaging tests are
-  # excluded because they resolve sqlglot inside isolated installs from the declared
-  # cap, so they would report on the capped version and not the one under test.
-  #
-  # Advisory by design (continue-on-error): it reports on code we do not control,
-  # so a red canary is a signal to investigate upstream, never a reason to block a
-  # merge of unrelated work. The `tests` and `safety` jobs remain the real gates.
-  sqlglot-canary:
-    runs-on: ubuntu-latest
-    continue-on-error: true
-    defaults:
-      run:
-        working-directory: packages/dex-core
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
-        with:
-          enable-cache: true
-      - name: Sync (duckdb + bigquery + snowflake + databricks + postgres + redshift + clickhouse + dev extras)
-        run: uv sync --extra duckdb --extra bigquery --extra snowflake --extra databricks --extra postgres --extra redshift --extra clickhouse --extra dev
-      # A direct install into the synced environment, which is what lets it ignore
-      # the ceiling the project declares. `uv sync` would resolve back to the cap.
-      - name: Install the newest sqlglot over the declared ceiling
-        run: uv pip install --upgrade sqlglot
-      # --no-sync so the test run cannot quietly restore the capped version and
-      # report a green canary that tested nothing, which would be worse than having
-      # no canary at all. The version is echoed in the same step for that reason:
-      # the log has to show which sqlglot actually ran.
-      - name: Suite against the newest sqlglot
-        run: |
-          uv run --no-sync python -c "import sqlglot; print('testing sqlglot', sqlglot.__version__)"
-          uv run --no-sync pytest -q -m "not packaging"
 
   # SLayer and dex's guards both bound sqlglot: the pinned SLayer release needs
   # >=30.17 and the [sql] extra caps it <31, so only 30.17 to 30.x satisfies both.
@@ -138,9 +90,11 @@ jobs:
   # which is the only way to hold that contract from here, and it is why there is
   # no Python mermaid dependency (every candidate is either a string builder that
   # replaces nothing, or a renderer that would POST the schema to a third-party
-  # host). Advisory like sqlglot-canary and for the same reason: it tracks a
+  # host). Advisory like sqlglot-canary.yml and for the same reason: it tracks a
   # moving upstream, so a Mermaid release breaking our dialect should be loud
-  # without blocking a merge that changed nothing.
+  # without blocking a merge that changed nothing. It stays per pull request,
+  # unlike that weekly canary, because the corpus it parses is our own renderer's
+  # output, which a pull request can change.
   mermaid-syntax:
     runs-on: ubuntu-latest
     continue-on-error: true

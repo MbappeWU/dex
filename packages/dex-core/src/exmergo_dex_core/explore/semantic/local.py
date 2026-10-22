@@ -4,18 +4,13 @@
 so it needs no extra and no warehouse connection: it is the discovery surface an
 agent uses to find what it can query.
 
-``query`` renders the metric SQL with MetricFlow's ``explain()`` through a
-renderer-only ``SqlClient`` (MetricFlow never opens a connection or sees a
-credential), then runs the rendered SQL through dex's own spine, in order: a PII
-request-gate on the grouped and filtered dimensions (resolved to physical columns
-and checked against the ``.dex/`` cache, with a name heuristic as the floor), a
-SELECT-only assertion, a relation pre-check against the connection's own
-inventory, the cost-before-spend handshake, and the connector. dex owns execution
-here, so the full cost guard applies, unlike the hosted backend.
-
-The SELECT-only assertion runs before the relation pre-check because the pre-check
-may introspect the live connection: whatever else happens to a rendered statement,
-it is proven read-only first.
+``query`` puts a PII request-gate on the grouped and filtered dimensions (resolved
+to physical columns and checked against the ``.dex/`` cache, with a name heuristic
+as the floor) and checks the grain, then renders the metric SQL with MetricFlow's
+``explain()`` through a renderer-only ``SqlClient`` (MetricFlow never opens a
+connection or sees a credential). The rendered SQL is handed to dex's governed
+spine (:mod:`.governed`), which owns the order everything after rendering runs in.
+dex owns execution here, so the full cost guard applies, unlike the hosted backend.
 """
 
 from __future__ import annotations
@@ -25,32 +20,34 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any, ClassVar
 
-from ... import command_args, metricflow_dialect
 from ... import envelope as env
-from ...adapters import get_dialect
-from ...cache import match_identifier
-from ...config import QueryLimits, pii_override_paths
+from ... import metricflow_dialect
+from ...config import QueryLimits
+from ...metricflow_dialect import METRIC_TIME
+from ...semantic_catalog import time_axis_tokens
 from ..results import SemanticQueryResult, SemanticValuesResult
 from . import (
     DIMENSIONS_PER_DECLARATION,
     EXECUTION_DEX,
-    PII_BLOCK_CONFIDENCE,
     BackendDescriptor,
     SemanticBackendError,
     SemanticCatalog,
     SemanticQuery,
     SemanticQueryRefusedError,
     ValuesRequest,
-    cap_columnar,
     queryable_grains,
     requested_dimension_refs,
     resolve_values_request,
     screen_dimension_refs,
     screen_values_request,
+    unadjudicated_refs,
     validate_grain,
     values_reach_note,
 )
+from .governed import GovernedSql
+from .governed import unprofiled_note as _unprofiled_note  # noqa: F401  (re-export)
 from .local_runtime import metricflow_engine
+from .policy import name_only_note
 
 # Said only when the join graph could not be resolved, which is an install that
 # picked no extras. A list that names a metric's single-hop dimensions and reads
@@ -64,6 +61,8 @@ _UNRESOLVED_JOINS_NOTE = (
     "these lists. Install or upgrade that extra for the resolved lists, or list "
     "with --api"
 )
+
+_RECOMPILE_HINT = "re-run `dbt parse`"
 
 _MISSING_EXTRA = (
     "local metric queries need the [semantic] extra: "
@@ -111,18 +110,25 @@ class LocalMetricFlowBackend:
         # keeps this backend from knowing that the format on the other side is
         # dbt. Falls back to the engine's, which is the ordinary path.
         self._format = project_format
-        # The dex engine, not an adapter: the connection is opened through it on
-        # the one billed path below, so this backend never becomes a second place
-        # that discovers credentials or builds a cost gate. Named `_dex` because
-        # "engine" already means the MetricFlow one throughout this module.
+        # The dex engine, which the governed spine opens the connection through.
+        # Named `_dex` because "engine" already means the MetricFlow one
+        # throughout this module.
         self._dex = engine
-        self._config = engine.config
         self._store = engine.store
         self._connector = connector
-        self._limits = limits
         self._mf_engine = None
         self._dim_columns: dict[str, tuple[str, str]] | None = None
+        self._dim_expressions: dict[str, tuple[str, str]] | None = None
         self._catalog_view = None
+        # Everything that happens to the SQL once MetricFlow has rendered it.
+        self._governed = GovernedSql(
+            engine,
+            connector,
+            limits,
+            self._dimension_columns,
+            recompile_hint=_RECOMPILE_HINT,
+            computed_columns=self._dimension_expressions,
+        )
 
     @classmethod
     def from_engine(cls, engine) -> LocalMetricFlowBackend:
@@ -228,11 +234,14 @@ class LocalMetricFlowBackend:
         cache = self._load_cache()
 
         # PII request-gate, before rendering. Catching a flagged dimension at the
-        # request is cheaper and more precise than parsing rendered SQL.
-        blocked = screen_dimension_refs(
-            requested_dimension_refs(q, filter_refs=self.filter_refs),
-            meta_lookup=self._cache_pii_lookup(cache),
-        )
+        # request is cheaper and more precise than parsing rendered SQL. A token
+        # carrying a grain is screened as the dimension it buckets, and
+        # `metric_time` as the time dimensions of the metrics queried, since
+        # those are the columns the result groups by.
+        refs = requested_dimension_refs(q, filter_refs=self.filter_refs)
+        aliases = self._screening_aliases(refs, q.metrics)
+        lookup = self._cache_pii_lookup(cache)
+        blocked = screen_dimension_refs(refs, meta_lookup=lookup, aliases=aliases)
         if blocked:
             named = ", ".join(f"{ref} ({reason})" for ref, reason in blocked)
             raise SemanticQueryRefusedError(
@@ -256,22 +265,64 @@ class LocalMetricFlowBackend:
                 f"could not resolve the metric query: {env.redact(str(exc))}"
             ) from exc
 
-        return self._run_rendered(
+        return self._governed.run(
             sql,
             cache,
+            backend=self,
             command="explore semantic query",
             result_type=SemanticQueryResult,
+            extra_notes=name_only_note(
+                unadjudicated_refs(refs, meta_lookup=lookup, aliases=aliases)
+            ),
         )
+
+    def time_axis_refs(self, metrics: list[str]) -> list[str] | None:
+        """The dimension tokens ``metric_time`` resolves to for these metrics.
+
+        Each input measure's agg time dimension, on its own semantic model, as
+        the token a caller would group that dimension by: the gate screens those
+        in place of ``metric_time``, which names no column of its own. None where
+        the project cannot place every one of them, which leaves ``metric_time``
+        on the name heuristic and the result saying so.
+        """
+
+        view = self._readable_view()
+        return time_axis_tokens(view, metrics) if view is not None else None
+
+    def _screening_aliases(
+        self, refs: list[str], metrics: list[str]
+    ) -> dict[str, list[str]]:
+        """What each requested token is screened as, where that is not itself."""
+
+        view = self._readable_view()
+        grains = tuple(
+            dict.fromkeys(
+                grain
+                for element in (
+                    (*view.metrics, *view.dimensions) if view is not None else ()
+                )
+                for grain in (element.queryable_granularities or ())
+            )
+        )
+        aliases: dict[str, list[str]] = {}
+        for ref in refs:
+            name, _grain = metricflow_dialect.split_grain(ref, grains=grains or None)
+            if name == METRIC_TIME:
+                axis = self.time_axis_refs(metrics)
+                if axis:
+                    aliases[ref] = axis
+            elif name != ref:
+                aliases[ref] = [name]
+        return aliases
 
     def values(self, dimension: str, metrics: list[str]) -> SemanticValuesResult:
         """One dimension's value domain, rendered by MetricFlow and executed here.
 
-        Everything after the render is the metric-query spine unchanged, because
-        this is the same kind of statement reaching the same warehouse: proven
-        read-only, pre-checked against the connection, priced, and capped. What
-        differs is in front of it, and it is resolved against the project's own
-        catalog so a token the layer does not have is refused by name rather than
-        surfacing as a MetricFlow resolution error about something else.
+        Everything after the render is the governed spine a metric query runs
+        through, because this is the same kind of statement reaching the same
+        warehouse. What differs is in front of it, and it is resolved against the
+        project's own catalog so a token the layer does not have is refused by name
+        rather than surfacing as a MetricFlow resolution error about something else.
         """
 
         request = resolve_values_request(self._semantic_view(), dimension, metrics)
@@ -283,9 +334,10 @@ class LocalMetricFlowBackend:
         used, sql = self._render_values(request)
         if used and not request.metrics:
             notes.append(values_reach_note(request.token, used, request.reachable))
-        return self._run_rendered(
+        return self._governed.run(
             sql,
             cache,
+            backend=self,
             command="explore semantic values",
             result_type=SemanticValuesResult,
             extra_notes=notes,
@@ -337,136 +389,24 @@ class LocalMetricFlowBackend:
             .sql_statement.sql
         )
 
-    def _run_rendered(
+    # The spine's cache, PII lookup and relation pre-check, reachable here so a
+    # caller holding this backend (a test pinning the gate) need not know the
+    # spine is a separate object.
+
+    def _load_cache(self):
+        return self._governed.load_cache()
+
+    def _cache_pii_lookup(self, cache):
+        return self._governed.pii_lookup(cache)
+
+    def _relation_precheck(
         self,
         sql: str,
         cache,
-        *,
-        command: str,
-        result_type,
-        extra_notes: list[str] | None = None,
-        **fields,
-    ):
-        """Everything that happens to rendered SQL between MetricFlow and a result.
-
-        The order here is the safety contract rather than a sequence that happens to
-        be written this way. Read-only is proven before anything touches the
-        connection, the relation pre-check runs before the handshake so a namespace
-        mismatch never bills a failed job, and the spend is settled onto the record
-        that comes back. Both commands that render metric SQL run through this for
-        that reason: a second copy of the order is a second place for it to drift,
-        and the drift would be silent.
-        """
-
-        from ...guards.sql_guard import NotSelectOnlyError, assert_select_only
-
-        dialect = get_dialect(self._connector)
-        try:
-            assert_select_only(sql, dialect=dialect)
-        except NotSelectOnlyError as exc:
-            raise SemanticQueryRefusedError(
-                f"rendered metric SQL was not read-only: {exc}"
-            ) from exc
-
-        # One adapter for the whole command: the pre-check may introspect the
-        # connection, and `_adapter` rebuilds the cost gate on every call, so
-        # asking twice would settle and rebuild a gate for nothing.
-        adapter = self._dex._adapter(command)
-        refusal, unprofiled = self._relation_precheck(
-            sql,
-            cache,
-            dialect,
-            lambda: [meta.identifier for meta in adapter.list_objects()],
-        )
-        if refusal is not None:
-            raise SemanticBackendError(refusal)
-
-        estimate_fn = getattr(adapter, "query_estimate", None)
-        estimate = estimate_fn(sql) if estimate_fn else 0.0
-        command_args.billed_handshake(command, adapter, estimate)
-        result = adapter.run_query(
-            sql,
-            max_rows=self._limits.max_rows,
-            timeout_seconds=self._limits.timeout_seconds,
-        )
-        capped = cap_columnar(
-            result.columns,
-            result.types,
-            result.cells,
-            max_rows=self._limits.max_rows,
-            max_cell_chars=self._limits.max_cell_chars,
-            max_payload_bytes=self._limits.max_payload_bytes,
-            truncated_by_source=result.truncated,
-            extra_notes=[*(extra_notes or []), *_unprofiled_note(unprofiled)],
-        )
-        record = result_type.from_capped(capped, backend=self, **fields)
-        return command_args.stamp_spend(record, adapter)
-
-    def _load_cache(self):
-        """The exploration cache with config PII overrides applied in memory, or None.
-
-        Absence is not fatal here (unlike ``explore query``, whose whole policy is
-        the cache: it tracks PII taint through the projection of agent-authored SQL
-        and cannot do that for a relation it has never seen). A metric query is
-        governed at the request, by dimension name, before any SQL exists, so the
-        name heuristic and the semantic layer's own metadata still bind, and the
-        relation pre-check falls through to the live inventory. A repo that never
-        ran ``explore map`` can still query metrics.
-        """
-
-        try:
-            cache = self._store.load_cache()
-        except Exception:
-            return None
-        if cache is None:
-            return None
-        overrides = pii_override_paths(getattr(self._config, "pii_overrides", []) or [])
-        if not overrides:
-            return cache
-        from ..commands import _mask_overridden
-
-        return _mask_overridden(cache, overrides)
-
-    def _cache_pii_lookup(self, cache):
-        """A ``dimension token -> {"pii": True}`` lookup backed by the cache.
-
-        A semantic dimension (``session__is_deleted``) maps to a physical column on
-        its owning model, so the token is resolved through the manifest to
-        (relation, column) and that column's cached PII flag decides. This is the
-        value-evidence-backed adjudication the profiler produced; the name
-        heuristic in ``screen_dimension_refs`` remains the floor underneath it, so
-        an unprofiled column is still caught by its name. Returns None for a token
-        the cache cannot speak to, which leaves the heuristic in charge.
-        """
-
-        if cache is None:
-            return None
-        columns = self._dimension_columns()
-        if not columns:
-            return None
-        known = [dataset.identifier for dataset in cache.datasets]
-
-        def lookup(ref: str):
-            target = columns.get(ref)
-            if target is None:
-                return None
-            relation, column_name = target
-            matches = match_identifier(relation, known)
-            for dataset in cache.datasets:
-                if dataset.identifier not in matches:
-                    continue
-                for column in dataset.columns:
-                    if column.name.lower() != column_name.lower():
-                        continue
-                    flag = column.pii
-                    if flag is not None and flag.confidence >= PII_BLOCK_CONFIDENCE:
-                        return {"pii": True, "category": flag.category.value}
-                    # Profiled and cleared (or a human override): authoritative,
-                    # so say so rather than leaving it to the name heuristic.
-                    return {"pii": False}
-            return None
-
-        return lookup
+        dialect: str,
+        live_identifiers: Callable[[], list[str]],
+    ) -> tuple[str | None, list[str]]:
+        return self._governed.relation_precheck(sql, cache, dialect, live_identifiers)
 
     def _dimension_columns(self) -> dict[str, tuple[str, str]]:
         """``dimension token -> (relation, physical column)``, from the project.
@@ -483,108 +423,37 @@ class LocalMetricFlowBackend:
         """
 
         if self._dim_columns is None:
-            try:
-                self._dim_columns = dict(self._semantic_view().physical_columns)
-            except SemanticBackendError:
-                self._dim_columns = {}
+            view = self._readable_view()
+            self._dim_columns = dict(view.physical_columns) if view else {}
         return self._dim_columns
 
-    def _relation_precheck(
-        self,
-        sql: str,
-        cache,
-        dialect: str,
-        live_identifiers: Callable[[], list[str]],
-    ) -> tuple[str | None, list[str]]:
-        """``(refusal message or None, relations with no profile)`` for the
-        rendered SQL.
+    def _dimension_expressions(self) -> dict[str, tuple[str, str]]:
+        """``dimension token -> (relation, expression)`` for computed elements.
 
-        MetricFlow bakes ``node_relation.relation_name`` from the compiled manifest
-        straight into the SQL, so a project compiled against another database (or a
-        different dev target) renders relations that do not exist here. Catching
-        that is worth a precise message before the cost handshake rather than a
-        table-not-found from the warehouse.
-
-        The authority is the *connection*, not the ``.dex/`` cache. That cache
-        records what has been profiled, which is a different question: a model
-        ``transform build`` created minutes ago is in the warehouse and not in the
-        cache, and refusing it made "build a model, then validate its metric"
-        impossible without a profiling pass in between. So the cache is only a free
-        fast path, and anything it cannot resolve is asked of the live inventory,
-        the same authority ``explore profile`` resolves its arguments against.
-
-        What the listing can and cannot settle is
-        :func:`~...cache.relation_verdict`. An inventory that cannot be read at all
-        settles nothing, and a relation that is genuinely absent still fails at
-        planning without billing.
-
-        Resolution is by suffix in both directions, because the cache and the
-        inventory are namespace-normalized per connector and an exact string
-        compare would reject legitimate spellings.
+        The tokens :meth:`_dimension_columns` leaves out because their reference
+        is an expression: the gate reads the expression for the columns it reads
+        rather than screening the token's name alone.
         """
 
-        # Imported here, not at module scope: `explore semantic` is routed from
-        # its own module so a remote-only install with no dialect engine can reach
-        # the hosted backend, and a top-level guards import would undo that.
-        from ...cache import relation_verdict
-        from ...guards.sql_guard import referenced_relations
+        if self._dim_expressions is None:
+            view = self._readable_view()
+            self._dim_expressions = dict(view.computed_columns) if view else {}
+        return self._dim_expressions
 
-        relations = referenced_relations(sql, dialect=dialect)
-        if not relations:
-            return None, []
+    def _readable_view(self):
+        """The catalog, or None where the project cannot be read at all.
 
-        datasets = list(cache.datasets) if cache is not None else []
-        cached = [dataset.identifier for dataset in datasets]
-        # Presence is not a profile: `explore map` writes inventory-only entries
-        # with no columns, and those tell the PII gate nothing.
-        profiled = {dataset.identifier for dataset in datasets if dataset.columns}
+        For the gate's evidence only: a project that cannot answer leaves the
+        gate on the name heuristic, the fail-closed floor, and the command
+        refuses for the unreadable project a step later, when it renders.
+        """
 
-        unresolved: list[str] = []
-        unprofiled: list[str] = []
-        for name in relations:
-            matches = match_identifier(name, cached)
-            if not matches:
-                unresolved.append(name)
-                unprofiled.append(name)
-            elif not any(match in profiled for match in matches):
-                unprofiled.append(name)
-        if not unresolved:
-            return None, unprofiled
+        from ...errors import DexError
 
         try:
-            live = live_identifiers()
-        except Exception:
-            return None, unprofiled
-
-        verdicts: dict[str, list[str]] = {"foreign": [], "missing": []}
-        for name in unresolved:
-            if match_identifier(name, live):
-                continue
-            verdict = relation_verdict(name, live)
-            if verdict is not None:
-                verdicts[verdict].append(name)
-
-        if verdicts["foreign"]:
-            named = ", ".join(sorted(set(verdicts["foreign"])))
-            return (
-                f"refused: the metric query reads {named}, in a namespace this "
-                "connection does not reach. The project was compiled against a "
-                "different namespace than the one dex is connected to; re-run "
-                "`dbt parse` against the target you are querying, or point dex at "
-                "the connection the project was built for.",
-                unprofiled,
-            )
-        if verdicts["missing"]:
-            named = ", ".join(sorted(set(verdicts["missing"])))
-            return (
-                f"refused: the metric query reads {named}, which this connection "
-                "does not have: its namespace was listed and the relation was not "
-                "in it. Build the model into the target you are querying, or "
-                "re-run `dbt parse` if the project was compiled against a "
-                "different target.",
-                unprofiled,
-            )
-        return None, unprofiled
+            return self._semantic_view()
+        except (SemanticBackendError, DexError):
+            return None
 
     def _render(self, q: SemanticQuery) -> str:
         from metricflow.engine.metricflow_engine import MetricFlowQueryRequest
@@ -634,26 +503,3 @@ class LocalMetricFlowBackend:
             missing_extra_message=_MISSING_EXTRA,
         )
         return self._mf_engine
-
-
-# ---- the relation pre-check's plumbing --------------------------------------
-
-
-def _unprofiled_note(relations: list[str]) -> list[str]:
-    """The disclosure that a queried relation carries no profile.
-
-    The PII request-gate adjudicates a dimension from its physical column's cached
-    flag and falls back to the name heuristic when the cache cannot speak. That
-    fallback is the fail-closed floor, not an equivalent, so a result whose
-    relations were never profiled says which ones and how to fix it rather than
-    letting the weaker screening pass unremarked.
-    """
-
-    if not relations:
-        return []
-    ordered = sorted(set(relations))
-    return [
-        "PII screening fell back to the name heuristic: the .dex/ cache holds no "
-        f"profile for {', '.join(ordered)}. Run `explore profile "
-        f"{' '.join(ordered)}` for value-evidence screening."
-    ]

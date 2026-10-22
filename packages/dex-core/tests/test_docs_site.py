@@ -358,6 +358,56 @@ def test_a_tracked_file_linking_an_unknown_docs_page_fails(tmp_path):
 # --- Escaping ---------------------------------------------------------------
 
 
+def test_a_link_whose_text_is_code_keeps_its_text(tmp_path):
+    """A code span inside link text is held inside the link's own placeholder,
+    so restoring once left the inner token in the page as invisible text."""
+
+    root = make_repo(
+        tmp_path,
+        references={
+            "alpha.md": (
+                "# Alpha\n\nSee [`beta.md`](beta.md) and [the `x` key](beta.md).\n"
+            ),
+            "beta.md": "# Beta\n",
+        },
+    )
+    builder = make_builder(root)
+    assert not builder.build(), messages(builder.problems)
+    body = builder.pages["alpha"].body
+    assert "[`beta.md`](/dex/beta)" in body
+    assert "[the `x` key](/dex/beta)" in body
+    assert not any(c in body for c in "\x00\x01")
+
+
+def test_every_page_shares_with_a_title_naming_exmergo_dex(tmp_path):
+    root = make_repo(
+        tmp_path,
+        pages={
+            "index.mdx": f"---\ntitle: Dex\ndescription: {DESC}\n---\n\nHi.\n",
+            "own.mdx": (
+                f"---\ntitle: Own\ndescription: {DESC}\n"
+                "og:title: Chosen by hand\n---\n\nHi.\n"
+            ),
+        },
+    )
+    builder = make_builder(root)
+    assert not builder.build(), messages(builder.problems)
+    files = builder.rendered()
+    assert (
+        "og:title: Exmergo Dex\ntwitter:title: Exmergo Dex\n" in files["dex/index.mdx"]
+    )
+    assert "og:title: alpha.md · Exmergo Dex\n" in files["dex/alpha.mdx"]
+    assert "og:title: Chosen by hand\n" in files["dex/own.mdx"]
+    assert "twitter:title: Chosen by hand · Exmergo Dex" not in files["dex/own.mdx"]
+
+
+def test_a_control_character_in_a_page_fails_the_build(tmp_path):
+    root = make_repo(tmp_path, references={"alpha.md": "# Alpha\n\nBell \x07 here.\n"})
+    assert "contains the control character '\\x07'" in messages(
+        make_builder(root).build()
+    )
+
+
 def test_prose_is_escaped_and_code_is_left_alone():
     text = (
         "# T\n\nUse <name> and {x} for $5 or $6. See <https://example.com/a>.\n"

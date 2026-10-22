@@ -103,13 +103,25 @@ def test_missing_uv_refuses_with_one_error_envelope(skill, monkeypatch, capsys):
     assert set(envelope) == {
         "status",
         "data",
+        "connection",
         "cost",
         "warnings",
         "diffs",
         "errors",
         "reason",
     }
-    assert envelope["cost"] == {"paradigm": None, "estimate": None, "ceiling": None}
+    assert envelope["connection"] == {
+        "connector": None,
+        "target": {},
+        "source": None,
+    }
+    assert envelope["cost"] == {
+        "paradigm": None,
+        "estimate": None,
+        "ceiling": None,
+        "estimate_quality": None,
+        "unit": None,
+    }
     assert envelope["data"] == {}
 
 
@@ -384,6 +396,7 @@ def test_warm_reports_what_it_installed_in_one_ok_envelope(monkeypatch, capsys):
     assert set(envelope) == {
         "status",
         "data",
+        "connection",
         "cost",
         "warnings",
         "diffs",
@@ -396,7 +409,18 @@ def test_warm_reports_what_it_installed_in_one_ok_envelope(monkeypatch, capsys):
     assert envelope["reason"] is None
     # Warm-up opens no connection, so it claims no paradigm. `free_local` would be
     # a positive assertion that the connector in play bills nothing.
-    assert envelope["cost"] == {"paradigm": None, "estimate": None, "ceiling": None}
+    assert envelope["connection"] == {
+        "connector": None,
+        "target": {},
+        "source": None,
+    }
+    assert envelope["cost"] == {
+        "paradigm": None,
+        "estimate": None,
+        "ceiling": None,
+        "estimate_quality": None,
+        "unit": None,
+    }
     assert envelope["data"]["connector"] == "duckdb"
     assert envelope["data"]["extras"] == ["duckdb", "cluster"]
     assert "exmergo-dex-core[duckdb,cluster]" in envelope["data"]["engine"]

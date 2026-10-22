@@ -33,7 +33,8 @@ MB = 1024 * 1024
 def _aggregate_response(sql: str, *, distinct: int = 100) -> list[dict]:
     """Return the aggregate aliases a real profile query asks the fake for."""
 
-    row = {"d_0": distinct}
+    # `kd_0` is the same key's count read from a batched probe (#275).
+    row = {"d_0": distinct, "kd_0": distinct}
     if "n_total" in sql:
         row["n_total"] = 100
         for index in range(32):
@@ -194,10 +195,12 @@ def test_unconfirmed_grain_returns_the_dry_run_estimate(
     envelope = _dispatch(tmp_path, "grain")
     assert envelope.status.value == "needs_confirmation"
     assert envelope.cost.paradigm is Paradigm.BYTES_SCANNED
-    # The aggregate null-fraction scan is reserved in the same paid half as
-    # the distinct-count check (one scan plus its profile safety reserves).
-    assert envelope.cost.estimate == 50 * MB
-    assert envelope.data["per_table_bytes"] == {"test-proj.shop.customers": 50 * MB}
+    # The null-fraction survey and the distinct-count check are one statement
+    # over the table (#275), so the quote is one per-query floor. It used to be
+    # two floors plus a profile's escalation reserve, which this survey never
+    # escalates into.
+    assert envelope.cost.estimate == 10 * MB
+    assert envelope.data["per_table_bytes"] == {"test-proj.shop.customers": 10 * MB}
     assert "--confirm" in envelope.data["hint"]
     assert all(c.dry_run for c in fake_bq_client.query_calls)
 
@@ -216,10 +219,11 @@ def test_confirmed_grain_scans_within_budget_and_ledgers(
     assert finding["code"] == "key_lost_uniqueness"
     assert finding["data"]["distinct_count"] == 90
     assert finding["data"]["row_count"] == 100
-    assert envelope.data["spend"]["bytes_billed"] == 10_000
-    assert [e["billed_bytes"] for e in entries] == [5_000, 5_000]
+    # One statement settles both the key and the null-fraction scan (#275).
+    assert envelope.data["spend"]["bytes_billed"] == 5_000
+    assert [e["billed_bytes"] for e in entries] == [5_000]
     # The command estimate and the adapter's per-statement charge are free
-    # dry-runs; the key and null-fraction scans both execute after confirmation.
+    # dry-runs; the combined scan executes after confirmation.
     dry_runs = [call.dry_run for call in fake_bq_client.query_calls]
     assert any(not dry_run for dry_run in dry_runs)
     assert any(dry_run for dry_run in dry_runs)
@@ -264,8 +268,8 @@ def test_unconfirmed_check_answers_and_offers(fake_bq_client, route_adapter, tmp
 
     offer = envelope.data["offer"]
     # The offer prices the aggregate null-fraction scan alongside the
-    # distinct-count check: one paid half, both scans.
-    assert offer["estimated_bytes"] == 50 * MB
+    # distinct-count check: one paid half, both scans, one statement (#275).
+    assert offer["estimated_bytes"] == 10 * MB
     # What did not run has to be nameable, now that the status no longer says so.
     assert offer["axes"] == ["grain"]
     assert envelope.data["axes_run"] == ["schema", "volume"]
@@ -336,17 +340,18 @@ def _seed_two_keyed_tables(tmp_path: Path) -> None:
 def test_check_fanout_estimate_reflects_per_query_floor(
     fake_bq_client, route_adapter, tmp_path
 ):
-    """A fan-out check over two tables estimates the per-query floors and the
-    null-fraction profile reserves, not the few KB of raw scan; confirming with
-    exactly that budget then runs without the per-statement floor rejecting a
-    statement (the reject-ladder the estimate used to cause)."""
+    """A fan-out check over two tables estimates the per-query floors, not the
+    few KB of raw scan; confirming with exactly that budget then runs without
+    the per-statement floor rejecting a statement (the reject-ladder the
+    estimate used to cause). Each table's probes are one statement (#275), so
+    the floor is paid once per table rather than once per probe."""
 
     _seed_two_keyed_tables(tmp_path)
     route_adapter(fake_bq_client)
 
     unconfirmed = _dispatch(tmp_path, "check")
     assert unconfirmed.status.value == "ok"
-    assert unconfirmed.data["offer"]["estimated_bytes"] == 90 * MB
+    assert unconfirmed.data["offer"]["estimated_bytes"] == 20 * MB
 
     fake_bq_client.row_resolver = _aggregate_response
     route_adapter(fake_bq_client)

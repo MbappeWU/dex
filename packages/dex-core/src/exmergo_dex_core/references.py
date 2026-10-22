@@ -391,9 +391,16 @@ class ReferenceIndex:
         self, view: DbtProjectView, *, package: str | None, prefix: str = ""
     ) -> None:
         nodes = node_files(view)
-        node_kinds = {node_name(path): self._node_kind(view, path) for path in nodes}
+        file_node_kinds = {
+            node_name(path): self._node_kind(view, path) for path in nodes
+        }
         if package is None:
-            self._node_kinds = dict(node_kinds)
+            self._node_kinds = dict(file_node_kinds)
+        documents = yaml_documents(view)
+        node_kinds = {
+            **self._declared_node_kinds(documents),
+            **file_node_kinds,
+        }
         for raw_path, source in sorted(view.files.items()):
             path = f"{prefix}{raw_path}"
             family = path_family(Path(view.root), raw_path, view)
@@ -426,7 +433,9 @@ class ReferenceIndex:
                     package=package,
                     node_kinds=node_kinds,
                 )
-        self._scan_yaml(view, node_kinds, package=package, prefix=prefix)
+        self._scan_yaml(
+            view, node_kinds, documents=documents, package=package, prefix=prefix
+        )
         self._scan_project_vars(view, package=package, prefix=prefix)
 
     def _python_query_limits(self, kind: str) -> list[str]:
@@ -525,6 +534,22 @@ class ReferenceIndex:
     def _node_kind(view: DbtProjectView, path: str) -> str:
         family = path_family(Path(view.root), path, view)
         return family if family in ("seed", "snapshot") else "model"
+
+    @staticmethod
+    def _declared_node_kinds(
+        documents: list[tuple[dict[str, Any], str]],
+    ) -> dict[str, str]:
+        kinds: dict[str, str] = {}
+        for parsed, _raw_path in documents:
+            for key, kind, marker in (
+                ("models", "model", "versions"),
+                ("snapshots", "snapshot", "relation"),
+            ):
+                for entry in _dicts(parsed.get(key)):
+                    name = entry.get("name")
+                    if isinstance(name, str) and entry.get(marker):
+                        kinds.setdefault(name, kind)
+        return kinds
 
     def _scan_sql(
         self,
@@ -772,10 +797,11 @@ class ReferenceIndex:
         view: DbtProjectView,
         node_kinds: dict[str, str],
         *,
+        documents: list[tuple[dict[str, Any], str]] | None = None,
         package: str | None,
         prefix: str = "",
     ) -> None:
-        documents = yaml_documents(view)
+        documents = documents if documents is not None else yaml_documents(view)
         for parsed, raw_path in documents:
             path = f"{prefix}{raw_path}"
             source = view.files[raw_path].content
@@ -785,7 +811,9 @@ class ReferenceIndex:
             for entry in _dicts(parsed.get("seeds")) + _dicts(parsed.get("snapshots")):
                 self._scan_model_entry(entry, path, lines, node_kinds, package=package)
             for source_entry in _dicts(parsed.get("sources")):
-                self._scan_source_entry(source_entry, path, lines, package=package)
+                self._scan_source_entry(
+                    source_entry, path, lines, node_kinds, package=package
+                )
             # A versioned model is `ref()`-ed by its base name, which no file is
             # named after (they are `<name>_v<n>.sql` unless `defined_in` says
             # otherwise), and a snapshot can be declared in YAML with no SQL at
@@ -810,7 +838,7 @@ class ReferenceIndex:
                         )
                         if marker == "relation":
                             self._record_snapshot_relation(
-                                entry, path, lines, package=package
+                                entry, path, lines, node_kinds, package=package
                             )
         parsed_paths = {raw_path for _parsed, raw_path in documents}
         for raw_path in sorted(view.files):
@@ -825,7 +853,9 @@ class ReferenceIndex:
             path = f"{prefix}{raw_path}"
             lines = _ScalarLines(view.files[raw_path].content, self.limits, path)
             if kind == "semantic_model":
-                self._scan_semantic_model(entry, path, lines, package=package)
+                self._scan_semantic_model(
+                    entry, path, lines, node_kinds, package=package
+                )
             else:
                 self._scan_metric(entry, path, lines, package=package)
 
@@ -834,26 +864,43 @@ class ReferenceIndex:
         entry: dict[str, Any],
         path: str,
         lines: _ScalarLines,
+        node_kinds: dict[str, str],
         *,
         package: str | None,
     ) -> None:
-        """A dbt 1.9 snapshot's ``relation:`` as a source or model read.
+        """A dbt 1.9 snapshot's ``relation:`` as a source, model, seed, or snapshot.
 
         The key is also what makes the YAML entry a declaration. Recording only
         that declaration drops the relation the snapshot is built from, so a
-        query for the source or model it names never sees this file.
+        query for the source or relation it names never sees this file.
         """
 
         relation = entry.get("relation")
         target = _relation_from(relation)
         if target is None:
+            if isinstance(relation, str):
+                expression = relation if "{{" in relation else "{{ " + relation + " }}"
+                for call in jinja_calls(expression):
+                    if call.callee not in ("ref", "source"):
+                        continue
+                    self._record(
+                        Reference(
+                            path=path,
+                            line=lines.peek(relation),
+                            form="yaml_snapshot_relation",
+                            kind="source" if call.callee == "source" else "model",
+                            resolution=INDETERMINATE,
+                            package=package,
+                            note="snapshot relation could not be resolved statically",
+                        )
+                    )
             return
         self._record(
             Reference(
                 path=path,
                 line=lines.peek(relation if isinstance(relation, str) else None),
                 form="yaml_snapshot_relation",
-                kind="source" if "." in target else "model",
+                kind="source" if "." in target else node_kinds.get(target, "model"),
                 name=target,
                 package=package,
             )
@@ -884,6 +931,7 @@ class ReferenceIndex:
             entry,
             path,
             lines,
+            node_kinds,
             package=package,
             owner=name if isinstance(name, str) else None,
         )
@@ -893,6 +941,7 @@ class ReferenceIndex:
         entry: dict[str, Any],
         path: str,
         lines: _ScalarLines,
+        node_kinds: dict[str, str],
         *,
         package: str | None,
     ) -> None:
@@ -914,6 +963,7 @@ class ReferenceIndex:
                 table,
                 path,
                 lines,
+                node_kinds,
                 package=package,
                 owner=f"{source_name}.{table_name}"
                 if isinstance(source_name, str) and isinstance(table_name, str)
@@ -925,6 +975,7 @@ class ReferenceIndex:
         entry: dict[str, Any],
         path: str,
         lines: _ScalarLines,
+        node_kinds: dict[str, str],
         *,
         package: str | None,
         owner: str | None = None,
@@ -945,15 +996,18 @@ class ReferenceIndex:
                 )
             )
             for test in _tests_of(column):
-                self._scan_test(test, path, lines, package=package, owner=owner)
+                self._scan_test(
+                    test, path, lines, node_kinds, package=package, owner=owner
+                )
         for test in _tests_of(entry):
-            self._scan_test(test, path, lines, package=package, owner=owner)
+            self._scan_test(test, path, lines, node_kinds, package=package, owner=owner)
 
     def _scan_test(
         self,
         test: Any,
         path: str,
         lines: _ScalarLines,
+        node_kinds: dict[str, str],
         *,
         package: str | None,
         owner: str | None = None,
@@ -1005,7 +1059,9 @@ class ReferenceIndex:
                                 path=path,
                                 line=lines.peek(str(value)),
                                 form="yaml_relationship_to",
-                                kind="source" if "." in target else "model",
+                                kind="source"
+                                if "." in target
+                                else node_kinds.get(target, "model"),
                                 name=target,
                                 package=package,
                             )
@@ -1029,6 +1085,7 @@ class ReferenceIndex:
         entry: dict[str, Any],
         path: str,
         lines: _ScalarLines,
+        node_kinds: dict[str, str],
         *,
         package: str | None,
     ) -> None:
@@ -1039,7 +1096,7 @@ class ReferenceIndex:
                     path=path,
                     line=lines.peek(str(entry.get("model"))),
                     form="semantic_model_ref",
-                    kind="source" if "." in target else "model",
+                    kind="source" if "." in target else node_kinds.get(target, "model"),
                     name=target,
                     package=package,
                 )
@@ -1319,8 +1376,11 @@ def _python_relation_calls(
 ) -> list[tuple[str, int, tuple[str | None, ...]]] | None:
     """``dbt.ref`` and ``dbt.source`` calls in one Python model.
 
-    Each argument is the string literal dex read, or ``None`` when the argument
-    is anything else. ``None`` for the whole list means the file did not parse,
+    Each positional argument is the string literal dex read, or ``None`` when
+    the argument is anything else. On ``dbt.ref``, ``v`` and ``version`` are
+    dbt's version selector and are ignored, so the model name stays the
+    positional argument. Any other keyword, including ``**kwargs``, leaves the
+    call unresolved. ``None`` for the whole list means the file did not parse,
     which is a different fact from a file that parses and names nothing.
     """
 
@@ -1340,7 +1400,10 @@ def _python_relation_calls(
             and func.attr in ("ref", "source")
         ):
             continue
-        if node.keywords:
+        versioned_ref = func.attr == "ref" and all(
+            keyword.arg in {"v", "version"} for keyword in node.keywords
+        )
+        if node.keywords and not versioned_ref:
             args: tuple[str | None, ...] = (None,)
         else:
             args = tuple(

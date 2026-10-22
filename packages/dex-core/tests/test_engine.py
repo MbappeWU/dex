@@ -50,6 +50,30 @@ def test_cloud_clickhouse_paradigm_is_available_before_connection_failure():
     assert engine.paradigm is Paradigm.COMPUTE_TIME
 
 
+def test_a_refused_galaxy_run_is_denominated_in_compute_time(tmp_path: Path, capsys):
+    """Galaxy is refused before anything opens, and the refusal's envelope still
+    names the unit Galaxy bills in rather than the self-hosted one."""
+
+    import json
+
+    from exmergo_dex_core.cli import main
+    from exmergo_dex_core.config import TrinoTarget
+
+    engine = DexEngine(
+        config=DexConfig(connector="trino", trino=TrinoTarget(deployment="galaxy"))
+    )
+    assert engine.paradigm is Paradigm.COMPUTE_TIME
+
+    save_config(
+        DexConfig(connector="trino", trino=TrinoTarget(deployment="galaxy")), tmp_path
+    )
+    rc = main(["--repo-root", str(tmp_path), "connect", "test"])
+    envelope = json.loads(capsys.readouterr().out)
+    assert rc == 1
+    assert envelope["cost"]["paradigm"] == "compute_time"
+    assert "Starburst Galaxy" in envelope["errors"][0]
+
+
 def test_the_public_import_works_and_defaults_to_writing_nothing(
     duckdb_file: Path, monkeypatch: pytest.MonkeyPatch
 ):
@@ -791,6 +815,7 @@ def _no_discovery(monkeypatch: pytest.MonkeyPatch) -> None:
         "resolve_postgres_connection",
         "resolve_redshift_connection",
         "resolve_clickhouse_connection",
+        "resolve_trino_connection",
     ):
         monkeypatch.setattr(connect_mod, name, unreachable)
 
@@ -1149,7 +1174,8 @@ def test_importing_the_package_pulls_in_no_connector_library():
         "before={m.split('.')[0] for m in sys.modules};"
         "import exmergo_dex_core;"
         "libs={'google','snowflake','databricks','psycopg','redshift_connector',"
-        "'clickhouse_connect','sklearn','httpx','metricflow','duckdb','sqlglot'};"
+        "'clickhouse_connect','trino','sklearn','httpx','metricflow','duckdb',"
+        "'sqlglot'};"
         "print(sorted(({m.split('.')[0] for m in sys.modules} - before) & libs))"
     )
     out = subprocess.run(  # noqa: S603  (this interpreter, a literal probe)

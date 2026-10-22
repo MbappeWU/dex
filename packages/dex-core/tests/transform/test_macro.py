@@ -30,6 +30,7 @@ ADAPTER_PREFIXES = (
     "postgres",
     "redshift",
     "clickhouse",
+    "trino",
     "duckdb",
 )
 

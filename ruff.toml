@@ -41,6 +41,9 @@ ignore = ["UP042"]
 # The semantic edit-target conformance contract also ships for reuse and uses
 # pytest assertions for the same reason (S101).
 "packages/dex-core/src/exmergo_dex_core/edits_conformance.py" = ["S101"]
+# The values-free conformance contract ships so a host can run it against the
+# release it pins, and is written in the same pytest idiom (S101).
+"packages/dex-core/src/exmergo_dex_core/values_free_conformance.py" = ["S101"]
 # The semantic-backend conformance contract, same reason and same idiom (S101).
 "packages/dex-core/src/exmergo_dex_core/explore/semantic/conformance.py" = ["S101"]
 # The semantic-source conformance contract, same again. B017 rides along because

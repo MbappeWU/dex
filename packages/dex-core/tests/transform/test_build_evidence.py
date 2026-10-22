@@ -54,10 +54,14 @@ def write_run_results(project: Path, results: list[dict], **metadata) -> None:
 def write_manifest_nodes(project: Path, nodes: dict[str, dict]) -> None:
     target = project / "target"
     target.mkdir(exist_ok=True)
+    # Stamped a minute ahead rather than at `now()`: a fresh manifest is one
+    # compiled after the newest source, and on Windows a file written just before
+    # `now()` can carry an mtime a few milliseconds after it, which reads as stale.
+    compiled_at = datetime.now(UTC) + timedelta(minutes=1)
     (target / "manifest.json").write_text(
         json.dumps(
             {
-                "metadata": {"generated_at": datetime.now(UTC).isoformat()},
+                "metadata": {"generated_at": compiled_at.isoformat()},
                 "nodes": nodes,
             }
         ),

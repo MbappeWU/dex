@@ -1655,7 +1655,15 @@ def test_batching_never_reorders_or_drops_an_edge(monkeypatch):
 
 @pytest.mark.parametrize(
     "dialect",
-    ["bigquery", "snowflake", "postgres", "redshift", "databricks", "clickhouse"],
+    [
+        "bigquery",
+        "snowflake",
+        "postgres",
+        "redshift",
+        "databricks",
+        "clickhouse",
+        "trino",
+    ],
 )
 def test_a_cross_child_batch_transpiles_and_stays_select_only(dialect: str):
     """The batched statement carries two shapes a single-edge probe never did

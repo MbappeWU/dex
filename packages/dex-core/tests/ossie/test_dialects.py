@@ -52,14 +52,14 @@ def test_the_active_connector_dialect_wins():
 
 
 def test_a_connector_with_no_ossie_token_falls_to_the_portable_dialect():
-    """Four of dex's seven connectors have no token in Ossie's enum.
+    """Five of dex's eight connectors have no token in Ossie's enum.
 
     They fall to the portable dialect rather than to something close, because
     DuckDB is not Databricks and a wrong dialect is a worse answer than a
     general one.
     """
 
-    for connector in ("duckdb", "postgres", "redshift", "clickhouse"):
+    for connector in ("duckdb", "postgres", "redshift", "clickhouse", "trino"):
         assert connector_dialect(connector) is None
         _, dialect, _ = select_expression(
             expression(SNOWFLAKE="b", ANSI_SQL="a"), connector

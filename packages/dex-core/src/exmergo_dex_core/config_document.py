@@ -37,6 +37,7 @@ from .diffs import file_diff
 from .envelope import redact, secret_like
 from .errors import ConfigurationError, RequestError
 from .storage import DEX_DIR
+from .values_free import CALLER_ONLY_KEYS, CALLER_ONLY_MESSAGE
 from .yaml_spans import before_trailing_blanks, block_end, indent_of
 
 CONFIG_RELPATH = f"{DEX_DIR}/{CONFIG_FILE}"
@@ -57,9 +58,10 @@ ABSENT: Any = object()
 class ConfigProblem:
     """One thing wrong with the file, located by setting and line.
 
-    ``kind`` is ``syntax``, ``invalid``, ``unknown_key``, ``duplicate_key``,
-    ``secret_like_key`` or ``project_not_found``. ``(kind, key, message)``
-    identifies a problem across edits, because an edit shifts every line below it.
+    ``kind`` is ``syntax``, ``invalid``, ``unknown_key``, ``caller_only_key``,
+    ``duplicate_key``, ``secret_like_key`` or ``project_not_found``.
+    ``(kind, key, message)`` identifies a problem across edits, because an edit
+    shifts every line below it.
     """
 
     kind: str
@@ -662,6 +664,18 @@ class ConfigDocument:
         fields = model.model_fields
         for name, sub in value.items():
             path = f"{prefix}{name}"
+            if not prefix and name in CALLER_ONLY_KEYS:
+                # Not a typo of something else, so no suggestion: a setting this
+                # file cannot hold, named as such (#591).
+                found.append(
+                    ConfigProblem(
+                        "caller_only_key",
+                        path,
+                        CALLER_ONLY_MESSAGE,
+                        line=self._line_of(path),
+                    )
+                )
+                continue
             if name not in fields:
                 found.append(
                     ConfigProblem(

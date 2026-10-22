@@ -20,8 +20,10 @@ logic.
   warehouse client, and both are resolved the same way, from the command being run
   rather than installed always: `explore cluster` adds `[cluster]`, and
   `explore semantic` adds `[semantic-api]` plus, where a statement might be
-  rendered locally (any mode but `list`, without `--api`), `[semantic]`. A repo
-  that runs neither resolves neither scikit-learn nor MetricFlow.
+  rendered locally (any mode but `list`, without `--api`), `[semantic]`, and
+  `[slayer]` where `semantic.vendor` is `slayer`, in place of `[semantic]`, since
+  SLayer renders its own `query` and `values`. A repo that runs neither resolves
+  neither scikit-learn nor MetricFlow.
 - That environment is uv's own, and `--no-project` is what keeps it so. Without it
   uv discovers whatever Python project the caller is standing in, builds it, leaves
   a `.venv/` and a `uv.lock` in their repo, and puts their dependencies on the
@@ -41,9 +43,11 @@ logic.
   resolved connector, its non-secret target coordinates, and the source of that
   resolution (`flag`, `.dex/config.yml`, `environment variable`,
   `dbt profiles.yml`, or `directory-local inference`). Commands that resolve no
-  warehouse keep the same shape with null/empty fields. The block is assembled
-  from facts already resolved by the command and never opens a connection or
-  spends merely to describe one.
+  warehouse keep the same shape with null/empty fields. This includes the
+  wrapper's missing-uv refusal and warm-up responses: their connection fields are
+  null/empty and all cost fields are null, because no warehouse was contacted or
+  query priced. The block is assembled from facts already resolved by the command
+  and never opens a connection or spends merely to describe one.
 - `DBT_PROFILES_DIR` locates `profiles.yml` for dbt operations and the
   last-resort credential fallback. It does **not** select dex's connector or
   override `--connector`/`--path` or `.dex/config.yml`; help and no-connector
@@ -387,6 +391,17 @@ hands it over via `--edits-file <path>` (or `-` for stdin), a JSON payload:
   {"path": "models/marts/dim_orders.sql", "kind": "model_sql", "op": "delete"}
 ]}
 ```
+
+Beside `edits`, `transform plan` and `semantic define|update|plan` accept a
+`declarations` list: per model, what one row is, which rows are in, what each column
+is, and the assumptions the model rests on with their evidence. Each is rendered
+into the model's existing YAML entry as a `schema_yml` edit in the same plan, and
+`edits` may be omitted when the payload only declares models that exist. The plan,
+apply and build envelopes then carry `data.decisions`, every assumption declared on
+the models the command touched. A command that takes no declarations refuses a
+payload carrying them rather than dropping them. The full shape, the refusals and
+what each field renders into:
+[`skills/transform/references/declarations.md`](../skills/transform/references/declarations.md).
 
 `kind` is one of `model_sql`, `schema_yml`, `semantic_yml` (optional on
 `semantic define|update`, which imply `semantic_yml`), `packages_yml`,
@@ -743,7 +758,14 @@ replace) inlines a literal credential, so no secret ever reaches the diff.
   `needs_confirmation` estimate. It is a partial floor when a cold dev target has
   not built a node's inputs yet, and degrades to no estimate (with a note) when
   dex cannot open its own connection; the ceiling and the server-side
-  per-statement cap bind regardless. dbt runs with cwd pinned to the project dir
+  per-statement cap bind regardless. On BigQuery, an incremental node whose
+  batch filter is bounded by a subquery (the usual watermark over
+  `{{ this }}`) is an upper bound rather than a measurement: a dry run prunes
+  partitions only on a constant bound, and the job prunes on the subquery's
+  result when it runs. Its `per_table_bytes` line is kept, since it is still
+  what the job can bill at most, and `data.upper_bounds` maps each such line to
+  the column it bounds; a note, and the over-ceiling refusal, say how much of
+  the estimate those lines are. dbt runs with cwd pinned to the project dir
   (relative `profiles.yml` paths resolve there, never against the caller's
   shell). When
   `packages.yml` (or a `dependencies.yml` with packages) is declared and
@@ -1024,9 +1046,14 @@ each saved measure a `formula` metric groupable by its own model's columns, so
 `--for-dimension` answers too. Measures and entities are declared `unavailable`,
 because a saved measure declares no aggregation and SLayer has no entities; its
 keys and joins reach `explore` through the declaration channel instead. `query`
-and `values` refuse by name: SLayer would execute through its own datasource
-connection, outside the cost guard and the query firewall, and under dex SLayer
-never touches the warehouse. Values SLayer caches in a model file
+and `values` run locally with `execution: dex`: SLayer renders the SQL as a dry
+run and dex executes it through the same PII gate, relation pre-check, cost
+handshake and columnar cap as the local MetricFlow backend, so SLayer never opens
+a datasource, never reads a credential, and never touches the warehouse. A query's
+metrics are saved measures on one model, grouped by that model's own columns, with
+`--where` in SLayer's own filter syntax; an ad-hoc formula is refused. DuckDB,
+BigQuery, Snowflake, Postgres and Redshift are supported, and Databricks,
+ClickHouse and Trino are refused with the reason. Values SLayer caches in a model file
 (`sampled_values`) are never read. See `references/semantic-layer.md`.
 `maintain` reads the same models on every axis without opening a SLayer
 datasource or SLayer storage: the baseline records the SLayer release and model
@@ -1175,7 +1202,18 @@ all three accept `--refresh`.
 
 Global flags (shared resolution path): `--connector`, `--path` (DuckDB),
 `--scope`, `--project` and `--dataset` (BigQuery only), `--repo-root`,
-`--confirm`, `--budget`, `--session-ceiling` and `--no-session-ceiling`.
+`--confirm`, `--budget`, `--session-ceiling`, `--no-session-ceiling`, and
+`--values-free`.
+
+`--values-free` runs the command in values-free mode, where no value read from a
+table appears in any result, refusal, error, note or warning: `explore profile`
+withholds `min_value`, `max_value` and `value_domain`, `explore query` accepts only
+aggregate-only statements, an error carries a code instead of a warehouse's words,
+and a command not reviewed for the mode refuses. A host pins it for every command
+with `DEX_RESULT_MODE=values_free` in the environment, and no flag turns it off;
+`.dex/config.yml` never selects it. Every envelope the mode produces carries
+`data.result_mode: "values_free"`. The rules, the command allowlist and the
+residual risks are in [`values-free-mode.md`](values-free-mode.md).
 
 `--session-ceiling <value>` and `--no-session-ceiling` are the two answers to the
 one-time cumulative-ceiling ask below. Either one writes the answer into
@@ -1289,6 +1327,12 @@ The gate, in order:
    is the one that follows the call rather than the statement, because it is the
    one protecting agent context: a call answering ten statements must not emit
    ten times what one statement is allowed.
+
+   In values-free mode a statement is first held to the aggregate-only shape (one
+   row of allowlisted aggregates, no column-keyed GROUP BY, no DISTINCT, LIMIT,
+   ORDER BY or window), before anything is opened or profiled, and its result is
+   held to one untruncated row of numbers afterwards: the mode refuses rather than
+   cuts. See [`values-free-mode.md`](values-free-mode.md).
 5. **Record.** Every decision, allowed, refused, or failed, is appended to
    `.dex/queries.jsonl` (SQL text and counts, never result values). An allowed
    query that projected sub-threshold flagged columns records those warnings
@@ -1298,7 +1342,8 @@ The gate, in order:
    the ledger as a spend. One entry per statement whatever the call carried; a
    call carrying several adds `batch_index` and `batch_size` to each and gives
    them all one timestamp, so an auditor can see that six statements were one
-   authorization event rather than six.
+   authorization event rather than six. In values-free mode a refused or failed
+   entry's `reason` is the error's code, never its words.
 
 Results are row-major (`columns`, `cells` as a list of lists, `row_count`,
 `truncated`, `notes`), which is cheaper in tokens than records and keeps the
@@ -1359,6 +1404,11 @@ Every command prints one object of this shape (`exmergo_dex_core.envelope`):
 }
 ```
 
+In values-free mode `data.result_mode` is `"values_free"` on every envelope, and
+an error envelope adds `data.code`, a stable code that quotes no value (see
+[`values-free-mode.md`](values-free-mode.md)). Outside the mode neither key is
+present.
+
 Rules the envelope enforces, all of them Tier-2 eval targets:
 
 - **Cost before spend.** `cost` is a preflight estimate, and any command that
@@ -1407,6 +1457,11 @@ Rules the envelope enforces, all of them Tier-2 eval targets:
   binding ceiling and ledger unit, and adds approximate compute-unit-hours from
   live per-replica memory plus optional USD from the configured price. Missing
   or partial capacity refuses before billed work.
+- **Trino is guarded as `db_load` in cluster-seconds.** `trino.deployment:
+  galaxy` is accepted by config validation, so the committed shape is final,
+  but refused by `connect`, the dev-target preflight and `transform init`,
+  with `compute_time` named as the paradigm it would need; a `self_hosted`
+  declaration reaching a `*.galaxy.starburst.io` host is refused too.
 - **Spend, the ledger, and the daily ceiling are governed by
   [`cost-controls.md`](cost-controls.md).** That file owns the
   `.dex/spend.jsonl` row shape, how reservations and settlements net, the

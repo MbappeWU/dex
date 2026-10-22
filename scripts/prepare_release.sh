@@ -23,8 +23,9 @@
 # (for example 0.1.0a1 for an alpha, 0.1.0 for a release). Use the canonical
 # PEP 440 spelling: it must match the built wheel name the workflow asserts on.
 # [plugin-semver], if given, bumps the plugin manifests each agent reads:
-# .claude-plugin/plugin.json (Claude Code), plugin.json (the Agent Plugins manifest
-# Copilot CLI, Cursor and Kiro read) and gemini-extension.json (Gemini CLI). A
+# .claude-plugin/plugin.json (Claude Code), .codex-plugin/plugin.json (Codex),
+# plugin.json (the Agent Plugins manifest Copilot CLI, Cursor and Kiro read), and
+# gemini-extension.json (Gemini CLI). A
 # manifest left behind advertises the previous version to that agent's users, and
 # packages/dex-core/tests/test_plugin_manifests.py fails the release gate on it. The
 # plugin version is semver, distinct from the engine's PEP 440 string, so it is set
@@ -94,7 +95,7 @@ for skill in explore transform maintain; do
 done
 
 if [ -n "${PLUGIN_VERSION}" ]; then
-  for manifest in .claude-plugin/plugin.json plugin.json gemini-extension.json; do
+  for manifest in .claude-plugin/plugin.json .codex-plugin/plugin.json plugin.json gemini-extension.json; do
     f="${ROOT}/${manifest}"
     sed -i.bak -E "s/(\"version\": \")[^\"]+(\")/\1${PLUGIN_VERSION}\2/" "$f"
     rm -f "${f}.bak"

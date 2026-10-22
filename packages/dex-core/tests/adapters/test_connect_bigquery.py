@@ -670,10 +670,11 @@ def test_the_profiles_own_aggregate_still_degrades_on_a_refused_dry_run(
     aggregates = adapter.column_aggregates(table.identifier, columns)
 
     assert len(aggregates) == len(columns)  # metadata-only rows, not an exception
-    assert any(
-        "aggregate profiling failed and was skipped" in note
-        for note in adapter.table_notes(table.identifier)
-    )
+    notes = adapter.table_notes(table.identifier)
+    assert any("aggregate profiling failed and was skipped" in note for note in notes)
+    # The note is cached and copied into `explore map`, so it never carries the
+    # server's message, which can quote the value a statement failed on (#591).
+    assert not any("Drive credentials" in note for note in notes)
     assert not [c for c in fake_bq_client.query_calls if not c.dry_run]
 
 

@@ -16,6 +16,7 @@ import pytest
 
 from exmergo_dex_core.cli import main
 from exmergo_dex_core.dbt_project import load
+from exmergo_dex_core.edits import EditOp
 from exmergo_dex_core.references import ReferenceIndex, find_references
 from exmergo_dex_core.transform.propagate import PropagationRefusedError, propagate
 
@@ -577,6 +578,43 @@ def test_a_yaml_snapshot_relation_is_an_occurrence(tmp_path):
     ]
 
 
+def test_dynamic_yaml_snapshot_relations_limit_only_their_reference_kinds(tmp_path):
+    root = tmp_path / "analytics"
+    _write(
+        root / "dbt_project.yml",
+        'name: analytics\nversion: "1.0.0"\nprofile: analytics\n',
+    )
+    _write(root / "models" / "orders.sql", "select 1 as id\n")
+    _write(
+        root / "snapshots" / "snapshots.yml",
+        "snapshots:\n"
+        "  - name: dynamic_source\n"
+        "    relation: source('raw', var('table_name'))\n"
+        "  - name: dynamic_model\n"
+        "    relation: ref(var('model_name'))\n"
+        "  - name: literal_source\n"
+        "    relation: source('raw', 'orders')\n"
+        "  - name: literal_model\n"
+        "    relation: ref('orders')\n",
+    )
+    view = load(root)
+    index = ReferenceIndex(view)
+    for kind, name, line in (("source", "raw.orders", 3), ("model", "orders", 5)):
+        report = find_references(view, [name], kind=kind, index=index)
+        assert report.completeness == "incomplete"
+        unresolved = [
+            (hit.path, hit.line, hit.kind, hit.name) for hit in report.indeterminate
+        ]
+        assert unresolved == [("snapshots/snapshots.yml", line, kind, None)]
+        assert any("could not be resolved" in limit for limit in report.limits)
+        assert any(
+            hit.form == "yaml_snapshot_relation"
+            for hit in index.references_to(name, kind)[0]
+        )
+    seed_report = find_references(view, ["orders"], kind="seed", index=index)
+    assert seed_report.completeness == "complete"
+
+
 def test_a_python_model_lists_its_ref_and_source_reads(tmp_path):
     """Literal `dbt.ref` and `dbt.source` calls are occurrences.
 
@@ -653,6 +691,140 @@ def test_an_unresolved_python_ref_makes_model_queries_incomplete(tmp_path):
     assert any("could not be resolved" in limit for limit in report.limits)
 
 
+def test_a_versioned_python_ref_resolves_to_the_model(tmp_path):
+    """`dbt.ref("other_model", v=1)` and `version=` name the model.
+
+    A package-qualified call names the model too. The version keyword is not
+    an unread argument.
+    """
+
+    root = tmp_path / "analytics"
+    _write(
+        root / "dbt_project.yml",
+        'name: analytics\nversion: "1.0.0"\nprofile: analytics\n',
+    )
+    _write(root / "models" / "other_model.sql", "select 1 as id\n")
+    _write(
+        root / "models" / "py_orders.py",
+        "def model(dbt, session):\n"
+        '    pinned = dbt.ref("other_model", v=1)\n'
+        '    named = dbt.ref("other_model", version=1)\n'
+        '    packaged = dbt.ref("utils", "other_model", version=2)\n'
+        "    return pinned\n",
+    )
+    index = ReferenceIndex(load(root))
+
+    python_refs = [
+        hit
+        for hit in index.references_to("other_model", "model")[0]
+        if hit.form == "python_ref"
+    ]
+    assert [(hit.path, hit.line, hit.qualifier) for hit in python_refs] == [
+        ("models/py_orders.py", 2, None),
+        ("models/py_orders.py", 3, None),
+        ("models/py_orders.py", 4, "utils"),
+    ]
+    assert [
+        item
+        for item in index.indeterminate_for("model")
+        if item.path == "models/py_orders.py"
+    ] == []
+    assert index.parents_of("py_orders") == {"other_model"}
+
+
+def test_a_versioned_python_ref_does_not_block_an_unrelated_model(tmp_path):
+    """A version keyword does not make every model query incomplete.
+
+    Renaming a model the call does not name is the move of that model.
+    """
+
+    root = tmp_path / "analytics"
+    _write(
+        root / "dbt_project.yml",
+        'name: analytics\nversion: "1.0.0"\nprofile: analytics\n',
+    )
+    _write(root / "models" / "stg_orders.sql", "select 1 as id\n")
+    _write(root / "models" / "other_model.sql", "select 1 as id\n")
+    _write(
+        root / "models" / "py_orders.py",
+        "def model(dbt, session):\n"
+        '    pinned = dbt.ref("other_model", v=1)\n'
+        '    named = dbt.ref("other_model", version=1)\n'
+        '    packaged = dbt.ref("utils", "other_model", version=2)\n'
+        "    return pinned\n",
+    )
+    view = load(root)
+
+    report = find_references(view, ["stg_orders"], kind="model")
+    assert report.completeness == "complete"
+    assert report.limits == []
+    result = propagate(view, root, "model", "stg_orders", "stg_bookings")
+    assert [(edit.op, edit.path) for edit in result.edits] == [
+        (EditOp.DELETE, "models/stg_orders.sql"),
+        (EditOp.UPSERT, "models/stg_bookings.sql"),
+    ]
+    moved = next(
+        edit for edit in result.edits if edit.path == "models/stg_bookings.sql"
+    )
+    assert moved.new_content == "select 1 as id\n"
+
+
+def test_an_unknown_python_ref_keyword_stays_unresolved(tmp_path):
+    """A keyword other than `v` or `version`, and `**kwargs`, stay unread."""
+
+    root = tmp_path / "analytics"
+    _write(
+        root / "dbt_project.yml",
+        'name: analytics\nversion: "1.0.0"\nprofile: analytics\n',
+    )
+    _write(root / "models" / "stg_orders.sql", "select 1 as id\n")
+    _write(
+        root / "models" / "py_orders.py",
+        "def model(dbt, session):\n"
+        "    dbt.ref('other_model', where='active')\n"
+        "    return dbt.ref('other_model', **opts)\n",
+    )
+    view = load(root)
+    index = ReferenceIndex(view)
+
+    unresolved = index.indeterminate_for("model")
+    assert [(hit.path, hit.line, hit.form, hit.name) for hit in unresolved] == [
+        ("models/py_orders.py", 2, "python_ref", None),
+        ("models/py_orders.py", 3, "python_ref", None),
+    ]
+    assert index.references_to("other_model", "model")[0] == []
+    report = find_references(view, ["stg_orders"], kind="model")
+    assert report.completeness == "incomplete"
+    with pytest.raises(PropagationRefusedError, match=r"models/py_orders\.py:2"):
+        propagate(view, root, "model", "stg_orders", "stg_bookings")
+
+
+def test_a_dynamic_python_ref_with_a_version_stays_unresolved(tmp_path):
+    """`dbt.ref(model_name, v=1)` still names nothing dex can read."""
+
+    root = tmp_path / "analytics"
+    _write(
+        root / "dbt_project.yml",
+        'name: analytics\nversion: "1.0.0"\nprofile: analytics\n',
+    )
+    _write(root / "models" / "stg_orders.sql", "select 1 as id\n")
+    _write(
+        root / "models" / "py_orders.py",
+        "def model(dbt, session):\n    return dbt.ref(model_name, v=1)\n",
+    )
+    view = load(root)
+    index = ReferenceIndex(view)
+
+    unresolved = index.indeterminate_for("model")
+    assert [(hit.path, hit.line, hit.form, hit.name) for hit in unresolved] == [
+        ("models/py_orders.py", 2, "python_ref", None)
+    ]
+    report = find_references(view, ["stg_orders"], kind="model")
+    assert report.completeness == "incomplete"
+    with pytest.raises(PropagationRefusedError, match=r"models/py_orders\.py:2"):
+        propagate(view, root, "model", "stg_orders", "stg_bookings")
+
+
 def test_an_unparsed_python_model_limits_relation_queries(tmp_path):
     """A Python model dex cannot parse may hide a ref or a source.
 
@@ -710,3 +882,110 @@ def test_a_yaml_file_that_does_not_parse_is_unread_not_a_global_limit(project):
 
     assert index.unread == ["models/broken.yml"]
     assert not any("broken.yml" in limit for limit in index.limits)
+
+
+def test_snapshot_and_python_relation_reads_preserve_seed_and_snapshot_kinds(tmp_path):
+    """A YAML snapshot reading a seed and a Python model reading a YAML snapshot
+    keep their targets' actual kinds rather than defaulting to `model`.
+    """
+
+    root = tmp_path / "analytics"
+    _write(
+        root / "dbt_project.yml",
+        'name: analytics\nversion: "1.0.0"\nprofile: analytics\n',
+    )
+    _write(root / "seeds" / "codes.csv", "code\nIT\n")
+    _write(
+        root / "models" / "py_orders.py",
+        'def model(dbt, session):\n    return dbt.ref("history")\n',
+    )
+    _write(
+        root / "snapshots" / "snapshots.yml",
+        "snapshots:\n  - name: history\n    relation: ref('codes')\n",
+    )
+    view = load(root)
+    index = ReferenceIndex(view)
+
+    seed_hits, _limits = index.references_to("codes", "seed")
+    assert [
+        (hit.path, hit.line, hit.form, hit.kind)
+        for hit in seed_hits
+        if hit.form == "yaml_snapshot_relation"
+    ] == [("snapshots/snapshots.yml", 3, "yaml_snapshot_relation", "seed")]
+    assert [
+        hit
+        for hit in index.references_to("codes", "model")[0]
+        if hit.form == "yaml_snapshot_relation"
+    ] == []
+
+    snapshot_hits, _limits = index.references_to("history", "snapshot")
+    assert [
+        (hit.path, hit.line, hit.form, hit.kind)
+        for hit in snapshot_hits
+        if hit.form == "python_ref"
+    ] == [("models/py_orders.py", 2, "python_ref", "snapshot")]
+    assert [
+        hit
+        for hit in index.references_to("history", "model")[0]
+        if hit.form == "python_ref"
+    ] == []
+
+    seed_report = find_references(view, ["codes"], kind="seed")
+    assert seed_report.completeness == "complete"
+    assert {f["path"] for f in seed_report.targets[0]["files"]} == {
+        "seeds/codes.csv",
+        "snapshots/snapshots.yml",
+    }
+
+    snapshot_report = find_references(view, ["history"], kind="snapshot")
+    assert snapshot_report.completeness == "complete"
+    assert "models/py_orders.py" in {
+        f["path"] for f in snapshot_report.targets[0]["files"]
+    }
+
+
+@pytest.mark.parametrize(
+    ("decl_file", "reader_file"),
+    [("a_decl.yml", "z_reader.yml"), ("z_decl.yml", "a_reader.yml")],
+)
+def test_yaml_declared_snapshot_kind_is_independent_of_traversal_order(
+    tmp_path, decl_file, reader_file
+):
+    """Reference kind resolution does not depend on file traversal order."""
+
+    root = tmp_path / "analytics"
+    _write(
+        root / "dbt_project.yml",
+        'name: analytics\nversion: "1.0.0"\nprofile: analytics\n',
+    )
+    _write(root / "seeds" / "codes.csv", "code\nIT\n")
+    _write(
+        root / "models" / "a_model.sql",
+        "select * from {{ ref('history') }}\n",
+    )
+    _write(
+        root / "models" / "a_py.py",
+        'def model(dbt, session):\n    return dbt.ref("history")\n',
+    )
+    _write(
+        root / "snapshots" / decl_file,
+        "snapshots:\n  - name: history\n    relation: ref('codes')\n",
+    )
+    _write(
+        root / "snapshots" / reader_file,
+        "snapshots:\n  - name: downstream_history\n    relation: ref('history')\n",
+    )
+    view = load(root)
+    index = ReferenceIndex(view)
+
+    hits, _limits = index.references_to("history", "snapshot")
+    assert {
+        (hit.path, hit.form, hit.kind)
+        for hit in hits
+        if hit.form in ("ref_call", "python_ref", "yaml_snapshot_relation")
+    } == {
+        ("models/a_model.sql", "ref_call", "snapshot"),
+        ("models/a_py.py", "python_ref", "snapshot"),
+        (f"snapshots/{reader_file}", "yaml_snapshot_relation", "snapshot"),
+    }
+    assert index.references_to("history", "model")[0] == []

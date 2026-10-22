@@ -35,6 +35,7 @@ from exmergo_dex_core.guards.cost_guard import (
         ("redshift", EstimateQuality.APPROXIMATE),
         ("postgres", EstimateQuality.APPROXIMATE),
         ("clickhouse", EstimateQuality.APPROXIMATE),
+        ("trino", EstimateQuality.APPROXIMATE),
         # Nothing is priced because nothing is billed.
         ("duckdb", None),
     ],

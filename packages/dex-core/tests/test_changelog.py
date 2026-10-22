@@ -89,7 +89,12 @@ FRAGMENTS = {
 WRAPPERS = [
     f"skills/{skill}/scripts/run.py" for skill in ("explore", "transform", "maintain")
 ]
-MANIFESTS = [".claude-plugin/plugin.json", "plugin.json", "gemini-extension.json"]
+MANIFESTS = [
+    ".claude-plugin/plugin.json",
+    ".codex-plugin/plugin.json",
+    "plugin.json",
+    "gemini-extension.json",
+]
 
 
 def _git(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:

@@ -416,7 +416,7 @@ listed only in the table's second tier reads its nearest listed ancestor, so
 | value | meaning |
 |---|---|
 | `exact` | BigQuery: a dry run is what the job will bill |
-| `approximate` | a model of the run (Snowflake, Databricks, Redshift, Postgres, ClickHouse) |
+| `approximate` | a model of the run (Snowflake, Databricks, Redshift, Postgres, ClickHouse, Trino) |
 | `unknown` | pricing was attempted and produced no number |
 | absent | nothing was priced |
 
@@ -459,6 +459,27 @@ says what it claims rather than recomputing it.
 This complements, rather than replaces, the executable contract classes shipped
 for the storage, project, and semantic seams. Those are for someone implementing a
 protocol; these are for someone consuming a payload.
+
+## Requiring values-free results
+
+A host whose model may see no value read from a table runs every call in
+values-free mode, and the place to require it is where the host builds the
+engine, never the repository: `DexEngine(result_mode="values_free")` pins the
+engine, so a call asking for `"full"` is refused and every method not reviewed for
+the mode refuses before it opens anything. A host that drives the CLI instead sets
+`DEX_RESULT_MODE=values_free` in the environment of every process it launches; no
+flag turns it off. Assert on the result rather than trusting the setting:
+`result.result_mode` on the library, `data.result_mode` on every envelope. In the
+mode an error carries `data.code` (`.code` on a `ValuesFreeError`,
+`.values_free_code` on any other refusal) in place of a warehouse's words, so a
+host branches on the code.
+
+The guarantee ships as an executable contract,
+`exmergo_dex_core.values_free_conformance.ValuesFreeContract`, installed with the
+`[values-free-conformance]` extra. Subclass it in your suite, override
+`make_engine` if you build engines differently, and run it against the release you
+pin. What the mode keeps, withholds and refuses, and the residual risks it does
+not close, are in [`values-free-mode.md`](values-free-mode.md).
 
 ## What stays where it is
 

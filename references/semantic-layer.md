@@ -5,9 +5,10 @@ dex can author a semantic layer (`transform` / `semantic define|update` for dbt,
 define|update` for SLayer model files) and detect drift
 in it (`maintain semantic`). `explore semantic` is the third piece: it *queries*
 the layer, so an agent can discover metrics and, where the layer defines a
-runtime, run governed metric queries. Three backends answer the same commands
-through one abstraction, and the differences between them are load-bearing, so
-they are spelled out here.
+runtime, run governed metric queries. Four layers answer the same commands
+through one abstraction (a local dbt project, a hosted dbt Cloud deployment,
+native Apache Ossie documents, and SLayer model files), and the differences
+between them are load-bearing, so they are spelled out here.
 
 ## The three commands
 
@@ -46,6 +47,12 @@ like any other. Positional metrics and the `--metric`, `--group-by`, and
 and the two forms mix freely: `--group-by a,b` and
 `--group-by a --group-by b` are the same query. `--where` never splits, because a
 filter clause carries commas of its own.
+
+A SLayer layer keeps the same flags and spells its tokens the way SLayer does: a
+metric is `orders.revenue`, a group-by token is `orders.status`, `--where` is
+SLayer's own filter syntax (`status = 'paid'`), and `--grain` buckets the model's
+default time dimension. What that changes is under
+[Governed `query` and `values`](#governed-query-and-values).
 
 ## What `list` returns
 
@@ -425,8 +432,12 @@ spine, in order:
 
 1. **PII request-gate.** Each grouped or filtered dimension is resolved through the
    manifest to its physical column, and that column's `.dex/` cache flag decides.
-   The evidence rules, in both directions, and the name heuristic that floors them
-   are in [`pii-policy.md`](pii-policy.md).
+   `metric_time` is resolved to each input measure's agg time dimension, a grain
+   suffix to the dimension it buckets, and a dimension defined as an expression to
+   every column the expression reads (refused when dex cannot parse it). The
+   evidence rules, in both directions, and the name heuristic that floors them are
+   in [`pii-policy.md`](pii-policy.md). A result names each dimension that only
+   the heuristic screened.
 2. **SELECT-only assertion.** Before anything else touches the statement or the
    connection, the rendered SQL is proven read-only.
 3. **Relation pre-check.** The rendered SQL bakes in `relation_name` from the
@@ -494,8 +505,9 @@ The PII gate's column resolution comes through the same seam: the format maps ev
 dimension and entity token to the `(relation, column)` behind it, resolved paths
 included, so a token the join resolution added is adjudicated from its column's
 evidence rather than dropping to the name heuristic. A token whose reference is a
-computed expression is absent rather than guessed, since guessing a column out of
-an expression would make the gate over-claim.
+computed expression is absent from that map rather than guessed, since guessing a
+column out of an expression would make the gate over-claim. The format hands the
+expression over separately instead, and the gate screens every column it reads.
 
 ## Hosted backend (`--api`, dbt Cloud Semantic Layer)
 
@@ -553,6 +565,14 @@ heuristic. Asking per metric is what keeps the layer authoritative for every
 dimension a query touches, and the aliases keep it to one round trip. A group-by
 token that carries a time grain (`user__created_at__month`) is looked up under the
 dimension name too, since no dimension name carries a grain.
+
+`metric_time` is the exception. dbt Cloud resolves it server-side, and nothing
+the gate reads before sending a query says which dimension it resolves to: the
+metadata is keyed by token, and a measure's agg time dimension arrives as a bare
+name with no semantic model to qualify it by. So `metric_time` is screened by its
+name, and the result names it among the dimensions only the heuristic screened.
+Group by the time dimension's own token to have the layer's metadata adjudicate
+it.
 
 The same request carries the layer's queryable grains per metric, which is what
 `--grain` is validated against. It is one more field on a document that was already
@@ -756,9 +776,9 @@ Selection is deterministic given a document and a connector:
 2. the portable dialect, `ANSI_SQL`;
 3. the first declared SQL dialect, in the document's own order.
 
-It never falls through to a non-SQL language. DuckDB, Postgres, Redshift and
-ClickHouse have no token in Ossie's enum, so they fall to the portable dialect,
-which is correct and is stated here rather than left to be inferred. Every
+It never falls through to a non-SQL language. DuckDB, Postgres, Redshift,
+ClickHouse and Trino have no token in Ossie's enum, so they fall to the portable
+dialect, which is correct and is stated here rather than left to be inferred. Every
 declared dialect is preserved on the element's `vendor_params`, along with the
 datatype, the AI context, and any custom extensions, so nothing the document says
 is dropped and nothing is smuggled into an unrelated field.
@@ -901,6 +921,7 @@ dex's catalog is shaped by MetricFlow, and SLayer is shaped differently:
 | `SlayerModel` | a semantic model, on the relation `sql_table` names. A model backed by `sql` or `source_queries`, or a `sql_table` that is not fully qualified for the connector, carries no relation and a note says why |
 | `Column` | a dimension, keyed `model.column`, the reference a SLayer query uses. `time` for `DATE` and `TIMESTAMP`, `categorical` otherwise. The `column` is the physical one behind it, and `None` for an expression or a quoted identifier |
 | saved `ModelMeasure` | a metric of type `formula`, named `model.measure`, with the formula under `composition.expr`, the model's filters under `filter`, and every column of its own model as a groupable token |
+| `Column.filter` | part of a metric's `filter` where every aggregation in its formula reads a column carrying that one filter, since a filtered column is where SLayer puts a predicate meant for one metric. A formula that aggregates filtered and unfiltered columns (a ratio over a filtered side) is narrowed in part only, so the column filter is not the metric's. A formula SLayer's parser could not read reports only the model's filters, with a note |
 | `default_time_dimension` | the model's `agg_time_dimension` and each of its metrics' `time_axis`, resolved the way SLayer resolves it (the declared column, else the model's only date or timestamp column) |
 | `Aggregation` | named in a note: a function a formula applies to a column, not an element that answers a number |
 | `Column.primary_key`, `Column.unique` | declared keys, through the declaration channel |
@@ -925,7 +946,7 @@ of them reaches the catalog, the declarations, or the fingerprint, since values
 reach agent context only through `explore query`'s firewall. `meta` is not carried
 either.
 
-### What reaches `explore`, and what does not run
+### What SLayer's declarations reach in `explore`
 
 - a sole primary-key column, or a `unique` column, becomes a declared unique key;
   several primary-key columns become one composite grain in declared order, never
@@ -936,11 +957,106 @@ either.
   `cardinality` is `many_to_many`, which says the far side is not a key;
 - `explore map --use-project` marks each relation with the SLayer models on it.
 
-`explore semantic query` and `values` refuse by name. SLayer has a query runtime,
-but it executes through SLayer's own datasource connection, which carries
-credentials dex does not read and spends outside the cost guard and the query
-firewall. The refusal names the governed route: the relations the catalog reports,
-read with `explore query`.
+### Governed `query` and `values`
+
+**SLayer renders, dex executes.** SLayer has a query runtime of its own, but it
+executes through SLayer's datasource connection, which carries credentials dex
+does not read and spends outside the cost guard and the query firewall. So dex
+never calls it. SLayer is handed a query and the model files dex already
+validated, renders the SQL it would run as a dry run (`dry_run=True`), and returns
+before any SQL client exists. That SQL reaches the warehouse only through the same
+spine the local MetricFlow backend uses, so `execution` is `dex`, the full cost
+guard applies, and no cost-guard-unavailable warning is attached. No datasource
+and no SLayer storage is opened, and the storage SLayer renders against refuses
+every write.
+
+`explore semantic query` runs in the local backend's order, because the order is
+the safety contract:
+
+1. **The PII request-gate**, on every grouped column and every column a `--where`
+   clause names. A clause is read with SLayer's own filter grammar, against the
+   model the query is rooted at: a bare column belongs to that model, and a dotted
+   one is walked through the model's declared joins, so a filter on a joined PII
+   column is caught too, including inside an aggregation's argument. A saved
+   measure named in a clause (`revenue > 100`) is read as the columns its formula
+   reads, since that is what SLayer renders in its place. Each column is looked up
+   in the `.dex/` cache through the catalog's physical columns, and a column
+   defined by `sql` through every column that expression reads, with the name
+   heuristic as the floor. A result names each column that only the heuristic
+   screened. A clause dex cannot read is refused rather than screened by half.
+2. **The grain check**, then **translation** into a SLayer query, which refuses
+   whatever this release does not map (below).
+3. **A dry-run render**, in the dialect of dex's own connector. A SLayer resolution
+   error is redacted and reported as `could not resolve the metric query`, as
+   MetricFlow's is.
+4. **The governed spine**: SELECT-only, the relation pre-check against the
+   connection's own inventory (a relation the connection lacks is refused before
+   spend, with a hint to correct the model's `sql_table`), the cost handshake,
+   dex's connector, and the columnar cap.
+
+What a query can say, in this release:
+
+- **A metric is a saved measure**, named `model.measure`. Every metric in one query
+  sits on the same model, because a SLayer query is rooted at one model and
+  choosing a root for metrics on several is a modelling decision dex will not make
+  for the caller. An ad-hoc formula (`sum(amount)`) is refused: SLayer would accept
+  it, but it is a definition written at query time that the layer never reviewed.
+- **`--group-by` takes the root model's own columns**, `model.column`, which is what
+  the catalog reports as groupable (`dimension_scope: declarations`). A column on a
+  joined model is refused by name, even where the layer declares the join.
+- **`--grain` buckets the model's `default_time_dimension`** at one of SLayer's
+  built-in granularities: `second`, `minute`, `hour`, `day`, `week`,
+  `week_sunday`, `month`, `quarter`, `year`. A datasource's custom grain is not
+  available, since dex reads no datasource, and a model with no time dimension
+  refuses `--grain`. Grouping by the time column as well folds it into the bucket.
+- **`--where` is SLayer's filter syntax**, passed to SLayer verbatim once the gate
+  has read it. A clause carrying `{variable}` syntax is refused, because SLayer
+  fills a placeholder from the model's declared defaults after the gate has
+  screened the clause; write the value in.
+- **`--order-by`** (`-token` for descending) names one of the query's own metrics or
+  grouped columns. Anything else would reach a column the gate never screened.
+- **Result columns are named `model.column`** on every connector. BigQuery rejects
+  a dotted output column, so the statement emits `orders___status` there and dex
+  renames it on the way back. Redshift folds a quoted name to lowercase unless
+  `enable_case_sensitive_identifier` is on, so a model spelt `Orders.Status`
+  comes back as `orders.status` and dex restores the model's spelling; two result
+  columns that differ only in case are refused there, since the rows could not
+  tell them apart.
+- **A week starts on the day its grain names.** `week` is Monday-based and
+  `week_sunday` Sunday-based on every connector. Snowflake's own week truncation
+  follows the account's `WEEK_START`, so dex rewrites it to a Monday computed with
+  `DAYOFWEEKISO`, which ignores that setting.
+
+`explore semantic values` runs the same spine behind a different front. The token
+is resolved against the catalog first, so an unknown dimension, or an unknown
+scoping metric, is refused by name. The values gate then refuses a PII-flagged
+dimension before anything renders. The render is a dimension-only query (one
+column, no measure, `distinct_dimension_values`), rooted at the dimension's own
+model, so `scoped_to` is empty and the model's own filters still apply: the domain
+is the column's values among the rows the model keeps. `--metric` roots it at that
+metric's model instead, the dimension must be one the metric groups by, and
+`scoped_to` names the metric. A grain suffix (`orders.ordered_at__month`) buckets a
+time dimension and is refused on a categorical one. There is no escalation to a
+metric: a SLayer dimension is a column of its own model, so the unscoped form
+always answers. SLayer's own value profiling (`update_column_sampled`, the samples
+it caches in a model file) is never reached.
+
+**Which connectors.** A connector joins only once a golden of the SQL SLayer renders
+for it has been read for that dialect:
+
+| connector | |
+|---|---|
+| DuckDB, BigQuery, Snowflake, Postgres, Redshift | supported |
+| Databricks | refused: SLayer buckets a timestamp with Spark's `TRUNC`, which answers NULL below a week, and renders a median with `PERCENTILE_APPROX`; both run and return wrong numbers |
+| ClickHouse | refused: SLayer probes the server through a live client while preparing a correlated semi-join, which a dry run would not survive |
+| Trino | refused: SLayer has a Trino dialect, but no golden of its rendered SQL has been read yet |
+
+Any other connector is refused too, rather than rendered in SLayer's Postgres
+fallback, because that SQL would run and the numbers would be wrong. `--api` is
+refused, since dex reads no hosted SLayer.
+
+Not in this release: a dimension reached through a join, an ad-hoc formula, and
+SLayer's row-level policy.
 
 ### What `maintain` makes of the layer
 
@@ -1213,32 +1329,34 @@ single-hop read), and `--api` against a transport reproducing the dbt Cloud API'
 real asymmetries. A fourth test compares those two directly on the same layer,
 which is the thing the per-backend assertions cannot catch. The native Ossie
 backend is bound to the same runtime contract in
-`tests/ossie/test_conformance.py`.
+`tests/ossie/test_conformance.py`, and the SLayer layer to both runtime contracts
+in `tests/slayer_vendor/test_reader.py`, the catalog one against
+`REFERENCE_LAYER` seeded as SLayer model files.
 
 ## The asymmetry at a glance
-| | Local (`--local`) | Hosted (`--api`) | Native Ossie (`vendor: ossie`) |
-|---|---|---|---|
-| `execution` reported | `dex` | `vendor` | `dex` |
-| Renders the SQL | dex, via MetricFlow `explain()` | dbt Cloud | nothing to render: the format defines no query runtime |
-| Executes the SQL | dex, through the active connector | dbt Cloud, server-side | nothing executes: `query` and `values` refuse |
-| Needs a local dbt project | yes | no | no, and it never reads one |
-| Cost guard ([`cost-controls.md`](cost-controls.md)) | the full handshake, ceiling enforced by dex | unavailable: dbt Cloud's own limits, warned on every result | not applicable: reading the layer spends nothing |
-| PII gate | `.dex/` cache flags on the resolved physical column, name heuristic as the floor | layer metadata, fetched per metric and unioned, plus a name heuristic | `.dex/` cache flags on the directly linked column, name heuristic where a field carries none |
-| When only the floor ran | disclosed on the result, naming the unprofiled relations | disclosed on the result, naming the dimensions the layer said nothing about | disclosed per field, naming which of the four no-column cases applies |
-| Namespace mismatch | refused before spend, against the connection's own inventory | dbt Cloud resolves its own relations | a source dex cannot address as one whole relation is opaque and links nothing |
-| Credentials | the connector's, never in context | a dbt Cloud service token, never in context | the connector's, and only where a later command touches the warehouse |
-| Host-supplied credential | `ConnectionSource` (the connector's) | `SemanticSource` (the service token) | none: the layer is files in this repository, and supplying one is refused by name |
-| Entity labels on `list` | yes, from the compiled manifest | no: the API's `Entity` type has none, declared in `unavailable` | no entities at all, declared in `unavailable` |
-| Semantic model metadata on `list` | label, description, `model_ref`, default time dimension | name only: the API's `SemanticModel` type carries nothing else | name, label, description and `relation`; no `model_ref` and no default time dimension |
-| Physical relation on a semantic model | yes, from `node_relation` | no: declared in `unavailable`, so a hosted catalog cannot say which table a metric reads | yes, where the dataset source is one relation this connector can address |
-| Physical column on an element | yes, on dimensions, entity declarations and measures | yes, from the API's `expr`, on all three | on a dimension only, and only for an unquoted bare identifier |
-| A measure's column | resolved from the expression the author wrote, so a plain `count` carries its column | resolved from the expression dbt compiled, so a plain `count` is a `CASE WHEN` and carries none | no measures at all, declared in `unavailable` |
-| `dimension_scope` | `queryable_paths` with the `[semantic]` extra, `declarations` without it (declared, with a note) | `queryable_paths`: one row per groupable token, join-resolved | `declarations`, always: the format states no join graph to resolve through |
-| Join graph resolved | by MetricFlow, where the `[semantic]` extra is installed | by the API, always | not resolved: joins are explicit relationships rather than a graph a planner walks |
-| `--grain` validated against | the grains the project declares for the metric | the grains the layer reports for the metric | not applicable: `query` refuses, and the format carries no grain vocabulary |
-| `values` renders with | MetricFlow's own distinct-values query, executed here under the full handshake | `createDimensionValuesQuery`, executed by dbt Cloud | refused: no distinct-values API. Profile the relation the dimension names instead |
-| `values` on a joined dimension | escalated to a metric that reaches it, and said so | escalated the same way, for the same refusal | refused for the same reason |
-| Catalog completeness | the layer as the project declares it | reached metric by metric, so an element no metric draws on is absent | every configured document in full, whether or not a metric reads it |
-| Where `list` reads from | the project seam, so a non-dbt format needs no new parser | the dbt Cloud GraphQL API, one round trip | the configured documents in this repository, through the semantic-source seam |
-| Extra | `[semantic]` (query); none for `list` | `[semantic-api]` | `[ossie]`; `[sql]` for expression syntax |
-| Held to the conformance contract | yes, in both resolver states | yes, against a transport with the API's own asymmetries | yes, plus the four semantic-source contracts |
+| | Local (`--local`) | Hosted (`--api`) | Native Ossie (`vendor: ossie`) | SLayer (`vendor: slayer`) |
+|---|---|---|---|---|
+| `execution` reported | `dex` | `vendor` | `dex` | `dex` |
+| Renders the SQL | dex, via MetricFlow `explain()` | dbt Cloud | nothing to render: the format defines no query runtime | SLayer, as a dry run over the model files dex validated, in the connector's dialect |
+| Executes the SQL | dex, through the active connector | dbt Cloud, server-side | nothing executes: `query` and `values` refuse | dex, through the active connector |
+| Needs a local dbt project | yes | no | no, and it never reads one | no, and it never reads one |
+| Cost guard ([`cost-controls.md`](cost-controls.md)) | the full handshake, ceiling enforced by dex | unavailable: dbt Cloud's own limits, warned on every result | not applicable: reading the layer spends nothing | the full handshake, ceiling enforced by dex |
+| PII gate | `.dex/` cache flags on the resolved physical column, name heuristic as the floor | layer metadata, fetched per metric and unioned, plus a name heuristic | `.dex/` cache flags on the directly linked column, name heuristic where a field carries none | `.dex/` cache flags on the column behind each grouped and filtered dimension, joined filter columns included, name heuristic as the floor |
+| When only the floor ran | disclosed on the result, naming the unprofiled relations | disclosed on the result, naming the dimensions the layer said nothing about | disclosed per field, naming which of the four no-column cases applies | disclosed on the result, naming the unprofiled relations |
+| Namespace mismatch | refused before spend, against the connection's own inventory | dbt Cloud resolves its own relations | a source dex cannot address as one whole relation is opaque and links nothing | refused before spend, against the connection's own inventory, naming the model's `sql_table` |
+| Credentials | the connector's, never in context | a dbt Cloud service token, never in context | the connector's, and only where a later command touches the warehouse | the connector's, never in context; SLayer reads none |
+| Host-supplied credential | `ConnectionSource` (the connector's) | `SemanticSource` (the service token) | none: the layer is files in this repository, and supplying one is refused by name | `ConnectionSource` (the connector's); a `SemanticSource` is refused by name, since the layer is files in this repository |
+| Entity labels on `list` | yes, from the compiled manifest | no: the API's `Entity` type has none, declared in `unavailable` | no entities at all, declared in `unavailable` | no entities at all, declared in `unavailable` |
+| Semantic model metadata on `list` | label, description, `model_ref`, default time dimension | name only: the API's `SemanticModel` type carries nothing else | name, label, description and `relation`; no `model_ref` and no default time dimension | name, description, `relation` and default time dimension; no label, `model_ref` or primary entity |
+| Physical relation on a semantic model | yes, from `node_relation` | no: declared in `unavailable`, so a hosted catalog cannot say which table a metric reads | yes, where the dataset source is one relation this connector can address | yes, where `sql_table` is fully qualified for the connector |
+| Physical column on an element | yes, on dimensions, entity declarations and measures | yes, from the API's `expr`, on all three | on a dimension only, and only for an unquoted bare identifier | on a dimension only; none for an expression or a quoted identifier |
+| A measure's column | resolved from the expression the author wrote, so a plain `count` carries its column | resolved from the expression dbt compiled, so a plain `count` is a `CASE WHEN` and carries none | no measures at all, declared in `unavailable` | no measures at all, declared in `unavailable` |
+| `dimension_scope` | `queryable_paths` with the `[semantic]` extra, `declarations` without it (declared, with a note) | `queryable_paths`: one row per groupable token, join-resolved | `declarations`, always: the format states no join graph to resolve through | `declarations`, always: a metric groups by its own model's columns |
+| Join graph resolved | by MetricFlow, where the `[semantic]` extra is installed | by the API, always | not resolved: joins are explicit relationships rather than a graph a planner walks | by SLayer at render time, for a filter's dotted columns only; a group-by stays on the root model |
+| `--grain` validated against | the grains the project declares for the metric | the grains the layer reports for the metric | not applicable: `query` refuses, and the format carries no grain vocabulary | SLayer's built-in grains, applied to the model's `default_time_dimension` |
+| `values` renders with | MetricFlow's own distinct-values query, executed here under the full handshake | `createDimensionValuesQuery`, executed by dbt Cloud | refused: no distinct-values API. Profile the relation the dimension names instead | SLayer's dimension-only query, no measure, executed here under the full handshake |
+| `values` on a joined dimension | escalated to a metric that reaches it, and said so | escalated the same way, for the same refusal | refused for the same reason | not applicable: a dimension is a column of its own model; `--metric` scopes it to a metric's model |
+| Catalog completeness | the layer as the project declares it | reached metric by metric, so an element no metric draws on is absent | every configured document in full, whether or not a metric reads it | every configured model file in full, with a refused file named in `notes` |
+| Where `list` reads from | the project seam, so a non-dbt format needs no new parser | the dbt Cloud GraphQL API, one round trip | the configured documents in this repository, through the semantic-source seam | the configured model files in this repository, through the semantic-source seam |
+| Extra | `[semantic]` (query); none for `list` | `[semantic-api]` | `[ossie]`; `[sql]` for expression syntax | `[slayer]`, pinned to one SLayer release |
+| Held to the conformance contract | yes, in both resolver states | yes, against a transport with the API's own asymmetries | yes, plus the four semantic-source contracts | yes, both runtime contracts, against a SLayer rendering of the reference layer |

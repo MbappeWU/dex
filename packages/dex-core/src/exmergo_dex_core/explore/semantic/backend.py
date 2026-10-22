@@ -64,6 +64,18 @@ class SemanticLayer(Protocol):
 
     def filter_refs(self, clauses: list[str]) -> list[str] | None: ...
 
+    def time_axis_refs(self, metrics: list[str]) -> list[str] | None:
+        """The dimension tokens this layer's time token buckets for ``metrics``.
+
+        A time grouping (MetricFlow's ``metric_time``, SLayer's ``--grain``)
+        projects the time dimension of each measure the metrics read, without
+        the caller naming it, so the PII gate screens these tokens as it screens
+        a grouped dimension. None is this backend's stated position that it
+        cannot resolve them, which leaves the time token on the name heuristic
+        and the result disclosing that it did.
+        """
+        ...
+
     def declared_relationships(self) -> list[Any]:
         """Native full-pair declarations, or an empty list when unavailable."""
         ...

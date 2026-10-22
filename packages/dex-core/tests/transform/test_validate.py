@@ -149,3 +149,17 @@ def test_validate_model_sql_warns_when_model_is_entirely_jinja():
     assert validate_edit(_model_sql("{{ generate_model() }}\n")) == [
         "model.sql: model is entirely jinja; SELECT-only check skipped"
     ]
+
+
+def test_invalid_yaml_preserves_path_line_and_column():
+    edit = PlanEdit(
+        path="models/staging/schema.yml",
+        new_content="version: 2\ndescription: Collected signal: more\n",
+        kind=EditKind.SCHEMA_YML,
+    )
+    with pytest.raises(EditValidationError) as exc:
+        validate_edit(edit)
+
+    message = str(exc.value)
+    assert "models/staging/schema.yml: invalid YAML:" in message
+    assert "line 2, column 30" in message

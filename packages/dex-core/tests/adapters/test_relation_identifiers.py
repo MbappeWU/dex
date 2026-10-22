@@ -18,7 +18,15 @@ from exmergo_dex_core.adapters import (
     parse_relation,
 )
 
-THREE_PART = ("duckdb", "bigquery", "snowflake", "databricks", "postgres", "redshift")
+THREE_PART = (
+    "duckdb",
+    "bigquery",
+    "snowflake",
+    "databricks",
+    "postgres",
+    "redshift",
+    "trino",
+)
 
 
 def test_every_shipped_connector_has_a_rule():
@@ -116,6 +124,7 @@ def test_a_hyphen_is_not_accepted_where_no_connector_allows_one():
         ("postgres", "db.schema.orders"),
         ("redshift", "db.schema.orders"),
         ("databricks", "db.schema.orders"),
+        ("trino", "db.schema.orders"),
         ("duckdb", "Db.Schema.Orders"),
         ("bigquery", "Db.Schema.Orders"),
     ],
@@ -152,7 +161,7 @@ def test_the_acceptor_opens_nothing_and_imports_no_client():
         "parse_relation('duckdb', 'a.b.c');"
         "print(sorted(m for m in sys.modules if m in "
         "{'duckdb','google.cloud.bigquery','snowflake','psycopg',"
-        "'clickhouse_connect'}))"
+        "'clickhouse_connect','trino'}))"
     )
     out = subprocess.run(  # noqa: S603  (a fixed argv, no shell)
         [sys.executable, "-c", probe], capture_output=True, text=True, check=True

@@ -99,6 +99,17 @@ _PROFILE_CONTROLS: dict[str, list[tuple[str, str, str]]] = {
     "postgres": [("keepalives_idle", "connection", "seconds")],
 }
 
+#: Per connector whose server-side cap `transform build` winds down from the
+#: confirmed budget: what that cap is called on the server. Keyed exactly like
+#: ``transform.build._CAP_ENV_BUILDERS``, which injects it; a connector listed
+#: there and not here would build capped and report no control, and the
+#: reverse would report a cap nothing injected.
+_BUDGET_CONTROLS: dict[str, str] = {
+    "postgres": "statement_timeout",
+    "clickhouse": "max_execution_time and max_bytes_to_read",
+    "trino": "query_max_run_time and query_max_scan_physical_bytes",
+}
+
 #: Coverage each connector structurally cannot give a guarded build, stated by
 #: name. An empty list would read as full coverage, which is never true.
 _UNSUPPORTED: dict[str, list[str]] = {
@@ -129,6 +140,14 @@ _UNSUPPORTED: dict[str, list[str]] = {
     "clickhouse": [
         "time alone is checked only at block boundaries, which is why the byte "
         "cap is set alongside it rather than instead of it"
+    ],
+    "trino": [
+        "the physical-bytes cap is enforced on an interval of about a second and "
+        "some catalogs report no physical input at all, so the run-time cap is "
+        "the one that always binds",
+        "a federated catalog's own database is bounded only through Trino's "
+        "time cap on the statement that reaches it, not by anything set on that "
+        "database",
     ],
     "duckdb": [
         "no provider-side spend control of any kind exists: DuckDB is a local "
@@ -244,45 +263,33 @@ def guarded_execution_preflight(
             )
         )
 
-    if connector in {"postgres", "clickhouse"}:
-        ceiling = getattr(getattr(config, "budget", None), "ceiling", None)
-        report.controls.append(
-            ProviderControl(
-                name=(
-                    "max_execution_time and max_bytes_to_read"
-                    if connector == "clickhouse"
-                    else "statement_timeout"
-                ),
-                binds="statement",
-                source="budget",
-                unit=unit,
-                value=float(ceiling) if isinstance(ceiling, (int, float)) else None,
-                detail="wound into the dbt subprocess environment from this run's "
-                "confirmed budget, so it follows the budget rather than the profile",
-            )
-        )
-        if connector == "clickhouse":
-            from ..transform.dev_target import _raw_target_key
-            from ..transform.init import (
-                CH_MAX_BYTES_TO_READ_ENV,
-                CH_MAX_EXECUTION_TIME_ENV,
-            )
+    budget_control = _BUDGET_CONTROLS.get(connector)
+    if budget_control is not None:
+        from ..transform.dev_target import missing_cap_references
+        from ..transform.init import BUILD_CAP_REFERENCES
 
-            settings = _raw_target_key(project, target, "custom_settings")
-            rendered = " ".join(str(v) for v in settings.values()) if settings else ""
-            missing = [
-                name
-                for name in (CH_MAX_EXECUTION_TIME_ENV, CH_MAX_BYTES_TO_READ_ENV)
-                if name not in rendered
-            ]
-            if missing:
-                report.controls = [c for c in report.controls if c.source != "budget"]
-                report.notes.append(
-                    "this profile's custom_settings do not reference "
-                    f"{' or '.join(missing)}, so nothing winds the budget into a "
-                    "server-side cap: the budget bounds the estimate and nothing "
-                    "bounds a statement that outruns it"
+        missing = missing_cap_references(project, target, connector)
+        if missing:
+            report.notes.append(
+                f"this profile's {BUILD_CAP_REFERENCES[connector][0]} do not "
+                f"reference {' or '.join(missing)}, so nothing winds the budget "
+                "into a server-side cap: the budget bounds the estimate and "
+                "nothing bounds a statement that outruns it"
+            )
+        else:
+            ceiling = getattr(getattr(config, "budget", None), "ceiling", None)
+            report.controls.append(
+                ProviderControl(
+                    name=budget_control,
+                    binds="statement",
+                    source="budget",
+                    unit=unit,
+                    value=float(ceiling) if isinstance(ceiling, (int, float)) else None,
+                    detail="wound into the dbt subprocess environment from this "
+                    "run's confirmed budget, so it follows the budget rather than "
+                    "the profile",
                 )
+            )
 
     report.binding = bool(report.controls)
     if not report.binding:

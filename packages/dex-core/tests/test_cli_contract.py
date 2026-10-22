@@ -863,6 +863,9 @@ _CONNECTION_DESTS = {
     # subparser via `_sub_connection_options()` same as --budget.
     "session_ceiling",
     "no_session_ceiling",
+    # Values-free mode (#591): an engine-construction concern like --budget, and
+    # the per-call `result_mode` keyword is the library's spelling of it.
+    "values_free",
 }
 
 

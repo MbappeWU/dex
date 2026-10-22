@@ -60,3 +60,26 @@ def before_trailing_blanks(content: str, end: int) -> int:
             break
         end = line_start
     return end
+
+
+def with_leading_comments(content: str, start: int) -> int:
+    """``start`` moved up over the comments written directly above its entry.
+
+    The other half of :func:`block_end`'s rule: a comment at a block's own column
+    belongs to what follows it, so removing an entry has to take the comment lines
+    above it too, or they end up describing its neighbour. Only full-line comments
+    at exactly the entry's indent count, with nothing between them and the entry.
+    A blank line stops the walk, because a comment set apart by one is a header
+    for whatever follows it rather than a note on this entry.
+    """
+
+    line_start = content.rfind("\n", 0, start) + 1
+    indent = indent_of(content, line_start)
+    moved = start
+    while line_start > 0:
+        above = content.rfind("\n", 0, line_start - 1) + 1
+        line = content[above : line_start - 1]
+        if not line.lstrip(" ").startswith("#") or indent_of(content, above) != indent:
+            break
+        line_start = moved = above
+    return moved

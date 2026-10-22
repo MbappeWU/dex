@@ -84,9 +84,11 @@ cost ceiling; a pass-rate or cost/turn regression blocks a release.
 
 Two jobs are deliberately **advisory** rather than blocking, because both track a
 moving upstream and a failure means the world changed rather than that this
-change broke something. `sqlglot-canary` runs the guards and the safety spine
-against the newest sqlglot, above the declared ceiling, so raising that ceiling is
-a decision taken on evidence. `mermaid-syntax` renders `explore diagram` output
+change broke something. `sqlglot-canary` runs the suite, guards and safety spine
+included, against the newest sqlglot, above the declared ceiling, so raising that
+ceiling is a decision taken on evidence. It runs weekly rather than per pull
+request (`.github/workflows/sqlglot-canary.yml`): the question it answers is
+about an upstream release, and a week is soon enough to learn it. `mermaid-syntax` renders `explore diagram` output
 and parses it with the real Mermaid package from npm.
 
 The second one is worth explaining, because it is the one place CI reaches outside

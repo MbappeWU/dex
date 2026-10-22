@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+from exmergo_dex_core.adapters.databricks import _STARTUP_SERVERLESS_SECONDS
 from exmergo_dex_core.cache import ColumnProfile, Dataset, DexCache
 from exmergo_dex_core.storage import FilesystemStore
 
@@ -77,9 +78,16 @@ def test_profile_handshake_then_confirmed_run(
     assert dataset["identifier"] == REGION
     columns = {c["name"] for c in dataset["columns"]}
     assert {"r_regionkey", "r_name", "r_comment"} <= columns
-    # The estimate the agent confirmed is what the envelope reports; actual
-    # spend (wall seconds) is in data.spend and the ledger.
-    assert second["cost"]["estimate"] == pytest.approx(estimate, rel=0.5)
+    # The confirmed run reprices, so its estimate is the one the agent confirmed
+    # up to the warehouse wake: the CI warehouse auto-stops after a minute, so
+    # its state can change between the two calls in either direction, adding
+    # or dropping the serverless startup floor. Actual spend (wall seconds) is
+    # in data.spend and the ledger.
+    drift = second["cost"]["estimate"] - estimate
+    assert any(
+        drift == pytest.approx(wake)
+        for wake in (0.0, _STARTUP_SERVERLESS_SECONDS, -_STARTUP_SERVERLESS_SECONDS)
+    ), (estimate, second["cost"]["estimate"])
     spend = second["data"]["spend"]
     assert spend["seconds_billed"] >= 0
     ledger = (tmp_path / ".dex" / "spend.jsonl").read_text().splitlines()

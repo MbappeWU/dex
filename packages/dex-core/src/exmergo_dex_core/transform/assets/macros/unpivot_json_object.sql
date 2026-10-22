@@ -5,7 +5,7 @@
     value of a key is the whole nested value, kept in the warehouse's native
     semi-structured type (BigQuery JSON, Snowflake VARIANT, Databricks VARIANT,
     Postgres jsonb, Redshift SUPER, DuckDB JSON, ClickHouse String holding
-    raw JSON). The key is a plain string.
+    raw JSON, Trino json). The key is a plain string.
 
     Renders a complete SELECT:
 
@@ -20,7 +20,7 @@
     json_column may be a bare column name (qualified onto the relation
     automatically) or any expression over it. For a string-typed source pass
     the adapter's parse expression: parse_json(payload) on BigQuery, Snowflake,
-    and Databricks, json_parse(payload) on Redshift; Postgres, DuckDB and
+    and Databricks, json_parse(payload) on Redshift and Trino; Postgres, DuckDB and
     ClickHouse accept JSON-bearing text directly. A NULL object produces no
     rows. On Postgres a non-object value errors loudly (jsonb_each is strict);
     the other adapters yield no rows for it. Databricks needs VARIANT support (DBR 15.3+ or a
@@ -117,6 +117,23 @@ select
     _dex_kv.2 as {{ value_alias }}
 from {{ relation }} as base
 array join JSONExtractKeysAndValuesRaw(toString({{ expr }})) as _dex_kv
+{% endmacro %}
+
+
+{% macro trino__unpivot_json_object(relation, json_column, key_alias, value_alias, passthrough) %}
+{%- set expr = 'base.' ~ json_column if modules.re.match('^[A-Za-z_][A-Za-z0-9_]*$', json_column) else json_column %}
+{#- Trino unnests maps, not JSON, so the object is cast to a map of its
+    top-level keys to json values: the cast is the depth limit, and a nested
+    object stays whole as one json value. try_cast turns a non-object value
+    into NULL, and unnest of NULL yields no rows, matching every adapter here
+    except Postgres. A varchar source reaches it via json_parse(col). -#}
+select
+    {% for col in passthrough %}base.{{ col }},
+    {% endfor -%}
+    _dex_kv.key as {{ key_alias }},
+    _dex_kv.value as {{ value_alias }}
+from {{ relation }} as base
+cross join unnest(try_cast({{ expr }} as map(varchar, json))) as _dex_kv(key, value)
 {% endmacro %}
 
 

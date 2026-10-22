@@ -114,6 +114,13 @@ _MEASURING = frozenset(
         "covar_samp",
         "bool_and",
         "bool_or",
+        # sqlglot parses bool_and/bool_or into LogicalAnd/LogicalOr on every
+        # dialect, and those canonical names are what reach this set, so the
+        # spellings above alone never matched. every is Trino's bool_and.
+        "logical_and",
+        "logical_or",
+        "every",
+        "geometric_mean",
         "entropy",
         "kurtosis",
         "skewness",
@@ -234,6 +241,26 @@ _UNNEST_FUNCS: dict[str, tuple[tuple[type, ...], frozenset[str]]] = {
     "duckdb": (
         (exp.JSONKeys, exp.JSONExtract, exp.JSONExtractScalar, exp.ParseJSON),
         frozenset({"json_each"}),
+    ),
+    # Trino unnests arrays and maps, so a JSON document is reached by parsing it
+    # and casting it to one: the canonical idiom is
+    # UNNEST(CAST(json_parse(c) AS ARRAY(JSON))), which is why a top-level Cast
+    # is admitted here (a nested one already is, everywhere). map_keys,
+    # map_values and map_entries reach into a map column. sequence and split
+    # are deliberately absent: they synthesize rows from a scalar.
+    "trino": (
+        tuple(
+            cls
+            for cls in (
+                exp.Cast,
+                exp.JSONExtract,
+                exp.JSONExtractScalar,
+                exp.ParseJSON,
+                getattr(exp, "MapKeys", None),
+            )
+            if isinstance(cls, type)
+        ),
+        frozenset({"map_keys", "map_values", "map_entries"}),
     ),
 }
 
@@ -390,6 +417,14 @@ def _override_suggestion(taint: _Taint, cache: DexCache) -> str:
     return clause
 
 
+# The table arguments that turn a read of a table into a read of its past.
+# sqlglot keeps FOR VERSION/TIMESTAMP/SYSTEM_TIME AS OF (Trino, Databricks,
+# BigQuery) in `version`, AT/BEFORE (Snowflake) and AT (VERSION => ...) (DuckDB)
+# in `when`, and Snowflake's CHANGES stream in `changes`. Matching the node shape
+# rather than the dialect is what lets a newly added dialect inherit the refusal.
+_HISTORICAL_READ_ARGS = ("version", "when", "changes")
+
+
 def assert_query_shape(sql: str, *, dialect: str = "duckdb") -> exp.Expression:
     """Prove a statement is one read-only SELECT and return its parsed root.
 
@@ -400,7 +435,9 @@ def assert_query_shape(sql: str, *, dialect: str = "duckdb") -> exp.Expression:
     warehouse on its behalf.
 
     Cache-independent by construction, which is what makes it safe to run early;
-    everything that needs the cache stays in :func:`inspect_query`.
+    everything that needs the cache stays in :func:`inspect_query`. Time travel
+    is refused here too: it needs no cache to recognize, and no relation should be
+    profiled on behalf of a statement that was always going to be refused.
     """
 
     try:
@@ -416,6 +453,21 @@ def assert_query_shape(sql: str, *, dialect: str = "duckdb") -> exp.Expression:
             f"only SELECT queries may run here, got {type(root).__name__}; use "
             "`explore inventory` / `explore profile` for introspection"
         )
+    # Refused wherever it appears, a WHERE subquery included, because the cache
+    # and every PII verdict in it describe each table as it is now. A past
+    # snapshot keeps the schema it had then, so a column dropped since (and so
+    # never profiled) comes back from SELECT *, and a change stream returns rows
+    # the current table no longer holds.
+    for table in root.find_all(exp.Table):
+        if any(table.args.get(key) for key in _HISTORICAL_READ_ARGS):
+            name = ".".join(p for p in (table.catalog, table.db, table.name) if p)
+            raise QueryRefusedError(
+                f"time travel is not permitted: {name} is read as of an earlier "
+                "version or point in time, or as a change stream. The exploration "
+                "cache and its PII verdicts describe the table as it is now, and a "
+                "past snapshot can carry columns or values that were never "
+                "profiled. Query the current table"
+            )
     return root
 
 
@@ -814,6 +866,7 @@ def _unnest_source(
         table_alias = node.args.get("alias")
         offset = None
     elif isinstance(node, exp.Table):
+        _refuse_table_function(node, dialect)
         inner = [node.this]
         table_alias = node.args.get("alias")
         offset = node.args.get("ordinality")
@@ -878,6 +931,33 @@ def _unnest_source(
 
     key = (alias_name or columns[0]).lower()
     return key, {name.lower(): set(taint) for name in columns if name}
+
+
+def _refuse_table_function(node: exp.Table, dialect: str) -> None:
+    """Refuse ``TABLE(fn(...))`` by name.
+
+    sqlglot parses the standard table-function call as a table whose body is an
+    anonymous ``TABLE`` call. It was already refused as an unnest of nothing
+    permitted, which is the right decision for the wrong reason: the refusal has
+    to say what was actually asked. On Trino the table functions include
+    ``system.query``, which sends its argument to a federated database as opaque
+    SQL, and the polymorphic ones that reshape a whole relation, so none of them
+    is a source the cache profiled. A Postgres set-returning function in FROM is
+    a different shape (the function itself is the table body) and is not
+    touched here.
+    """
+
+    body = node.this
+    if not (isinstance(body, exp.Anonymous) and str(body.this).upper() == "TABLE"):
+        return
+    called = body.expressions[0].sql(dialect=dialect) if body.expressions else ""
+    name = called.split("(", 1)[0] or "TABLE(...)"
+    raise QueryRefusedError(
+        f"table function {name} is not permitted: TABLE(...) returns rows the "
+        "exploration cache never profiled, and some table functions pass their "
+        "argument to another database unread. Query cached tables and views, or "
+        "unnest a column of one with UNNEST(...)"
+    )
 
 
 def _unnest_taint(

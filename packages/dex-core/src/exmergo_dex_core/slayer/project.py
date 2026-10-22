@@ -21,7 +21,8 @@ Datasource files and `priority.yaml` are refused at configuration, because a
 datasource carries connection credentials.
 
 Nothing in this module imports `slayer`. The reader that does, :mod:`.loader`,
-is imported only on first read, by a source that
+is imported only on first read (and the renderer, :mod:`.render`, only by a
+caller that renders a query), by a source that
 :func:`.dependency.ensure_available` let construct, so a base install can
 import and run every non-SLayer command.
 """
@@ -45,7 +46,7 @@ if TYPE_CHECKING:
     from ..semantic_catalog import SemanticCatalogView
     from ..semantic_source import SemanticSourceContext
     from ..transform.plans import PlanEdit
-    from .loader import LoadResult
+    from .loader import LoadedModel, LoadResult
 
 __all__ = [
     "VENDOR_NAME",
@@ -137,6 +138,16 @@ class SlayerSemanticLayer:
 
         root = self.repo_root / self.base_dir
         return [root / name for name in self.models]
+
+    def validated_models(self) -> list[LoadedModel]:
+        """Every model that passed validation, from this command's one load.
+
+        What the renderer stores, so a query is planned over exactly the models
+        the catalog reported, without reading a file a second time. A model with
+        an error is absent here and named in the catalog's notes.
+        """
+
+        return list(self._load().models)
 
     # --- the declaration channel ----------------------------------------------
 

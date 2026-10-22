@@ -174,6 +174,23 @@ VALUE_DOMAIN_MIN_ROWS = ceil(1 / VALUE_DOMAIN_MAX_FRACTION)
 
 
 @dataclass(frozen=True)
+class TableProbe:
+    """What one consolidated drift statement measured on one table (#275).
+
+    The same numbers :meth:`Adapter.exact_distinct_counts`,
+    :meth:`Adapter.distinct_combination_counts` and
+    :meth:`Adapter.column_aggregates` return, read from a single statement so a
+    connector that bills a per-statement minimum pays it once per table rather
+    than once per probe. ``aggregates`` is ``None`` when the statement carried
+    no null survey, so the caller runs that survey on its own as before.
+    """
+
+    distinct: dict[str, int]
+    combinations: dict[tuple[str, ...], int]
+    aggregates: list[ColumnAggregate] | None
+
+
+@dataclass(frozen=True)
 class QueryResult:
     """The result of one firewall-approved agent query, columnar.
 
@@ -355,13 +372,27 @@ def distinct_combination_sql(
     calling adapter, which also guards the result as a read-only SELECT.
     """
 
-    parts = [
+    parts = distinct_combination_parts(table_sql, combinations, quote_ident)
+    return f"SELECT {', '.join(parts)}"
+
+
+def distinct_combination_parts(
+    table_sql: str,
+    combinations: list[list[str]],
+    quote_ident: Callable[[str], str],
+    *,
+    alias: str = "d",
+) -> list[str]:
+    """The scalar subqueries :func:`distinct_combination_sql` selects, one per
+    combination and read back by ``{alias}_{i}``, for a caller folding them into
+    a statement of its own."""
+
+    return [
         "(SELECT COUNT(*) FROM (SELECT DISTINCT "  # noqa: S608
         + ", ".join(quote_ident(name) for name in combo)
-        + f" FROM {table_sql}) AS q_{i}) AS d_{i}"
+        + f" FROM {table_sql}) AS q_{i}) AS {alias}_{i}"
         for i, combo in enumerate(combinations)
     ]
-    return f"SELECT {', '.join(parts)}"
 
 
 COMPOSITE_PROBE_SKIPPED_NOTE = (
@@ -437,10 +468,19 @@ UPPER_VOCAB_PATTERN = "^[A-Z]+([ -][A-Z]+)*$"
 PERSON_SHAPE_PATTERN = "^[A-Z][a-z]+ [A-Z][a-z]+$"
 
 
+#: The one and zero every fraction builder averages over. A dialect that types
+#: ``1.0`` as an exact decimal and keeps its scale through ``AVG`` (Trino reads
+#: it as ``decimal(2,1)``, so a fraction of 1/3 comes back as 0.3) passes double
+#: literals instead through each builder's ``fraction_literals`` keyword.
+DEFAULT_FRACTION_LITERALS = ("1.0", "0.0")
+
+
 def shape_stat_expressions(
     qcol: str,
     i: int,
     regexp_predicate: Callable[[str, str], str],
+    *,
+    fraction_literals: tuple[str, str] = DEFAULT_FRACTION_LITERALS,
 ) -> list[str]:
     """The three value-shape aggregate expressions for one column, read back by
     aliases ``su_{i}`` / ``sp_{i}`` / ``st_{i}``.
@@ -452,11 +492,13 @@ def shape_stat_expressions(
     dialect's full-match predicate (anchors ride in the pattern).
     """
 
+    one, zero = fraction_literals
+
     def fraction(pattern: str, alias: str) -> str:
         predicate = regexp_predicate(qcol, pattern)
         return (
-            f"AVG(CASE WHEN {predicate} THEN 1.0 "
-            f"WHEN {qcol} IS NOT NULL THEN 0.0 END) AS {alias}"
+            f"AVG(CASE WHEN {predicate} THEN {one} "
+            f"WHEN {qcol} IS NOT NULL THEN {zero} END) AS {alias}"
         )
 
     token_count = f"LENGTH({qcol}) - LENGTH(REPLACE({qcol}, ' ', '')) + 1"
@@ -619,6 +661,7 @@ def type_contradiction_expressions(
     regexp_predicate: Callable[[str, str], str],
     bigint_type: str,
     substring_expr: Callable[[str, int, int], str] = default_substring_expr,
+    fraction_literals: tuple[str, str] = DEFAULT_FRACTION_LITERALS,
 ) -> list[str]:
     """Declared-type-vs-content aggregate expressions for one column.
 
@@ -655,10 +698,12 @@ def type_contradiction_expressions(
     check).
     """
 
+    one, zero = fraction_literals
+
     def fraction(value_expr: str, condition: str, alias: str) -> str:
         return (
-            f"AVG(CASE WHEN {condition} THEN 1.0 "
-            f"WHEN {value_expr} IS NOT NULL THEN 0.0 END) AS {alias}"
+            f"AVG(CASE WHEN {condition} THEN {one} "
+            f"WHEN {value_expr} IS NOT NULL THEN {zero} END) AS {alias}"
         )
 
     def plain_fraction(pattern: str, alias: str) -> str:
@@ -765,7 +810,11 @@ def type_contradiction_aggregate_kwargs(
 
 
 def key_shape_expressions(
-    qcol: str, i: int, regexp_predicate: Callable[[str, str], str]
+    qcol: str,
+    i: int,
+    regexp_predicate: Callable[[str, str], str],
+    *,
+    fraction_literals: tuple[str, str] = DEFAULT_FRACTION_LITERALS,
 ) -> list[str]:
     """Heterogeneous-key-shape aggregate expressions for one column.
 
@@ -789,14 +838,15 @@ def key_shape_expressions(
     calling adapter.
     """
 
+    one, zero = fraction_literals
     numeric_pred = regexp_predicate(qcol, NUMERIC_PATTERN)
     hex_pred = regexp_predicate(qcol, HEX_PATTERN)
     hex_not_numeric = f"({hex_pred} AND NOT {numeric_pred})"
     return [
-        f"AVG(CASE WHEN {regexp_predicate(qcol, UUID_PATTERN)} THEN 1.0 "
-        f"WHEN {qcol} IS NOT NULL THEN 0.0 END) AS ks_uuid_{i}",
-        f"AVG(CASE WHEN {hex_not_numeric} THEN 1.0 "
-        f"WHEN {qcol} IS NOT NULL THEN 0.0 END) AS ks_hex_{i}",
+        f"AVG(CASE WHEN {regexp_predicate(qcol, UUID_PATTERN)} THEN {one} "
+        f"WHEN {qcol} IS NOT NULL THEN {zero} END) AS ks_uuid_{i}",
+        f"AVG(CASE WHEN {hex_not_numeric} THEN {one} "
+        f"WHEN {qcol} IS NOT NULL THEN {zero} END) AS ks_hex_{i}",
         f"MIN(CASE WHEN {hex_not_numeric} THEN LENGTH({qcol}) END) AS ks_hexmn_{i}",
         f"MAX(CASE WHEN {hex_not_numeric} THEN LENGTH({qcol}) END) AS ks_hexmx_{i}",
     ]
@@ -829,7 +879,11 @@ _TEMPORAL_UNIT_ALIAS = {"day": "d", "month": "m", "hour": "h"}
 
 
 def temporal_alignment_expressions(
-    qcol: str, i: int, date_trunc: Callable[[str, str], str]
+    qcol: str,
+    i: int,
+    date_trunc: Callable[[str, str], str],
+    *,
+    fraction_literals: tuple[str, str] = DEFAULT_FRACTION_LITERALS,
 ) -> list[str]:
     """Fraction of non-null values that are already truncated to day/month --
     the evidence `explore.profile._temporal_granularity` decides the
@@ -837,10 +891,12 @@ def temporal_alignment_expressions(
     midnight is day-aligned; one whose values are all the 1st of the month
     is also month-aligned."""
 
+    one, zero = fraction_literals
+
     def fraction(condition: str, alias: str) -> str:
         return (
-            f"AVG(CASE WHEN {condition} THEN 1.0 "
-            f"WHEN {qcol} IS NOT NULL THEN 0.0 END) AS {alias}"
+            f"AVG(CASE WHEN {condition} THEN {one} "
+            f"WHEN {qcol} IS NOT NULL THEN {zero} END) AS {alias}"
         )
 
     return [
@@ -964,6 +1020,14 @@ class Adapter(Protocol):
     - ``read_dev_target(scope)``: also read the namespace this command's own
       build writes into (``None`` stops), applied through
       :func:`with_dev_target`. The engine's adapter funnel sets it per command.
+    - ``table_probe_sql(identifier, *, distinct, combinations, null_columns)``
+      and ``table_probe(...)`` with the same arguments: the drift probes one
+      table needs (exact distinct counts, distinct combinations, a null survey)
+      as one statement, priced and run, returning :class:`TableProbe`. Worth
+      implementing where the warehouse bills a per-statement minimum, which
+      separate probes over one table each pay (#275). Both return ``None``
+      where the table cannot be probed in one statement; the caller then issues
+      the separate probes exactly as it would without the pair.
     """
 
     #: Stable connector name, e.g. "duckdb", "snowflake".

@@ -20,6 +20,7 @@ keywords = ["dex", "exmergo", "exmergo-dex-core", "analytics-engineering", "plac
 
 [project.urls]
 Homepage = "https://www.exmergo.com/dex"
+Documentation = "https://docs.exmergo.com/dex"
 Repository = "https://github.com/exmergo/dex"
 
 [tool.hatch.build.targets.wheel]

@@ -42,7 +42,7 @@ def ensure_available() -> None:
             "ships with every connector extra, so reinstall the engine with the "
             "connector you use: exmergo-dex-core[duckdb] for the local on-ramp, or "
             "[snowflake], [bigquery], [databricks], [postgres], [redshift], "
-            "[clickhouse]. Only "
+            "[clickhouse], [trino]. Only "
             "the hosted semantic layer (`explore semantic --api`, the "
             "[semantic-api] extra) runs without it, because dbt Cloud renders and "
             "executes that SQL rather than dex."

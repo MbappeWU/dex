@@ -40,7 +40,7 @@ NON_SQL_DIALECTS: tuple[str, ...] = ("MDX", "TABLEAU", "MAQL")
 #: The dialect an expression falls back to when nothing more specific applies.
 PORTABLE_DIALECT = "ANSI_SQL"
 
-# The Ossie dialect token a dex connector corresponds to. Four of dex's seven
+# The Ossie dialect token a dex connector corresponds to. Five of dex's eight
 # connectors have no token in Ossie's enum, and they are absent here rather than
 # mapped to something close: DuckDB is not Databricks, and a wrong dialect is a
 # worse answer than the portable one. They fall to PORTABLE_DIALECT, which is

@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import os
 import sys
 from typing import Any
 
@@ -33,6 +34,12 @@ from .guards.cost_guard import ConfirmationRequiredError, CostGuardError
 from .guards.dialect import DialectDependencyError
 from .guards.dialect import ensure_available as ensure_dialect_available
 from .results import BudgetExhaustedError
+from .values_free import (
+    ResultMode,
+    call_withholding,
+    parse_result_mode,
+    require_allowed,
+)
 
 # The full command surface. Group -> its subcommands.
 #
@@ -163,6 +170,11 @@ def _bare_subcommand_suggestion(token: str) -> str | None:
     return f"subcommand '{token}' is ambiguous; try one of: {listed}"
 
 
+#: The environment variable a host that wraps the CLI pins values-free mode with
+#: (#591). An environment variable rather than config, because the process that
+#: launches dex is the host and `.dex/config.yml` is a file the agent may write.
+RESULT_MODE_ENV = "DEX_RESULT_MODE"
+
 #: Help for the options every command accepts. One table for both places they
 #: are declared (the top-level parser and each subparser's parent), so the two
 #: copies of an option cannot describe it differently.
@@ -177,6 +189,7 @@ _CONNECTION_OPTION_HELP: dict[str, str] = {
     "--budget": "spend this command may use, in the connector's cost unit",
     "--session-ceiling": "answer the one-time ask: commit this daily spend ceiling",
     "--no-session-ceiling": "answer the one-time ask: record that no ceiling applies",
+    "--values-free": f"return no table value in any result ({RESULT_MODE_ENV} pins it)",
 }
 
 
@@ -212,6 +225,10 @@ def _add_connection_options(parser: argparse.ArgumentParser, *, suppress: bool) 
     # of that same command.
     add("--session-ceiling", type=float, metavar="AMOUNT")
     add("--no-session-ceiling", default=False, action="store_true")
+    # Values-free mode (#591). An on switch only: there is no flag that turns it
+    # off, so `DEX_RESULT_MODE=values_free` set by a host cannot be undone by
+    # anything an agent adds to the command line.
+    add("--values-free", default=False, action="store_true")
 
 
 def _sub_connection_options() -> argparse.ArgumentParser:
@@ -1323,7 +1340,10 @@ def dispatch(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
     """
 
     try:
-        return _run(args, engine)
+        # In values-free mode every error leaving a command is held to it here,
+        # before the handlers below turn it into an envelope (#591).
+        mode = getattr(engine, "result_mode", ResultMode.FULL)
+        return call_withholding(mode, _run_allowed, args, engine)
     except DialectDependencyError as exc:
         # A missing extra, caught before the command imported anything that needed
         # it, so nothing has been opened or priced. The message names the install.
@@ -1350,6 +1370,34 @@ def dispatch(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
         # arrives with no cost at all, and an empty cost block on a spend
         # refusal reads as a claim that nothing was going to be spent.
         return env.error_for(exc, env.redact(str(exc)), cost=exc.cost or env.Cost())
+
+
+def _run_allowed(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
+    mode = getattr(engine, "result_mode", ResultMode.FULL)
+    if mode is ResultMode.VALUES_FREE:
+        require_allowed(mode, _command_label(args))
+    return _run(args, engine)
+
+
+def _command_label(args: argparse.Namespace) -> str:
+    """The command as the values-free allowlist spells it: ``explore profile``,
+    and ``explore semantic list`` for the semantic modes (bare means list)."""
+
+    label = f"{args.group} {getattr(args, 'subcommand', '')}".strip()
+    if args.group == "explore" and getattr(args, "subcommand", None) == "semantic":
+        label += f" {getattr(args, 'mode', None) or 'list'}"
+    return label
+
+
+def _result_mode(args: argparse.Namespace) -> ResultMode:
+    """The mode this process runs in: the flag, or the host's pin, whichever asks
+    for values-free. Neither can ask for less than the other, and an unknown
+    value in the environment refuses rather than reading as full."""
+
+    pinned = parse_result_mode(os.environ.get(RESULT_MODE_ENV) or None)
+    if getattr(args, "values_free", False) or pinned is ResultMode.VALUES_FREE:
+        return ResultMode.VALUES_FREE
+    return ResultMode.FULL
 
 
 def _run(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
@@ -1578,18 +1626,23 @@ def main(argv: list[str] | None = None) -> int:
     # and it runs before the handlers below.
     spend: dict | None = None
     connection = env.Connection()
+    # Resolved before anything can refuse, so even a refusal states the mode. An
+    # unknown DEX_RESULT_MODE is itself a refusal, rendered below like any other.
+    result_mode: ResultMode | None = None
     # Building the engine is inside the handler, not before it: it reads the
     # config file and constructs the configured storage backend, and both can
     # refuse. Every agent wrapper expects exactly one envelope on stdout, so a
     # refusal raised here has to render as one like any other rather than as a
     # traceback the wrapper cannot parse.
     try:
+        result_mode = _result_mode(args)
         if args.group == "config":
             # No engine, on purpose: see `config_commands`. With none, nothing
             # below has a paradigm, a spend, or a connection to stamp, which is
             # the truth for a verb that opens nothing.
             from .config_commands import cmd_config
 
+            require_allowed(result_mode, _command_label(args))
             envelope = cmd_config(args)
         else:
             # One engine per process, built from the resolved repo root. The default
@@ -1610,6 +1663,7 @@ def main(argv: list[str] | None = None) -> int:
                 confirmed=getattr(args, "confirm", False),
                 session_ceiling=getattr(args, "session_ceiling", None),
                 decline_session_ceiling=getattr(args, "no_session_ceiling", False),
+                result_mode=result_mode,
             )
             try:
                 envelope = dispatch(args, engine)
@@ -1685,6 +1739,11 @@ def main(argv: list[str] | None = None) -> int:
     # The connection identity is stamped centrally, just like cost paradigm:
     # handlers cannot drift, and filling it performs no extra warehouse read.
     envelope.connection = connection
+
+    # Every envelope a values-free process prints says so, refusals and asks
+    # included, so a host can assert the mode on whatever comes back (#591).
+    if result_mode is ResultMode.VALUES_FREE:
+        envelope.data["result_mode"] = result_mode.value
 
     env.emit(envelope)
     return 0 if envelope.status != env.Status.ERROR else 1

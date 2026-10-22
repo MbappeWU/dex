@@ -1,0 +1,19 @@
+{
+  "catalogs": [
+    {"user": "admin", "catalog": ".*", "allow": "all"},
+    {"user": "dbt_dev", "catalog": "(memory|iceberg|iceberg_glue)", "allow": "all"},
+    {"catalog": ".*", "allow": "read-only"}
+  ],
+  "schemas": [
+    {"user": "admin", "owner": true},
+    {"user": "dbt_dev", "catalog": "(memory|iceberg)", "schema": "dbt_dev", "owner": true},
+    {"user": "dbt_dev", "catalog": "iceberg_glue", "schema": "dex_ci_dbt_dev", "owner": true}
+  ],
+  "tables": [
+    {"user": "admin", "privileges": ["SELECT", "INSERT", "DELETE", "UPDATE", "OWNERSHIP", "GRANT_SELECT"]},
+    {"user": "dbt_dev", "catalog": "(memory|iceberg)", "schema": "dbt_dev", "privileges": ["SELECT", "INSERT", "DELETE", "UPDATE", "OWNERSHIP", "GRANT_SELECT"]},
+    {"user": "dbt_dev", "catalog": "iceberg_glue", "schema": "dex_ci_dbt_dev", "privileges": ["SELECT", "INSERT", "DELETE", "UPDATE", "OWNERSHIP", "GRANT_SELECT"]},
+    {"user": "dbt_dev", "privileges": ["SELECT", "GRANT_SELECT"]},
+    {"privileges": ["SELECT"]}
+  ]
+}

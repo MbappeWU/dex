@@ -13,6 +13,8 @@ dbt Cloud deployment, or native Apache Ossie documents in a repository with no
 dbt project at all. Read-only against your data; every change is a reviewable
 diff.
 
+Documentation: https://docs.exmergo.com/dex
+
 ## Install
 
 ```

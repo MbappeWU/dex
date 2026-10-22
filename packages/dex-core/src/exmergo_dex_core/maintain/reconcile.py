@@ -5,8 +5,10 @@ finding to the most honest response its axis allows. The action space differs
 sharply by axis, and every proposal says which kind it is:
 
 - ``mechanical``: schema drift on a dex-scaffolded staging model maps to a
-  re-scaffold of the model pair from the drift-patched profile. High
-  confidence, automatable, still a reviewable diff.
+  splice of each drifted column into the model's column list and into the YAML
+  that already declares the model, and to nothing else. The model is never
+  regenerated, so whatever a person wrote into it since it was scaffolded
+  survives. High confidence, automatable, still a reviewable diff.
 - ``advisory``: grain and semantic drift have no clean automatic fix (the
   warehouse is read-only and dex cannot know whether a new categorical value
   belongs in a metric), so the proposal is a decision surfaced, at most backed
@@ -19,17 +21,24 @@ writes to the project and human edits stay authoritative at apply time.
 
 from __future__ import annotations
 
+from pathlib import PurePosixPath
+
 from pydantic import BaseModel, Field
 
 from ..adapters.project import PlacingProject
-from ..cache import ColumnProfile, Dataset, DexCache
+from ..cache import ColumnProfile, DexCache
 from ..config import PIIOverrideMatcher
-from ..dbt_project import DbtProjectView, ProjectDefinitions
+from ..dbt_project import DbtProjectView, ProjectDefinitions, node_name
 from ..explore.profile import detect_pii
+from ..references import ReferenceIndex
 from ..transform.plans import EditKind, PlanEdit
-from ..transform.rewrite import column_tests
-from ..transform.scaffold import model_edits
-from .declare import DeclarationEdits, Declined, Placed
+from ..transform.rewrite import (
+    RewriteError,
+    column_tests,
+    project_column_in_sql,
+    unproject_column_in_sql,
+)
+from .declare import Covered, DeclarationEdits, Declined, Placed
 from .drift import DriftFinding
 from .snapshot import Snapshot
 
@@ -51,7 +60,7 @@ class Proposal(BaseModel):
     paths: list[str] = Field(default_factory=list)
 
 
-# Schema findings `_patched_dataset` knows how to apply to a profile.
+# Schema findings reconcile reads off the schema axis.
 _PATCHABLE = {"column_added", "column_dropped", "column_retyped", "nullability_changed"}
 
 #: The subset that has a written form. A retype has none: `data_type` carries the
@@ -151,7 +160,6 @@ def build(
         written = [f for f in table_findings if f.code in _MECHANICAL]
         if not written:
             continue
-        base = _base_dataset(identifier, cache, snap)
         model_path = _placed(placement, EditKind.MODEL_SQL, table)
         if view is not None and model_path is None:
             # The format authors no staging model, and this drift was never about
@@ -175,30 +183,21 @@ def build(
                     for finding in written
                 )
             continue
-        if view is None or base is None or model_path not in view.files:
+        if view is None or model_path not in view.files:
             reason = (
                 "this project format cannot receive edits"
                 if view is None
-                else "no profiled baseline to rebuild from"
-                if base is None
                 else f"no dex-scaffolded staging model at {model_path}"
             )
             proposals.extend(
                 _schema_advisory(identifier, finding, reason) for finding in written
             )
             continue
-        patched = _patched_dataset(base, table_findings, pii_overrides or set())
-        table_edits = model_edits(patched)
-        # The scaffold generates both the path and the dbt SQL inside it, so a
-        # format that places a staging model somewhere else would receive dbt
-        # content written to a path the generator did not agree to. Placement
-        # alone cannot close this channel; authoring the content is the larger
-        # design the seam deliberately does not attempt. Refuse rather than
-        # write the mismatch, and say which of the two is missing.
-        misplaced = any(
-            edit.path != _placed(placement, edit.kind, table) for edit in table_edits
-        )
-        if misplaced:
+        if model_path != _placed(None, EditKind.MODEL_SQL, table):
+            # The splice reads and writes dbt SQL, so a format placing its staging
+            # model anywhere but dbt's scaffold path would have dbt edits written
+            # into a file dex has no reason to think is dbt. Placement alone cannot
+            # open that channel; refuse rather than write the mismatch.
             proposals.extend(
                 Proposal(
                     axis="schema",
@@ -208,29 +207,23 @@ def build(
                     column=finding.column,
                     action=(
                         "this project format places a staging model somewhere "
-                        "dex cannot author one for it; re-scaffold "
+                        "dex cannot author one for it; update "
                         f"stg_{table} wherever that model is defined"
                     ),
                 )
-                for finding in table_findings
+                for finding in written
             )
             continue
-        for edit in table_edits:
-            declarations.stage_whole(edit.path, edit.kind, edit.new_content or "")
-        changes = ", ".join(f"{f.code.replace('_', ' ')} ({f.column})" for f in written)
-        proposals.append(
-            Proposal(
-                axis="schema",
-                kind="mechanical",
-                finding_code="schema_drift",
-                identifier=identifier,
-                action=(
-                    f"re-scaffold stg_{table} from the drifted source "
-                    f"({changes}); review the diff for hand-written logic "
-                    "the scaffold cannot know about"
-                ),
-                paths=[edit.path for edit in table_edits],
-            )
+        _splice_model(
+            declarations,
+            view,
+            model_path,
+            identifier,
+            table,
+            written,
+            proposals,
+            warnings,
+            pii_overrides,
         )
 
     warnings.extend(_grain_test_edits(proposals, declarations, definitions))
@@ -401,6 +394,47 @@ def _retype_advisory(finding: DriftFinding) -> Proposal:
     )
 
 
+def _stage_declaration(
+    declarations: DeclarationEdits,
+    placed: Placed,
+    identifier: str,
+    findings: list[DriftFinding],
+    pii_overrides: PIIOverrideMatcher | None,
+) -> tuple[list[DriftFinding], list[DriftFinding], list[tuple[DriftFinding, str]]]:
+    """Stage each finding onto the declaration: staged, already covered, refused.
+
+    Three outcomes rather than two, because a column the declaration already
+    states is neither an edit nor a refusal. Reading it as a refusal would tell
+    the reader dex could not do something the project already did.
+    """
+
+    staged: list[DriftFinding] = []
+    covered: list[DriftFinding] = []
+    refused: list[tuple[DriftFinding, str]] = []
+    for finding in findings:
+        if finding.code == "column_added":
+            outcome = declarations.add_column(
+                placed, _added_column(identifier, finding, pii_overrides)
+            )
+        elif finding.code == "column_dropped":
+            outcome = declarations.drop_column(placed, finding.column or "")
+        else:
+            nullable = bool(finding.data.get("nullable_after", True))
+            outcome = declarations.want_tests(
+                placed,
+                finding.column or "",
+                add=() if nullable else ("not_null",),
+                remove=("not_null",) if nullable else (),
+            )
+        if outcome is None:
+            staged.append(finding)
+        elif isinstance(outcome, Covered):
+            covered.append(finding)
+        else:
+            refused.append((finding, outcome))
+    return staged, covered, refused
+
+
 def _declare(
     declarations: DeclarationEdits,
     placed: Placed,
@@ -419,29 +453,17 @@ def _declare(
     a consumer cannot see is indistinguishable from one dex dropped.
     """
 
-    staged: list[DriftFinding] = []
-    for finding in written:
-        if finding.code == "column_added":
-            refusal = declarations.add_column(
-                placed, _added_column(identifier, finding, pii_overrides)
-            )
-        elif finding.code == "column_dropped":
-            refusal = declarations.drop_column(placed, finding.column or "")
-        else:
-            nullable = bool(finding.data.get("nullable_after", True))
-            refusal = declarations.want_tests(
-                placed,
-                finding.column or "",
-                add=() if nullable else ("not_null",),
-                remove=("not_null",) if nullable else (),
-            )
-        if refusal is None:
-            staged.append(finding)
-        else:
-            proposals.append(_schema_advisory(identifier, finding, refusal))
+    staged, covered, refused = _stage_declaration(
+        declarations, placed, identifier, written, pii_overrides
+    )
+    proposals.extend(
+        _schema_advisory(identifier, finding, reason) for finding, reason in refused
+    )
+    if covered and not staged and not refused:
+        proposals.append(_covered_advisory(identifier, covered))
     if not staged:
         return
-    changes = ", ".join(f"{f.code.replace('_', ' ')} ({f.column})" for f in staged)
+    changes = _changes(staged)
     proposals.append(
         Proposal(
             axis="schema",
@@ -457,6 +479,186 @@ def _declare(
             paths=[placed.path],
         )
     )
+
+
+def _splice_model(
+    declarations: DeclarationEdits,
+    view: DbtProjectView,
+    model_path: str,
+    identifier: str,
+    table: str,
+    written: list[DriftFinding],
+    proposals: list[Proposal],
+    warnings: list[str],
+    pii_overrides: PIIOverrideMatcher | None,
+) -> None:
+    """Edit the drifted columns into a staging model and its declaration, and
+    nothing else.
+
+    The model is never regenerated. A file someone has edited since it was
+    scaffolded (a cast a warehouse needs, a key derived by hand, a filter) holds
+    work the scaffold cannot know about, and a regenerated file deletes it under a
+    `mechanical` label that invites applying it unread. So each drifted column is
+    one splice: its projection added to, or removed from, the list the model
+    names its columns in, and its entry in whichever YAML file already declares
+    the model. That file is found rather than assumed, because a model documented
+    in a shared `schema.yml` would otherwise get a second, parallel declaration
+    that dbt refuses at parse. No test is ever invented: `unique` from one
+    profile's distinct count is a guess about the grain, not a fact.
+
+    A finding the model's own logic still reads (``checksum as row_checksum``, a
+    ``where`` on it) becomes an advisory naming the use, and neither of its halves
+    is staged, since dropping only the declaration would leave the two disagreeing.
+    A finding the project already reflects stages nothing, and a table where that
+    is true of every finding is reported as covered rather than as an edit.
+    """
+
+    model = PurePosixPath(model_path).stem
+    settled: list[DriftFinding] = []
+    in_sql: list[DriftFinding] = []
+    for finding in written:
+        if finding.code == "nullability_changed":
+            settled.append(finding)
+            continue
+        column = finding.column or ""
+        content = declarations.content_for(model_path) or ""
+        try:
+            if finding.code == "column_added":
+                result = project_column_in_sql(
+                    content, model_path, column, column, through_ctes=True
+                )
+            else:
+                result = unproject_column_in_sql(
+                    content, model_path, column, through_ctes=True
+                )
+        except RewriteError as exc:
+            proposals.append(
+                Proposal(
+                    axis="schema",
+                    kind="advisory",
+                    finding_code=finding.code,
+                    identifier=identifier,
+                    column=finding.column,
+                    action=str(exc),
+                )
+            )
+            continue
+        if result.changed:
+            declarations.stage_sql(model_path, result.content)
+            in_sql.append(finding)
+        settled.append(finding)
+
+    placed = declarations.resolve(table)
+    in_yaml: list[DriftFinding] = []
+    unstaged: list[tuple[DriftFinding, str]] = []
+    if isinstance(placed, Placed):
+        in_yaml, _covered, unstaged = _stage_declaration(
+            declarations, placed, identifier, settled, pii_overrides
+        )
+    else:
+        unstaged = [(finding, placed.reason) for finding in settled]
+
+    changed = [f for f in settled if f in in_sql or f in in_yaml]
+    for finding, reason in unstaged:
+        if finding in in_sql:
+            # The model's half landed; say plainly which half did not, so a
+            # reader does not take the plan for the whole of the change.
+            warnings.append(
+                f"{reason}, so the {finding.code.replace('_', ' ')} "
+                f"({finding.column}) was edited into {model_path} and into no "
+                f"declaration; update the YAML that documents '{model}' by hand"
+            )
+        else:
+            proposals.append(_schema_advisory(identifier, finding, reason))
+    warnings.extend(_downstream_readers(view, model, settled))
+
+    if not changed:
+        declined = [finding for finding, _reason in unstaged]
+        already = [f for f in settled if f not in declined]
+        if already:
+            proposals.append(_covered_advisory(identifier, already))
+        return
+    paths = ([model_path] if in_sql else []) + (
+        [placed.path] if isinstance(placed, Placed) and in_yaml else []
+    )
+    proposals.append(
+        Proposal(
+            axis="schema",
+            kind="mechanical",
+            finding_code="schema_drift",
+            identifier=identifier,
+            action=(
+                f"update {model} for the drifted source ({_changes(changed)}): "
+                "only the drifted columns' lines change, and every other line of "
+                "the model and its declaration is left as it is"
+            ),
+            paths=paths,
+        )
+    )
+
+
+def _changes(findings: list[DriftFinding]) -> str:
+    return ", ".join(f"{f.code.replace('_', ' ')} ({f.column})" for f in findings)
+
+
+def _covered_advisory(identifier: str, findings: list[DriftFinding]) -> Proposal:
+    """The drift is real and the project already reflects it."""
+
+    return Proposal(
+        axis="schema",
+        kind="advisory",
+        finding_code="schema_drift",
+        identifier=identifier,
+        action=(
+            f"the project already reflects this drift ({_changes(findings)}), "
+            "most likely through a plan applied since the baseline, so dex "
+            "proposes no edit; re-run `maintain snapshot` to baseline it"
+        ),
+    )
+
+
+def _downstream_readers(
+    view: DbtProjectView, model: str, findings: list[DriftFinding]
+) -> list[str]:
+    """A warning per dropped column that a model built on ``model`` still reads.
+
+    The staging edit is what the drift requires, and it is still proposed: the
+    column is gone upstream, so the staging model fails without it. What breaks
+    next is every model reading it below, and none of those edits is dex's to
+    make, because what a mart should do without a column is a decision about the
+    mart.
+    """
+
+    dropped = [f.column for f in findings if f.code == "column_dropped" and f.column]
+    if not dropped:
+        return []
+    index = ReferenceIndex(view, scan_packages=False)
+    warnings: list[str] = []
+    for column in dropped:
+        hits, limits = index.references_to(f"{model}.{column}", "column")
+        readers = sorted(
+            {
+                f"{hit.path}:{hit.line}"
+                for hit in hits
+                if hit.note == "lineage_resolved"
+                and (hit.owner or node_name(hit.path)) != model
+            }
+        )
+        if not readers:
+            continue
+        shown = ", ".join(readers[:_MAX_READERS])
+        more = len(readers) - _MAX_READERS
+        warnings.append(
+            f"'{column}' is gone from the source of {model}, and models built on "
+            f"{model} still read it ({shown}{f', and {more} more' if more > 0 else ''})"
+            "; they break once the staging edit is applied, so update them by hand"
+            + (" (the reference search was incomplete)" if limits else "")
+        )
+    return warnings
+
+
+#: How many downstream readers a warning names before counting the rest.
+_MAX_READERS = 10
 
 
 def _added_column(
@@ -503,68 +705,13 @@ def _drop_empty_proposals(proposals: list[Proposal], written: set[str]) -> None:
                 "action": (
                     f"{proposal.action}. dex proposed no edit in the end: what it "
                     "would have written is what the project already holds, so the "
-                    "drift is real and does not show up in anything dex authors"
+                    "drift is real and does not show up in anything dex authors. "
+                    "If the project already reflects it, re-run `maintain "
+                    "snapshot` to baseline it"
                 ),
                 "paths": [],
             }
         )
-
-
-def _base_dataset(
-    identifier: str, cache: DexCache | None, snap: Snapshot
-) -> Dataset | None:
-    """The freshest profiled view of a table to patch: the cache wins over the
-    snapshot (it may carry newer profiles), profiled entries only."""
-
-    for source in (cache, snap.warehouse):
-        if source is None:
-            continue
-        for dataset in source.datasets:
-            if dataset.identifier == identifier and dataset.columns:
-                return dataset
-    return None
-
-
-def _patched_dataset(
-    base: Dataset,
-    findings: list[DriftFinding],
-    pii_overrides: PIIOverrideMatcher | set[str],
-) -> Dataset:
-    """Apply the detected column drift to the baseline profile, so the
-    re-scaffold reflects the warehouse as it is now without re-profiling.
-    New columns get name-based PII flags at base confidence (no aggregates
-    exist yet, so no shape evidence: the flag blocks until the next profile
-    refines it); an overridden column is cleared with the audit recorded."""
-
-    patched = base.model_copy(deep=True)
-    columns = {c.name: c for c in patched.columns}
-    for finding in findings:
-        if finding.code == "column_added" and finding.column not in columns:
-            data_type = str(finding.data.get("data_type", ""))
-            flag = detect_pii(finding.column, data_type)
-            overridden = f"{base.identifier}.{finding.column}".lower() in pii_overrides
-            profile = ColumnProfile(
-                name=finding.column,
-                data_type=data_type,
-                pii=None if overridden else flag,
-                pii_overridden=flag.category if overridden and flag else None,
-            )
-            patched.columns.append(profile)
-            columns[finding.column] = profile
-        elif finding.code == "column_dropped":
-            patched.columns = [c for c in patched.columns if c.name != finding.column]
-            columns.pop(finding.column, None)
-        elif finding.code == "column_retyped" and finding.column in columns:
-            columns[finding.column].data_type = str(finding.data.get("type_after", ""))
-        elif finding.code == "nullability_changed" and finding.column in columns:
-            columns[finding.column].nullable = bool(
-                finding.data.get("nullable_after", True)
-            )
-    live = set(columns)
-    patched.candidate_keys = [key for key in patched.candidate_keys if set(key) <= live]
-    if patched.grain and not set(patched.grain) <= live:
-        patched.grain = None
-    return patched
 
 
 #: Appended to a key_lost_uniqueness action only where a test edit is actually

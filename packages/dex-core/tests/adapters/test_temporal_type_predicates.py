@@ -94,6 +94,13 @@ SPELLINGS = [
     ("clickhouse", "Nullable(Date)", True, True),
     ("clickhouse", "Nullable(DateTime)", True, False),
     ("clickhouse", "LowCardinality(Nullable(DateTime64(3)))", True, False),
+    # Trino: information_schema.columns.data_type, lower case with the
+    # precision and zone spelled inside the name.
+    ("trino", "date", True, True),
+    ("trino", "timestamp(3)", True, False),
+    ("trino", "timestamp(6) with time zone", True, False),
+    ("trino", "time(3)", False, False),
+    ("trino", "interval day to second", False, False),
 ]
 
 

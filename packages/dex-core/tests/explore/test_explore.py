@@ -138,6 +138,90 @@ def test_inventory_rank_states_its_basis(duckdb_file: Path, capsys):
     assert "connectivity" in basis
 
 
+def _inventory_from_a_stub(monkeypatch, rows: dict[str, int | None]):
+    """An inventory whose objects carry the row counts the connector reported.
+
+    The DuckDB fixture cannot stand in here: it always knows a row count, and the
+    defect this pins is what `--rank` says when nothing does (Trino's
+    `information_schema` carries none, and neither does any view on the other
+    connectors).
+    """
+
+    from exmergo_dex_core import DexEngine
+    from exmergo_dex_core.adapters.base import ObjectMeta
+    from exmergo_dex_core.envelope import Paradigm
+
+    class StubAdapter:
+        paradigm = Paradigm.FREE_LOCAL
+
+        def list_objects(self, *, include_views: bool = True):
+            return [
+                ObjectMeta(
+                    identifier=f"db.shop.{name}",
+                    object_type="table",
+                    schema="shop",
+                    name=name,
+                    row_count=row_count,
+                    byte_size=0,
+                    column_count=4,
+                )
+                for name, row_count in rows.items()
+            ]
+
+    monkeypatch.setattr(
+        DexEngine, "_adapter", lambda self, cmd=None, **kw: StubAdapter()
+    )
+    return DexEngine().inventory(rank=True)
+
+
+def test_inventory_rank_without_row_counts_does_not_claim_a_size_order(monkeypatch):
+    """No object reported a count, so size ranked nothing (#717).
+
+    The note used to say "ranked by size (row count)" over an inventory where
+    every object tied on that signal and the order was the catalog's, which is
+    exactly the state `explore inventory --rank` reports on Trino.
+    """
+
+    result = _inventory_from_a_stub(
+        monkeypatch, {"orders": None, "customers": None, "stg_orders": None}
+    )
+
+    basis = " ".join(result.notes)
+    assert "ranked by size" not in basis
+    assert "no object reported a count" in basis
+    assert "size (row count) contributed nothing" in basis
+    # The other two signals are still claimed, and they did order the list.
+    assert "naming convention" in basis
+    assert "shape (column count)" in basis
+
+
+def test_inventory_rank_with_row_counts_keeps_the_size_note(monkeypatch):
+    """One object with a count is enough for size to have ranked something."""
+
+    result = _inventory_from_a_stub(
+        monkeypatch, {"orders": 10, "customers": 5, "stg_orders": 2}
+    )
+
+    basis = " ".join(result.notes)
+    assert "ranked by size (row count)" in basis
+    assert "reported no row count" not in basis
+
+
+def test_inventory_rank_names_the_objects_size_could_not_rank(monkeypatch):
+    """A partial inventory says how much of it size could not order, rather than
+    letting the reader believe every object was compared by size."""
+
+    result = _inventory_from_a_stub(
+        monkeypatch, {"orders": 10, "customers": 5, "v_orders": None}
+    )
+
+    notes = result.notes
+    assert "ranked by size (row count)" in " ".join(notes)
+    assert (
+        "1 of 3 object(s) reported no row count, so size ranked only the rest" in notes
+    )
+
+
 def test_inventory_without_rank_reports_empty_notes(duckdb_file: Path, capsys):
     # always_reports_notes: an empty list is itself the "nothing to say" signal,
     # and it must still be present rather than omitted (map/diagram/query convention).
@@ -1433,8 +1517,7 @@ def _orphan_repo(tmp_path: Path) -> tuple[Path, Path]:
     return db, repo
 
 
-def test_map_downranks_and_badges_orphan_relation(tmp_path: Path, capsys):
-    db, repo = _orphan_repo(tmp_path)
+def _map_orphan_repo(db: Path, repo: Path, capsys) -> tuple:
     _run(
         [
             "explore",
@@ -1452,8 +1535,68 @@ def test_map_downranks_and_badges_orphan_relation(tmp_path: Path, capsys):
         d for d in cache.datasets if d.identifier.endswith(".stg_legacy_orders")
     )
     backed = next(d for d in cache.datasets if d.identifier.endswith(".stg_orders"))
-    assert any("orphaned residue" in n for n in orphan.data_quality)
+    return orphan, backed
+
+
+_NOT_DECLARED = "no dbt source declares this relation yet"
+
+
+def test_map_downranks_and_badges_orphan_relation(tmp_path: Path, capsys):
+    """No baseline, so the leftover may just be a table the loader added (#735):
+    it is still downranked, but not called residue of a removal."""
+
+    db, repo = _orphan_repo(tmp_path)
+    orphan, backed = _map_orphan_repo(db, repo, capsys)
+    assert any(_NOT_DECLARED in n for n in orphan.data_quality)
+    assert not any("orphaned residue" in n for n in orphan.data_quality)
     assert orphan.rank_score < backed.rank_score
+
+
+def test_map_calls_orphan_residue_only_when_baseline_knew_it(tmp_path: Path, capsys):
+    db, repo = _orphan_repo(tmp_path)
+    legacy_model = repo / "models" / "stg_legacy_orders.sql"
+    legacy_model.write_text("select * from x", encoding="utf-8")
+    _run(
+        ["maintain", "snapshot", "--path", str(db), "--repo-root", str(repo)],
+        capsys,
+    )
+    legacy_model.unlink()
+    orphan, backed = _map_orphan_repo(db, repo, capsys)
+    assert any("orphaned residue" in n for n in orphan.data_quality)
+    assert not any(_NOT_DECLARED in n for n in orphan.data_quality)
+    assert orphan.rank_score < backed.rank_score
+
+
+def test_map_unreadable_snapshot_counts_as_no_baseline(tmp_path: Path, capsys):
+    db, repo = _orphan_repo(tmp_path)
+    (repo / ".dex").mkdir(exist_ok=True)
+    (repo / ".dex" / "snapshot.json").write_text("{not json", encoding="utf-8")
+    orphan, _backed = _map_orphan_repo(db, repo, capsys)
+    assert any(_NOT_DECLARED in n for n in orphan.data_quality)
+
+
+def test_map_orphan_note_on_an_explore_only_store(tmp_path: Path):
+    """An explore-tier store keeps no snapshot, so it counts as no baseline."""
+
+    from fakes.stores import TenantStore
+
+    from exmergo_dex_core import DexEngine
+
+    db, repo = _orphan_repo(tmp_path)
+    TenantStore.reset()
+    with DexEngine(
+        connector="duckdb",
+        path=str(db),
+        store=TenantStore("t"),
+        repo_root=str(repo),
+    ) as engine:
+        engine.map(use_project=True)
+    cache = TenantStore("t").load_cache()
+    TenantStore.reset()
+    orphan = next(
+        d for d in cache.datasets if d.identifier.endswith(".stg_legacy_orders")
+    )
+    assert any(_NOT_DECLARED in n for n in orphan.data_quality)
 
 
 def test_map_declared_grain_overrides_heuristic(tmp_path: Path, capsys):

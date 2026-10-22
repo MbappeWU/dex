@@ -615,6 +615,10 @@ def test_a_name_the_project_already_uses_turns_the_check_off(
         (None, "db_load", "postgres", "opt-in: re-run with --check-equivalence"),
         (True, "compute_time", "redshift", "no verified whole-row comparison"),
         (True, "compute_time", "databricks", "no verified whole-row comparison"),
+        (True, "db_load", "trino", "no verified whole-row comparison"),
+        # Unasked on a connector with no comparison: the reason is the missing
+        # comparison, never an invitation to a flag that cannot help.
+        (None, "db_load", "trino", "no verified whole-row comparison"),
     ],
 )
 def test_the_check_is_off_with_a_reason_rather_than_absent(
@@ -1313,3 +1317,137 @@ def test_the_days_total_excludes_the_reservation_the_command_is_still_holding():
     assert gate.settled, "the reservation has to be released before the read"
     assert refreshed["session_spent_today"] == 6_000.0
     assert refreshed["bytes_billed"] == 6_000.0, "what the runs billed is unchanged"
+
+
+class _TranslatingAdapter(_TextPricedAdapter):
+    """Stand-in compute-time adapter that translates settled seconds."""
+
+    def __init__(self, translate_fn, *, dialect: str = "snowflake", uptime=None):
+        from exmergo_dex_core.envelope import Paradigm
+        from exmergo_dex_core.guards.cost_guard import CostGate
+
+        self.dialect = dialect
+        self.paradigm = Paradigm.COMPUTE_TIME
+        self.cost_gate = CostGate(
+            paradigm=Paradigm.COMPUTE_TIME,
+            ceiling=10_000,
+            session_ceiling=None,
+            session_spent=0.0,
+            confirmed=True,
+            connector=dialect,
+        )
+        self.warehouse_uptime = uptime
+        self.translated_Args: list[float] = []
+        self._translate_fn = translate_fn
+
+    def compute_spend_translation(self, seconds: float) -> dict[str, float]:
+        self.translated_Args.append(seconds)
+        return self._translate_fn(seconds)
+
+
+def test_snowflake_mutation_spend_reports_credits_billed_including_uptime(
+    project, recorded_dbt, monkeypatch
+):
+    """On Snowflake the batch translates its total settled `seconds_billed`
+    (runs plus settled warehouse uptime) once into `credits_billed`."""
+
+    calls, plan = recorded_dbt
+    plan["manifest"] = _manifest()
+    plan["results"] = [
+        {
+            "unique_id": "test.p.not_null_fct_a.abc123",
+            "status": "pass",
+            "execution_time": 15.0,
+        }
+    ]
+    _skip_dev_target_check(monkeypatch)
+
+    uptime = _UptimeStandIn(owed=60.0)
+    adapter = _TranslatingAdapter(
+        lambda seconds: {
+            "credits_billed": round(seconds / 3600.0, 6),
+            "usd_billed": round((seconds / 3600.0) * 3.0, 4),
+        },
+        dialect="snowflake",
+        uptime=uptime,
+    )
+    monkeypatch.setattr(DexEngine, "_adapter", lambda self, command=None, **kw: adapter)
+
+    engine = _engine(project, connector="snowflake", confirmed=True, budget=600.0)
+    result = transform_commands.test_mutations(engine, "fct")
+
+    test_runs = sum(1 for c in calls if c["argv"][1] == "test")
+    expected_seconds = test_runs * 15.0 + 60.0
+    assert result.spend["seconds_billed"] == pytest.approx(expected_seconds)
+    assert result.spend["credits_billed"] == pytest.approx(
+        round(expected_seconds / 3600.0, 6)
+    )
+    assert result.spend["usd_billed"] == pytest.approx(
+        round((expected_seconds / 3600.0) * 3.0, 4)
+    )
+    # Called once at 0.0 during pricing, then once after runs + uptime settle.
+    assert adapter.translated_Args == [0.0, pytest.approx(expected_seconds)]
+
+
+def test_clickhouse_cloud_mutation_proves_capacity_before_runs_and_translates_spend(
+    project, recorded_dbt, monkeypatch
+):
+    """ClickHouse Cloud proves live capacity at 0.0 seconds while pricing, before
+    any `dbt test` runs, and reports `compute_unit_hours_billed` on settlement."""
+
+    calls, plan = recorded_dbt
+    plan["manifest"] = _manifest()
+    plan["results"] = [
+        {
+            "unique_id": "test.p.not_null_fct_a.abc123",
+            "status": "pass",
+            "execution_time": 18.0,
+        }
+    ]
+    _skip_dev_target_check(monkeypatch)
+
+    test_calls_at_translate: list[int] = []
+
+    def translate(seconds: float) -> dict[str, float]:
+        test_calls_at_translate.append(sum(1 for c in calls if c["argv"][1] == "test"))
+        return {"compute_unit_hours_billed": round(seconds * 2.0 / 3600.0, 6)}
+
+    adapter = _TranslatingAdapter(translate, dialect="clickhouse")
+    monkeypatch.setattr(DexEngine, "_adapter", lambda self, command=None, **kw: adapter)
+
+    engine = _engine(project, connector="clickhouse", confirmed=True, budget=600.0)
+    result = transform_commands.test_mutations(engine, "fct")
+
+    total_test_runs = sum(1 for c in calls if c["argv"][1] == "test")
+    assert total_test_runs >= 2
+    # First translation happened before any `dbt test` ran; second after all ran.
+    assert test_calls_at_translate == [0, total_test_runs]
+    expected_seconds = total_test_runs * 18.0
+    assert result.spend["seconds_billed"] == pytest.approx(expected_seconds)
+    assert result.spend["compute_unit_hours_billed"] == pytest.approx(
+        round(expected_seconds * 2.0 / 3600.0, 6)
+    )
+
+
+def test_clickhouse_cloud_mutation_fails_before_first_run_when_capacity_unproved(
+    project, recorded_dbt, monkeypatch
+):
+    """If proving live capacity fails during `_price_mutations`, no `dbt test`
+    invocation may run."""
+
+    calls, plan = recorded_dbt
+    plan["manifest"] = _manifest()
+    plan["results"] = _results()
+    _skip_dev_target_check(monkeypatch)
+
+    def missing_capacity(_seconds: float) -> dict[str, float]:
+        raise RuntimeError("ClickHouse Cloud capacity could not be proved")
+
+    adapter = _TranslatingAdapter(missing_capacity, dialect="clickhouse")
+    monkeypatch.setattr(DexEngine, "_adapter", lambda self, command=None, **kw: adapter)
+
+    engine = _engine(project, connector="clickhouse", confirmed=True, budget=600.0)
+    with pytest.raises(RuntimeError, match="capacity could not be proved"):
+        transform_commands.test_mutations(engine, "fct")
+
+    assert not [c for c in calls if c["argv"][1] == "test"]

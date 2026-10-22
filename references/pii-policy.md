@@ -93,7 +93,15 @@ refused when its resolved column is flagged, and a profiled, cleared column is
 not re-blocked by a PII-shaped name. Where a dimension resolves to no physical
 column, or to a relation that was never profiled, the name heuristic is the
 fail-closed floor, so silence never clears. A result that ran on the floor alone
-says so.
+says so, naming each dimension that did.
+
+A column a query reads without the caller naming it is screened as if the
+caller had grouped by it. A time grouping (`metric_time`, or the column a SLayer
+`--grain` buckets) is screened as each measure's time dimension. A token
+carrying a grain suffix is screened as the dimension it buckets. A dimension
+defined as an expression is screened by every column the expression reads, and
+refused when dex cannot parse it. A SLayer saved measure named in a filter is
+screened by the columns its formula reads.
 
 Which evidence each backend can reach, and why a computed expression resolves to
 no column, is in [`semantic-layer.md`](semantic-layer.md) and
@@ -143,6 +151,14 @@ table yet stays silent, since new entities landing later under the same scope is
 the point of the pattern form. Both `explore profile` and `explore map` emit
 this warning with the same text, so a scheduled `map` is enough to catch a
 rename that left an override pointing at nothing.
+
+## Broader than PII: values-free mode
+
+This policy keeps personal data out of results column by column. A host that must
+keep every value out, whatever the column holds, selects values-free mode instead,
+which this policy does not replace: no `min_value`, `max_value` or value domain on
+any column, aggregate-only queries, and errors as codes. See
+[`values-free-mode.md`](values-free-mode.md).
 
 ## Where the policy is enforced
 

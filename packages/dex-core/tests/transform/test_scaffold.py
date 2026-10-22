@@ -127,6 +127,9 @@ def _seed_cache(tmp_path: Path, duckdb_file: Path, capsys) -> None:
 def test_scaffold_builds_staging_skeletons_with_pii_meta(
     dbt_project_dir: Path, duckdb_file: Path, tmp_path: Path, capsys
 ):
+    # The fixture declares stg_customers in a shared schema.yml; a scaffold
+    # beside that would be a second entry dbt refuses (see the test below).
+    (dbt_project_dir / "models/staging/schema.yml").unlink()
     _seed_cache(tmp_path, duckdb_file, capsys)
     rc, envelope = _run(
         [
@@ -303,6 +306,7 @@ def test_a_scaffolded_duckdb_model_takes_config_meta_and_refuses_the_old_form(
     fix named instead of letting it reach `dbt parse`.
     """
 
+    (dbt_project_dir / "models/staging/schema.yml").unlink()
     _seed_cache(tmp_path, duckdb_file, capsys)
     rc, envelope = _run(
         [
@@ -348,6 +352,39 @@ def test_a_scaffolded_duckdb_model_takes_config_meta_and_refuses_the_old_form(
     assert envelope["status"] == "error"
     assert "both a top-level 'meta' and 'config.meta'" in envelope["errors"][0]
     assert "Move the keys" in envelope["errors"][0]
+
+
+def test_a_scaffold_never_writes_a_second_entry_for_a_declared_model(
+    dbt_project_dir: Path, duckdb_file: Path, tmp_path: Path, capsys
+):
+    """The fixture declares stg_customers in a shared models/staging/schema.yml.
+
+    A `stg_customers.yml` beside it would be a second entry for one model, which
+    dbt refuses (`DuplicatePatchPathError`). The scaffold's YAML is left out and
+    the warning says how to add what it carried to the entry that exists.
+    """
+
+    _seed_cache(tmp_path, duckdb_file, capsys)
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "transform",
+            "plan",
+            "scaffold",
+            "--scaffold",
+            "customers",
+        ],
+        capsys,
+    )
+
+    assert rc == 0, envelope
+    assert "models/staging/stg_customers.yml" not in envelope["data"]["paths"]
+    assert "models/staging/stg_customers.sql" in envelope["data"]["paths"]
+    assert any(
+        "already declared in models/staging/schema.yml" in w and "declarations" in w
+        for w in envelope["warnings"]
+    )
 
 
 def test_scaffold_without_cache_is_a_clean_error(
@@ -560,3 +597,72 @@ def test_scaffold_into_an_unmergeable_sources_file_is_a_configuration_refusal(
     assert envelope["status"] == "error"
     assert "flow-style" in envelope["errors"][0]
     assert envelope["reason"] == "configuration"
+
+
+def _trino_store(*identifiers: str):
+    from exmergo_dex_core.cache import CacheProvenance, ColumnProfile, DexCache
+    from exmergo_dex_core.storage.memory import MemoryStore
+
+    store = MemoryStore()
+    store.save_cache(
+        DexCache(
+            datasets=[
+                Dataset(
+                    identifier=identifier,
+                    columns=[ColumnProfile(name="id", data_type="bigint")],
+                )
+                for identifier in identifiers
+            ],
+            provenance=CacheProvenance(connector="trino"),
+        )
+    )
+    return store
+
+
+def test_a_trino_source_names_its_catalog():
+    """dbt-trino resolves a source with no `database` in the profile's, which is
+    the dev catalog and never a source catalog, so a scaffold without it reads
+    the wrong table. Catalogs also share schema names, so the source name
+    carries the catalog as well."""
+
+    from exmergo_dex_core.transform.scaffold import scaffold_edits
+
+    edits = scaffold_edits(
+        ["memory.app.orders"], _trino_store("memory.app.orders", "lake.app.orders")
+    )
+    sources = yaml.safe_load(next(e for e in edits if "sources" in e.path).new_content)
+    assert sources["sources"] == [
+        {
+            "name": "memory_app",
+            "database": "memory",
+            "schema": "app",
+            "tables": [{"name": "orders"}],
+        }
+    ]
+    model = next(e for e in edits if e.path.endswith("stg_orders.sql"))
+    assert "source('memory_app', 'orders')" in model.new_content
+
+
+def test_two_relations_sharing_a_table_name_are_refused_in_one_call():
+    from exmergo_dex_core.transform.scaffold import scaffold_edits
+
+    store = _trino_store("memory.app.orders", "lake.app.orders")
+    with pytest.raises(ScaffoldError, match="both scaffold stg_orders"):
+        scaffold_edits(["memory.app.orders", "lake.app.orders"], store)
+
+
+def test_a_model_reading_another_relation_is_not_repointed(dbt_project_dir: Path):
+    """stg_orders already reads one relation; scaffolding a different relation
+    with the same table name would silently repoint every model downstream.
+    Re-scaffolding the relation it already reads is still an update."""
+
+    from exmergo_dex_core.transform.scaffold import scaffold_edits
+
+    store = _trino_store("memory.app.orders", "lake.app.orders")
+    (dbt_project_dir / "models" / "staging" / "stg_orders.sql").write_text(
+        "select * from {{ source('memory_app', 'orders') }}\n", encoding="utf-8"
+    )
+    with pytest.raises(ScaffoldError, match="already reads source"):
+        scaffold_edits(["lake.app.orders"], store, dbt_project_dir)
+    edits = scaffold_edits(["memory.app.orders"], store, dbt_project_dir)
+    assert any(e.path.endswith("stg_orders.sql") for e in edits)

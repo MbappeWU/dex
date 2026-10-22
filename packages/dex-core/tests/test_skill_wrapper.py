@@ -17,6 +17,7 @@ path rather than imported.
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import subprocess
 from pathlib import Path
@@ -48,6 +49,17 @@ def test_the_three_wrappers_stay_byte_identical():
     assert len(WRAPPERS) == 3
     contents = {path.read_bytes() for path in WRAPPERS}
     assert len(contents) == 1, [path.as_posix() for path in WRAPPERS]
+
+
+def test_the_wrapper_knows_every_engine_connector(wrapper):
+    """An engine connector the wrapper does not name falls back to the DuckDB
+    extra, so the installed engine lacks the client and refuses every command for
+    a user who configured nothing wrong. Checked against the engine's own table,
+    so the next connector cannot land without the wrapper learning it."""
+
+    from exmergo_dex_core.adapters import _DIALECTS
+
+    assert set(wrapper._KNOWN_CONNECTORS) == set(_DIALECTS)
 
 
 @pytest.mark.parametrize(
@@ -173,6 +185,18 @@ def test_the_extras_are_the_connector_plus_whatever_the_command_needs(
         (["explore", "semantic"], "slayer", ["ossie", "slayer", "semantic-api"]),
         (
             ["explore", "semantic", "list", "--metric", "orders.revenue"],
+            "slayer",
+            ["ossie", "slayer", "semantic-api"],
+        ),
+        # SLayer renders `query` and `values` itself, so both take it and
+        # neither takes MetricFlow (#685).
+        (
+            ["explore", "semantic", "query", "orders.revenue"],
+            "slayer",
+            ["ossie", "slayer", "semantic-api"],
+        ),
+        (
+            ["explore", "semantic", "values", "orders.status"],
             "slayer",
             ["ossie", "slayer", "semantic-api"],
         ),
@@ -406,3 +430,18 @@ def test_both_ways_into_uv_carry_the_child_env(argv, monkeypatch):
     assert len(envs) == 1 and envs[0] is not None
     assert "GITHUB_TOKEN" not in envs[0]
     assert envs[0]["DATABASE_URL"] == "postgresql://dex_ro@localhost/app"
+
+
+@pytest.mark.parametrize("status", ["ok", "error"])
+def test_wrapper_envelope_matches_engine(wrapper, status):
+    """Bootstrap responses obey the same contract as installed-engine responses."""
+    from exmergo_dex_core.envelope import Envelope
+
+    fields = {
+        "data": {"connector": "duckdb"} if status == "ok" else {},
+        "errors": ["uv is required"] if status == "error" else [],
+        "reason": "prerequisite" if status == "error" else None,
+    }
+    actual = json.loads(wrapper._envelope(status, **fields))
+    expected = Envelope(status=status, **fields).model_dump(mode="json")
+    assert actual == expected

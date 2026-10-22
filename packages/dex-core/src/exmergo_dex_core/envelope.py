@@ -21,6 +21,7 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .errors import DexError, StatementStage, WarehouseQueryError
+from .values_free import ValuesFreeError, error_code
 
 
 class Status(str, Enum):
@@ -459,6 +460,10 @@ def reason_for(exc: BaseException) -> Reason:
       warehouse connector extra brings ``sql``.
     """
 
+    if isinstance(exc, ValuesFreeError):
+        # The one family that carries its bucket rather than deriving it: a
+        # withheld error keeps the reason the error it replaced would have read.
+        return Reason(exc.reason)
     for exc_type, reason in _reason_overrides():
         if isinstance(exc, exc_type):
             return reason
@@ -475,7 +480,9 @@ def stage_for(exc: BaseException) -> StatementStage | None:
     neither can carry one the other drops.
     """
 
-    return exc.stage if isinstance(exc, WarehouseQueryError) else None
+    if isinstance(exc, (WarehouseQueryError, ValuesFreeError)):
+        return exc.stage
+    return None
 
 
 def error_for(
@@ -494,6 +501,11 @@ def error_for(
     stage = stage_for(exc)
     if stage is not None:
         kwargs["data"] = {**(kwargs.get("data") or {}), "stage": stage.value}
+    # The stable code an error carries in values-free mode (#591), which is the
+    # part of it guaranteed to quote no value; absent outside the mode.
+    code = error_code(exc)
+    if code is not None:
+        kwargs["data"] = {**(kwargs.get("data") or {}), "code": code}
     return Envelope(
         status=Status.ERROR,
         errors=[message if message is not None else str(exc)],

@@ -125,6 +125,19 @@ def _sample_parts(
         # takes Redshift's shape: a random-ordered top-N, a full scan bounded by
         # the budget, described honestly in the note.
         return "", f" ORDER BY rand() LIMIT {n}", f"ORDER BY rand() LIMIT {n}"
+    if dialect == "trino":
+        # Authored natively: the ROWS form sqlglot would transpile to is one
+        # Trino rejects, and BERNOULLI takes a percent. It keeps each row with
+        # that probability, so it still reads every split: it bounds the rows
+        # the query works on, not the scan, and it is not repeatable.
+        p = percent()
+        if p is None:
+            return "", "", "no sample clause (row count unknown or below cap)"
+        return (
+            f" TABLESAMPLE BERNOULLI ({p})",
+            "",
+            f"TABLESAMPLE BERNOULLI ({p}%, reads every split)",
+        )
     # Unknown dialect: no sampling clause. The row-cap on the fetch and the cost
     # gate still bound the work; column pruning still limits the scan.
     return "", "", UNRECOGNIZED_DIALECT_NOTE

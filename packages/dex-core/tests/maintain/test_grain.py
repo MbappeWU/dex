@@ -1099,3 +1099,132 @@ def test_a_declared_grain_naming_absent_columns_is_noted():
     assert plan.declared_composite_checks == []
     assert len(plan.notes) == 1
     assert "invoice_no" in plan.notes[0] and "not verified" in plan.notes[0]
+
+
+def test_an_unknown_row_count_is_measured_rather_than_read_as_empty(
+    fake_trino_connection,
+):
+    """A connector with no free row count reports None until a scan counts the
+    table. Read as zero, every table on it came back as `no_rows`, and none of
+    its columns was surveyed for nulls."""
+
+    pytest.importorskip("trino")
+
+    from fakes.trino import FakeResult
+
+    from exmergo_dex_core import DexConfig, DexEngine, MemoryStore
+    from exmergo_dex_core.cache import Dataset
+    from exmergo_dex_core.config import Budget
+    from exmergo_dex_core.connect import ConnectionSource
+    from exmergo_dex_core.dbt_project import ProjectDefinitions
+    from exmergo_dex_core.maintain.commands import grain_drift
+    from exmergo_dex_core.maintain.snapshot import Snapshot, WarehouseBaseline
+
+    store = MemoryStore()
+    store.save_snapshot(
+        Snapshot(
+            created_at="2024-01-01T00:00:00+00:00",
+            warehouse=WarehouseBaseline(
+                datasets=[Dataset(identifier="pg.public.accounts")],
+                relationships=[],
+            ),
+        )
+    )
+    fake_trino_connection.explain_override = {"pg.public.accounts": 1_000}
+
+    def answer(sql: str):
+        if "COUNT(*) AS n_total" in sql:
+            return FakeResult(rows=[{"n_total": 40, "nn_0": 40, "nn_1": 0}])
+        return None
+
+    fake_trino_connection.row_resolver = answer
+
+    class Project:
+        def definitions(self):
+            return ProjectDefinitions(present=False)
+
+    engine = DexEngine(
+        config=DexConfig(
+            connector="trino", budget=Budget(ceiling=600.0, session_ceiling=None)
+        ),
+        store=store,
+        connection=ConnectionSource(connect=lambda: fake_trino_connection),
+        confirmed=True,
+        project_format=Project(),
+    )
+    result = grain_drift(engine)
+
+    assert not [f for f in result.findings if f.code == "no_rows"]
+    (finding,) = [f for f in result.findings if f.code == "fully_null_column"]
+    assert finding.column == "owner"
+    assert finding.data["row_count"] == 40
+
+
+def test_a_lost_key_is_caught_where_rows_are_only_counted_by_the_scan(
+    fake_trino_connection,
+):
+    """Planned on an unknown count rather than dropped for want of one. The
+    uniqueness check was skipped outright on every connector without a free
+    row count, so a duplicated key there could never be reported."""
+
+    pytest.importorskip("trino")
+
+    from fakes.trino import FakeResult
+
+    from exmergo_dex_core import DexConfig, DexEngine, MemoryStore
+    from exmergo_dex_core.cache import Dataset
+    from exmergo_dex_core.config import Budget
+    from exmergo_dex_core.connect import ConnectionSource
+    from exmergo_dex_core.dbt_project import ProjectDefinitions
+    from exmergo_dex_core.maintain.commands import grain_drift
+    from exmergo_dex_core.maintain.snapshot import Snapshot, WarehouseBaseline
+
+    store = MemoryStore()
+    store.save_snapshot(
+        Snapshot(
+            created_at="2024-01-01T00:00:00+00:00",
+            warehouse=WarehouseBaseline(
+                datasets=[
+                    Dataset(
+                        identifier="pg.public.accounts",
+                        candidate_keys=[["id"], ["id", "owner"]],
+                        grain=["id"],
+                    )
+                ],
+                relationships=[],
+            ),
+        )
+    )
+    fake_trino_connection.explain_override = {"pg.public.accounts": 1_000}
+
+    def answer(sql: str):
+        if "COUNT(DISTINCT" in sql:
+            return FakeResult(rows=[{"n_total": 50, "d_0": 45}])
+        if "SELECT DISTINCT" in sql:
+            return FakeResult(rows=[{"n_total": 50, "d_0": 48}])
+        if "COUNT(*) AS n_total" in sql:
+            return FakeResult(rows=[{"n_total": 50, "nn_0": 50, "nn_1": 50}])
+        return None
+
+    fake_trino_connection.row_resolver = answer
+
+    class Project:
+        def definitions(self):
+            return ProjectDefinitions(present=False)
+
+    engine = DexEngine(
+        config=DexConfig(
+            connector="trino", budget=Budget(ceiling=600.0, session_ceiling=None)
+        ),
+        store=store,
+        connection=ConnectionSource(connect=lambda: fake_trino_connection),
+        confirmed=True,
+        project_format=Project(),
+    )
+    findings = [
+        f for f in grain_drift(engine).findings if f.code == "key_lost_uniqueness"
+    ]
+    assert {(f.column, f.data["row_count"]) for f in findings} == {
+        ("id", 50),
+        ("id, owner", 50),
+    }

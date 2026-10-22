@@ -1005,3 +1005,53 @@ def test_a_cumulative_cap_binds_on_a_statement_charged_without_a_handshake():
     # ceiling of 1_000 would admit it, the cumulative cap must not.
     with pytest.raises(OverCeilingError):
         gate.charge(100.0)
+
+
+def test_a_verified_build_shares_the_gates_reservation_id_for_one_ratio():
+    """Issue #666: a verified build's dbt row and its folded ``--verify``
+    statement rows share ``gate.reservation_id`` so :func:`settled_ratios`
+    groups them into one billed-over-estimated point, while builds that settled
+    with no gate (``reservation_id: None``) still form solo groups of their own.
+    """
+
+    from exmergo_dex_core.guards.cost_guard import ledger_row, settled_ratios
+
+    ledger = _Ledger()
+    gate = _ledger_gate(ledger)
+    gate.preflight_command(500.0)
+    # The folded `--verify` count statement bills through the gate.
+    gate.record_billed(50.0)
+    gate.settle()
+    # The dbt build settles outside the gate, stamped with the gate's token.
+    ledger.append(
+        ledger_row(
+            connector="bigquery",
+            command="transform build",
+            entry="settlement",
+            field="billed_bytes",
+            amount=350.0,
+            reservation_id=gate.reservation_id,
+            estimate=500.0,
+        )
+    )
+    # Two degraded builds with no gate (`reservation_id: None`) stay solo groups.
+    for billed in (100.0, 200.0):
+        ledger.append(
+            ledger_row(
+                connector="bigquery",
+                command="transform build",
+                entry="settlement",
+                field="billed_bytes",
+                amount=billed,
+                reservation_id=None,
+                estimate=400.0,
+            )
+        )
+
+    assert settled_ratios(
+        ledger.entries, connector="bigquery", field="billed_bytes"
+    ) == [
+        pytest.approx((50.0 + 350.0) / 500.0),
+        pytest.approx(100.0 / 400.0),
+        pytest.approx(200.0 / 400.0),
+    ]

@@ -38,6 +38,7 @@ from typing import TYPE_CHECKING, Any
 from ..dbt_project import DbtProjectView, EditOp, node_files, node_name, path_family
 from ..errors import RequestError
 from ..references import KINDS, ReferenceIndex
+from ..yaml_spans import with_leading_comments
 from .plans import EditKind, PlanEdit
 from .rewrite import (
     RewriteError,
@@ -248,10 +249,14 @@ def _refuse_incomplete(index: ReferenceIndex, kind: str, name: str) -> None:
             "Resolve that first, because a partial rewrite can still compile"
         )
 
-    if index.limits:
+    _, query_limits = index.references_to(
+        name.rpartition(".")[2] if kind == "column" else name, kind
+    )
+    limits = list(dict.fromkeys([*index.limits, *query_limits]))
+    if limits:
         raise PropagationRefusedError(
             "dex cannot promise it found every use of "
-            f"'{name}': {'; '.join(index.limits)}. Resolve that first, because a "
+            f"'{name}': {'; '.join(limits)}. Resolve that first, because a "
             "rename applied to most of a project still compiles"
         )
 
@@ -469,7 +474,8 @@ class _Builder:
             if block.kind == "column" and not self._owned(block.owner, defining=True):
                 continue
             self.sites[block.form] += 1
-            self._spans[path].append((block.span[0], block.span[1], ""))
+            start = with_leading_comments(content, block.span[0])
+            self._spans[path].append((start, block.span[1], ""))
 
     def _seed_file(self, path: str, content: str) -> None:
         """A seed's header row, and never a row below it.

@@ -1,0 +1,60 @@
+name: sqlglot canary
+
+# A weekly run of the suite against the newest sqlglot, above the ceiling the
+# project declares. The query firewall matches sqlglot expression classes by name
+# at module scope, so a sqlglot major that renames one breaks every install that
+# resolves it. The declared dependency is therefore capped, and this run is how
+# the cap stays honest: a breaking release surfaces here within a week instead of
+# on a user's machine after we raise the ceiling blind.
+#
+# Weekly rather than per pull request: the question it answers is about an
+# upstream release, which a week is soon enough to learn of, and re-running the
+# whole suite on every pull request to ask it again would be waste. A red run is
+# a signal to investigate upstream, never a merge blocker; `ci.yml`'s `tests` and
+# `safety` jobs remain the real gates.
+#
+# Deliberately a mirror of `ci.yml`'s `tests` job rather than a narrower
+# selection: the firewall is not the only dialect-dependent code (relationship
+# probes and drift checks transpile per connector), and this run is only
+# informative if a red run means "the new sqlglot broke something" rather than
+# "the canary environment was missing something". Two safety-spine tests import
+# boto3 and httpx unguarded and get them transitively from the [redshift] and
+# [databricks] extras, so a narrower sync fails for reasons that have nothing to
+# do with sqlglot. Packaging tests are excluded because they resolve sqlglot
+# inside isolated installs from the declared cap, so they would report on the
+# capped version and not the one under test.
+
+on:
+  schedule:
+    # Mondays at 07:10 UTC (off the hour to avoid GitHub's cron congestion).
+    - cron: "10 7 * * 1"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  sqlglot-canary:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: packages/dex-core
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          enable-cache: true
+      - name: Sync (duckdb + bigquery + snowflake + databricks + postgres + redshift + clickhouse + trino + dev extras)
+        run: uv sync --extra duckdb --extra bigquery --extra snowflake --extra databricks --extra postgres --extra redshift --extra clickhouse --extra trino --extra dev
+      # A direct install into the synced environment, which is what lets it ignore
+      # the ceiling the project declares. `uv sync` would resolve back to the cap.
+      - name: Install the newest sqlglot over the declared ceiling
+        run: uv pip install --upgrade sqlglot
+      # --no-sync so the test run cannot quietly restore the capped version and
+      # report a green canary that tested nothing, which would be worse than having
+      # no canary at all. The version is echoed in the same step for that reason:
+      # the log has to show which sqlglot actually ran.
+      - name: Suite against the newest sqlglot
+        run: |
+          uv run --no-sync python -c "import sqlglot; print('testing sqlglot', sqlglot.__version__)"
+          uv run --no-sync pytest -q -m "not packaging"

@@ -84,12 +84,17 @@ _DRIFT_FIELDS: dict[str, tuple[tuple[str, str, str], ...]] = {
     # dbt-clickhouse has no `database` key: its `schema` is the ClickHouse
     # database, which is the same two-part-namespace fact the adapter encodes.
     "clickhouse": (("dev_database", "clickhouse.dev_database", "schema"),),
+    # dbt-trino's `database` is the Trino catalog.
+    "trino": (
+        ("dev_catalog", "trino.dev_catalog", "database"),
+        ("dev_schema", "trino.dev_schema", "schema"),
+    ),
     "duckdb": (("path", "duckdb.path", "path"),),
 }
 
 # Connectors whose identifiers are case-insensitive, so DBT_DEV and dbt_dev are
 # the same namespace and must not be reported as drift.
-_CASE_FOLDING = {"snowflake"}
+_CASE_FOLDING = {"snowflake", "trino"}
 
 
 def _resolve_declared_path(declared: str, base_dir: Path) -> Path:
@@ -127,6 +132,16 @@ def check(
     than running it.
     """
 
+    from ..connect import assert_deployment_supported
+    from ..errors import ConfigurationError
+
+    try:
+        # First, and here as well as at connect: a build whose pricing
+        # connection fails degrades to a note and runs dbt anyway, so this is
+        # the last point a refused deployment can be stopped before dbt spends.
+        assert_deployment_supported(config.connector, config)
+    except ConfigurationError as exc:
+        raise DevTargetError(str(exc)) from exc
     project = Path(project_dir)
     profile = target_identifiers(project, target)
     drift_warnings = _assert_no_drift(
@@ -144,37 +159,46 @@ def check(
     ]
 
 
+def missing_cap_references(project: Path, target: str, connector: str) -> list[str]:
+    """The build-cap variables ``target``'s profile block fails to reference.
+
+    On a connector whose cap rides the profile (ClickHouse ``custom_settings``,
+    Trino ``session_properties``), ``transform build`` fills ``env_var``
+    references from the confirmed budget. A hand-written profile without them is
+    valid and builds fine; what it cannot do is be capped. Empty when every
+    reference is there, and for a connector whose cap does not ride the profile
+    at all (see ``init.BUILD_CAP_REFERENCES``).
+    """
+
+    from .init import BUILD_CAP_REFERENCES
+
+    entry = BUILD_CAP_REFERENCES.get(connector)
+    if entry is None:
+        return []
+    key, names = entry
+    block = _raw_target_key(project, target, key)
+    rendered = " ".join(str(v) for v in block.values()) if block else ""
+    return [name for name in names if name not in rendered]
+
+
 def _assert_build_cap_reachable(
     project: Path, target: str, config: DexConfig
 ) -> list[str]:
     """Warn when dex cannot tighten the build's server-side cap.
-
-    On ClickHouse the cap rides the profile's ``custom_settings`` through two
-    ``env_var`` references that ``transform build`` fills from the confirmed
-    budget. A hand-written profile without them is perfectly valid and builds
-    fine; what it cannot do is be capped, so the confirmed budget bounds the
-    estimate and nothing bounds a statement that outruns it.
 
     A warning, never a refusal, matching this module's posture: dex does not
     own the profile. But it has to be said out loud, because the alternative is
     a build that reports it was capped when it was not.
     """
 
-    if config.connector != "clickhouse":
-        return []
-    from .init import CH_MAX_BYTES_TO_READ_ENV, CH_MAX_EXECUTION_TIME_ENV
-
-    settings = _raw_target_key(project, target, "custom_settings")
-    rendered = " ".join(str(v) for v in settings.values()) if settings else ""
-    missing = [
-        name
-        for name in (CH_MAX_EXECUTION_TIME_ENV, CH_MAX_BYTES_TO_READ_ENV)
-        if name not in rendered
-    ]
+    missing = missing_cap_references(project, target, config.connector)
     if not missing:
         return []
+    from .init import BUILD_CAP_REFERENCES
+
+    key = BUILD_CAP_REFERENCES[config.connector][0]
     return [
-        "this profile's custom_settings do not reference "
+        f"this profile's {key} do not reference "
         f"{' or '.join(missing)}, so `transform build` cannot wind the "
         "confirmed budget down into a server-side cap for this connector. The "
         "budget still bounds the estimate; nothing bounds a statement that "
@@ -333,6 +357,8 @@ def _assert_namespace_exists(
         return _redshift_namespace(project, target, config, open_probe)
     if config.connector == "clickhouse":
         return _clickhouse_namespace(project, target, config, open_probe)
+    if config.connector == "trino":
+        return _trino_namespace(project, config, open_probe)
     return []
 
 
@@ -639,6 +665,51 @@ def _clickhouse_namespace(
     )
 
 
+def _trino_namespace(
+    project: Path,
+    config: DexConfig,
+    open_probe: Callable[[str], tuple[object | None, str | None]],
+) -> list[str]:
+    """Free: one coordinator metadata read, no scan.
+
+    Trino lands with Snowflake and Databricks: dbt-trino creates the dev schema
+    but never the catalog, and a catalog can only take writes if its connector
+    can, so a catalog that is missing, or one of the read-only kinds (tpch,
+    tpcds, jmx, system, faker), is refused before dbt runs. A memory or
+    blackhole catalog is writable and passes with a warning that the build will
+    not last. Whether the dbt identity may write is not asked: Trino
+    authorization is pluggable and exposes no grant table, so that answer comes
+    from dbt.
+    """
+
+    tr = config.trino
+    if tr is None or not tr.dev_catalog:
+        return []
+
+    from .init import DEFAULT_TRINO_DEV_SCHEMA
+
+    namespace = f"{tr.dev_catalog}.{tr.dev_schema or DEFAULT_TRINO_DEV_SCHEMA}"
+    adapter, note = open_probe("trino")
+    if adapter is None:
+        return [note]
+    try:
+        missing = adapter.missing_dev_namespaces(namespace, role="")
+        warnings = adapter.table_notes(f"{namespace}.*")
+    except Exception as exc:
+        raise DevTargetError(str(exc)) from exc
+    finally:
+        adapter.close()
+
+    if missing:
+        if _confirmed_out_of_scope(project, "trino", "database", tr.dev_catalog):
+            return []
+        raise DevTargetError(
+            f"trino {missing[0]} cannot hold the dev build; point trino.dev_catalog "
+            "in .dex/config.yml (and the profile's database) at a writable catalog"
+        )
+    return list(warnings)
+
+
 def _postgres_namespace(
     project: Path,
     target: str,
@@ -838,6 +909,16 @@ def content_check(
             schemas.extend(layer_names)
         probes.extend(
             (f"{block.dev_catalog}.{schema}", (block.dev_catalog, schema))
+            for schema in schemas
+        )
+    elif connector == "trino" and block.dev_catalog:
+        from .init import DEFAULT_TRINO_DEV_SCHEMA
+
+        schemas = [block.dev_schema or DEFAULT_TRINO_DEV_SCHEMA]
+        if layered:
+            schemas.extend(layer_names)
+        probes.extend(
+            (f"{block.dev_catalog}.{schema}", (f"{block.dev_catalog}.{schema}",))
             for schema in schemas
         )
     elif connector == "clickhouse" and block.dev_database:

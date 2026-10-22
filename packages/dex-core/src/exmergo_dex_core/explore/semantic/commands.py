@@ -250,7 +250,18 @@ def semantic_query(
             "a metric query needs at least one metric (discover them with "
             "`explore semantic list`)"
         )
-    return resolve_backend(engine, api=api, local=local).query(query)
+    result = resolve_backend(engine, api=api, local=local).query(query)
+    from ...config import QueryLimits
+
+    limits = getattr(engine.config, "query", None) or QueryLimits()
+    max_rows = limits.max_rows
+    if query.limit is not None and query.limit > max_rows:
+        result.warnings.append(
+            f"--limit {query.limit} exceeds query.max_rows ({max_rows}); "
+            f"results are capped at {max_rows}. Raise query.max_rows in "
+            f".dex/config.yml to return more."
+        )
+    return result
 
 
 def cmd_semantic(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:

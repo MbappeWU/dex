@@ -16,6 +16,7 @@ _RENDERERS: dict[str, tuple[str, str, str]] = {
     "databricks": ("databricks", "DatabricksSqlPlanRenderer", "DATABRICKS"),
     "postgres": ("postgres", "PostgresSqlPlanRenderer", "POSTGRES"),
     "redshift": ("redshift", "RedshiftSqlPlanRenderer", "REDSHIFT"),
+    "trino": ("trino", "TrinoSqlPlanRenderer", "TRINO"),
 }
 
 

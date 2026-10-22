@@ -514,32 +514,8 @@ def generate_demo_warehouse(
     empty string from NULL, and every column generated here is non-null.
     """
 
-    # Both refusals name the path with forward slashes, as `dex demo` reports
-    # everything it names, so one command never spells a path two ways.
     target = Path(path)
-    if target.exists() or target.is_symlink():
-        raise DemoTargetExistsError(
-            f"'{target.as_posix()}' already exists; dex demo only ever creates a "
-            "new file and never opens, inspects, or replaces one you already have. "
-            "Name a different path, for example `dex demo demo2.duckdb`"
-        )
-    parent = target.parent
-    if not parent.is_dir():
-        raise DemoPathError(
-            f"'{parent.as_posix()}' is not an existing directory; dex demo writes "
-            "one file and creates no directories. Create it first, or name a path "
-            "inside a directory that exists"
-        )
-
-    try:
-        import duckdb
-    except ImportError as exc:
-        raise DemoDependencyError(
-            "dex demo builds a local DuckDB warehouse, which needs the duckdb "
-            "client: reinstall the engine with the on-ramp extra, "
-            '`pip install "exmergo-dex-core[duckdb]"`. It pulls no cloud client '
-            "and needs no credentials"
-        ) from exc
+    duckdb = _new_target(target)
 
     tables = build_tables(seed)
     connection = duckdb.connect(str(target))
@@ -573,3 +549,73 @@ def generate_demo_warehouse(
     return DemoWarehouse(
         path=target, tables=tables, seed=seed, digest=row_digest(tables)
     )
+
+
+def generate_fixture_warehouse(path: str | Path, tables: tuple[DemoTable, ...]) -> Path:
+    """Create a new DuckDB file at ``path`` holding exactly ``tables``. Never
+    overwrite.
+
+    The demo's write path for a caller that brings its own small table set: the
+    values-free conformance suite (#591) seeds one with sentinel values a test then
+    searches every output for. It lives here rather than beside that suite so this
+    module stays the only one in the engine that opens DuckDB writable, under the
+    same three refusals as :func:`generate_demo_warehouse`.
+
+    Rows are bound as parameters rather than staged through CSV, because a fixture
+    needs NULLs and CSV cannot tell one from an empty string; the tables are a few
+    rows each, so the binding cost the demo avoids does not arise.
+    """
+
+    target = Path(path)
+    duckdb = _new_target(target)
+    connection = duckdb.connect(str(target))
+    try:
+        for table in tables:
+            columns = ", ".join(f"{name} {sql}" for name, sql in table.columns)
+            connection.execute(f"CREATE TABLE {table.name} ({columns})")
+            if table.rows:
+                marks = ", ".join("?" for _ in table.columns)
+                connection.executemany(
+                    f"INSERT INTO {table.name} VALUES ({marks})",  # noqa: S608
+                    [list(row) for row in table.rows],
+                )
+        connection.execute("CHECKPOINT")
+    except Exception:
+        connection.close()
+        target.unlink(missing_ok=True)
+        raise
+    connection.close()
+    return target
+
+
+def _new_target(target: Path):
+    """Refuse a target that exists or whose directory does not, then import and
+    return ``duckdb``. Everything here runs before anything is opened, so a
+    refused call has opened nothing."""
+
+    # Both refusals name the path with forward slashes, as `dex demo` reports
+    # everything it names, so one command never spells a path two ways.
+    if target.exists() or target.is_symlink():
+        raise DemoTargetExistsError(
+            f"'{target.as_posix()}' already exists; dex demo only ever creates a "
+            "new file and never opens, inspects, or replaces one you already have. "
+            "Name a different path, for example `dex demo demo2.duckdb`"
+        )
+    parent = target.parent
+    if not parent.is_dir():
+        raise DemoPathError(
+            f"'{parent.as_posix()}' is not an existing directory; dex demo writes "
+            "one file and creates no directories. Create it first, or name a path "
+            "inside a directory that exists"
+        )
+
+    try:
+        import duckdb
+    except ImportError as exc:
+        raise DemoDependencyError(
+            "dex demo builds a local DuckDB warehouse, which needs the duckdb "
+            "client: reinstall the engine with the on-ramp extra, "
+            '`pip install "exmergo-dex-core[duckdb]"`. It pulls no cloud client '
+            "and needs no credentials"
+        ) from exc
+    return duckdb

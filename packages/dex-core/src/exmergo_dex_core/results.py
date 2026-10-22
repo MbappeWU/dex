@@ -27,6 +27,7 @@ from pydantic import BaseModel, Field
 from . import envelope as env
 from .envelope import Cost
 from .errors import DexError
+from .values_free import ResultMode
 
 
 class ConfirmationRequest(BaseModel):
@@ -115,6 +116,9 @@ class Result(BaseModel):
     diffs: list[dict[str, Any]] = Field(default_factory=list)
     pending_confirmation: ConfirmationRequest | None = None
     pending_offer: ConfirmationRequest | None = None
+    # Which mode produced this result (#591). A host that requires values-free
+    # results asserts it here, and the envelope states it as `data.result_mode`.
+    result_mode: ResultMode = ResultMode.FULL
 
     def data(self) -> dict[str, Any]:
         """The command-specific payload, keyed as the command contract documents."""
@@ -151,6 +155,9 @@ def to_envelope(result: Result, *, hints: dict[str, Any] | None = None) -> env.E
         data["notes"] = result.notes
     if result.spend is not None:
         data["spend"] = result.spend
+    # Stated only in the mode, so a full-mode payload is exactly what it was.
+    if result.result_mode is ResultMode.VALUES_FREE:
+        data["result_mode"] = result.result_mode.value
 
     if result.pending_confirmation is not None and result.pending_offer is not None:
         raise ValueError(

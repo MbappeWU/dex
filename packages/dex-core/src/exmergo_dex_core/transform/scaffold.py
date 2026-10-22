@@ -20,6 +20,7 @@ shipped version.
 
 from __future__ import annotations
 
+import re
 from importlib import resources
 from pathlib import Path
 
@@ -34,6 +35,12 @@ from ..storage import ExploreStore, readable_cache
 from .plans import EditKind, PlanEdit
 
 _SOURCES_FILE = "models/staging/_dex_sources.yml"
+
+# A scaffolded model's one source() call, read back to tell a re-scaffold of the
+# same relation from a different relation that happens to share its table name.
+_SOURCE_CALL = re.compile(
+    r"""source\(\s*['"]([^'"]+)['"]\s*,\s*['"]([^'"]+)['"]\s*\)"""
+)
 
 # name -> one-line description, surfaced by `transform macro` with no argument.
 MACRO_ASSETS: dict[str, str] = {
@@ -119,10 +126,16 @@ def scaffold_edits(
             + "; re-run `explore map` (or `explore profile`) on them first"
         )
 
-    sources_edit = _sources_edit(datasets, _existing_sources_content(project_dir))
+    connector = cache.provenance.connector
+    view = _project_view(project_dir)
+    _refuse_model_collisions(datasets, view, connector)
+    existing = view.files.get(_SOURCES_FILE) if view is not None else None
+    sources_edit = _sources_edit(
+        datasets, existing.content if existing is not None else None, connector
+    )
     edits = [sources_edit] if sources_edit is not None else []
     for dataset in datasets:
-        edits.extend(model_edits(dataset))
+        edits.extend(model_edits(dataset, connector))
     return edits
 
 
@@ -185,11 +198,13 @@ def missing_macro_warnings(edits: list[PlanEdit], view: DbtProjectView) -> list[
     return warnings
 
 
-def model_edits(dataset: Dataset) -> list[PlanEdit]:
+def model_edits(dataset: Dataset, connector: str | None = None) -> list[PlanEdit]:
     """The scaffold pair (model SQL + per-model YAML) for one profiled dataset.
 
     Shared with maintain's reconcile, which regenerates a staging model from a
-    drift-patched dataset without touching the shared sources file.
+    drift-patched dataset without touching the shared sources file. Both pass
+    the cache's connector, so the source() a regenerated model calls is the one
+    the scaffold declared.
     """
 
     table = _table_name(dataset.identifier)
@@ -197,7 +212,7 @@ def model_edits(dataset: Dataset) -> list[PlanEdit]:
         PlanEdit(
             path=f"models/staging/stg_{table}.sql",
             kind=EditKind.MODEL_SQL,
-            new_content=_model_sql(dataset),
+            new_content=_model_sql(dataset, connector),
         ),
         PlanEdit(
             path=f"models/staging/stg_{table}.yml",
@@ -239,15 +254,90 @@ def _source_schema(identifier: str) -> str:
     return parts[-2] if len(parts) >= 2 else "main"
 
 
+def _source_location(
+    identifier: str, connector: str | None
+) -> tuple[str, str | None, str]:
+    """``(source name, database, schema)`` for the source a model reads.
+
+    On Trino the source names its catalog. dbt-trino resolves a source with no
+    ``database`` in the profile's, which is the dev catalog, never a source
+    catalog, so without it every scaffolded model would read the wrong table.
+    And one cluster federates catalogs that share schema names (``app`` in a
+    lake and in a Postgres), so the source name carries the catalog too.
+    Elsewhere the source is named for its schema and the target's database
+    applies, as it always has.
+    """
+
+    schema = _source_schema(identifier)
+    parts = identifier.split(".")
+    if connector == "trino" and len(parts) == 3:
+        return f"{parts[0]}_{schema}", parts[0], schema
+    return schema, None, schema
+
+
+def _project_view(project_dir: Path | None) -> DbtProjectView | None:
+    """The dbt project, or ``None`` before ``transform init`` has made one."""
+
+    if project_dir is None:
+        return None
+    try:
+        return load_dbt_project(project_dir)
+    except DbtProjectError:
+        return None
+
+
+def _refuse_model_collisions(
+    datasets: list[Dataset], view: DbtProjectView | None, connector: str | None
+) -> None:
+    """Refuse a scaffold that would turn one relation's model into another's.
+
+    Models are named ``stg_<table>``, so two relations sharing a table name in
+    different schemas or catalogs map to one file. Re-scaffolding the relation a
+    model already reads is an update; replacing it with a different relation
+    would silently repoint every model downstream, so it is refused with both
+    named.
+    """
+
+    by_table: dict[str, str] = {}
+    for dataset in datasets:
+        table = _table_name(dataset.identifier)
+        other = by_table.setdefault(table, dataset.identifier)
+        if other != dataset.identifier:
+            raise ScaffoldError(
+                f"{other} and {dataset.identifier} would both scaffold "
+                f"stg_{table}; scaffold them in separate calls, renaming the "
+                "first model in between (`transform rename model`)"
+            )
+    if view is None:
+        return
+    for dataset in datasets:
+        table = _table_name(dataset.identifier)
+        path = f"models/staging/stg_{table}.sql"
+        current = view.files.get(path)
+        if current is None:
+            continue
+        reads = _SOURCE_CALL.findall(current.content)
+        wanted = (_source_location(dataset.identifier, connector)[0], table)
+        if reads and wanted not in reads:
+            named = ", ".join(f"source('{s}', '{t}')" for s, t in reads)
+            raise ScaffoldError(
+                f"{path} already reads {named}, not {dataset.identifier}; "
+                f"scaffolding it would repoint stg_{table} at a different "
+                "relation. Rename the existing model first (`transform rename "
+                f"model stg_{table} <new name>`), then scaffold"
+            )
+
+
 def _sources_edit(
-    datasets: list[Dataset], existing_content: str | None
+    datasets: list[Dataset], existing_content: str | None, connector: str | None
 ) -> PlanEdit | None:
     requested: dict[str, set[str]] = {}
+    locations: dict[str, tuple[str | None, str]] = {}
     for dataset in datasets:
-        requested.setdefault(_source_schema(dataset.identifier), set()).add(
-            _table_name(dataset.identifier)
-        )
-    content = _merge_sources(existing_content, requested)
+        name, database, schema = _source_location(dataset.identifier, connector)
+        requested.setdefault(name, set()).add(_table_name(dataset.identifier))
+        locations[name] = (database, schema)
+    content = _merge_sources(existing_content, requested, locations)
     if content == existing_content:
         return None
     return PlanEdit(
@@ -257,12 +347,18 @@ def _sources_edit(
     )
 
 
-def _merge_sources(content: str | None, requested: dict[str, set[str]]) -> str:
+def _merge_sources(
+    content: str | None,
+    requested: dict[str, set[str]],
+    locations: dict[str, tuple[str | None, str]] | None = None,
+) -> str:
     """Insert missing declarations without serializing existing user content.
 
     Match the logical source name used by the generated source() calls, not
     its physical schema: several independent sources can share a schema.
     YAML marks locate block insertions; unsupported shapes refuse a rewrite.
+    ``locations`` gives a new source's ``(database, schema)``; a source it does
+    not name is declared with its name as its schema and no database.
     """
     original = content or "version: 2\n\n"
     try:
@@ -374,8 +470,12 @@ def _merge_sources(content: str | None, requested: dict[str, set[str]]) -> str:
         )
         addition = ""
         for name, tables in new_sources:
+            database, schema = (locations or {}).get(name, (None, name))
             addition += " " * indent + "- name: " + scalar(name) + newline
-            addition += " " * (indent + 2) + "schema: " + scalar(name) + newline
+            if database:
+                addition += " " * (indent + 2) + "database: " + scalar(database)
+                addition += newline
+            addition += " " * (indent + 2) + "schema: " + scalar(schema) + newline
             addition += " " * (indent + 2) + "tables:" + newline
             addition += "".join(
                 " " * (indent + 4) + "- name: " + scalar(t) + newline for t in tables
@@ -408,33 +508,15 @@ def _merge_sources(content: str | None, requested: dict[str, set[str]]) -> str:
     return original
 
 
-def _existing_sources_content(project_dir: Path | None) -> str | None:
-    """The shared sources file's current content, or ``None`` if there is none.
-
-    A missing dbt project (scaffold run before `transform init`) is not an
-    error here: it means there is nothing to merge with yet, the same as a
-    project that exists but has not scaffolded a source file so far.
-    """
-
-    if project_dir is None:
-        return None
-    try:
-        view = load_dbt_project(project_dir)
-    except DbtProjectError:
-        return None
-    existing = view.files.get(_SOURCES_FILE)
-    return existing.content if existing is not None else None
-
-
-def _model_sql(dataset: Dataset) -> str:
+def _model_sql(dataset: Dataset, connector: str | None = None) -> str:
     table = _table_name(dataset.identifier)
-    schema = _source_schema(dataset.identifier)
+    source = _source_location(dataset.identifier, connector)[0]
     columns = ",\n".join(f"        {c.name}" for c in dataset.columns)
     # This renders a dbt model source file, never SQL that gets executed; the
     # interpolated names come from the adapter's own catalog metadata.
     return (
         "with source as (\n"  # noqa: S608
-        f"    select * from {{{{ source('{schema}', '{table}') }}}}\n"
+        f"    select * from {{{{ source('{source}', '{table}') }}}}\n"
         "),\n\n"
         "renamed as (\n"
         "    select\n"

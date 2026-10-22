@@ -453,3 +453,33 @@ def test_the_ci_postgres_service_runs_the_dogfood_script_s_image(jobs):
         if line.startswith("DIGEST=")
     )
     assert jobs["postgres"]["services"]["postgres"]["image"] == f"postgres@{digest}"
+
+
+def test_the_trino_catalog_sidecar_runs_the_postgres_dogfood_image():
+    """The Iceberg catalog's Postgres is the image the Postgres connector is
+    tested against, so one digest bump moves both; a sidecar left on an old
+    digest would be a second, unreviewed server image in CI."""
+
+    def assignment(script: str, name: str) -> str:
+        text = (ROOT / "scripts" / script).read_text(encoding="utf-8")
+        return next(
+            line.split("=", 1)[1]
+            for line in text.splitlines()
+            if line.startswith(f"{name}=")
+        )
+
+    assert assignment("setup_trino_dev.sh", "CATALOG_DIGEST") == assignment(
+        "setup_postgres_dev.sh", "DIGEST"
+    )
+
+
+def test_the_trino_job_needs_no_secret_and_seeds_through_the_dogfood_script(jobs):
+    """Keyless and fork-runnable by construction: no environment, no secret,
+    and the one seeding path the dogfood uses."""
+
+    job = jobs["trino"]
+    assert "environment" not in job
+    assert "if" not in job
+    steps = " ".join(str(step.get("run", "")) for step in job["steps"])
+    assert "scripts/setup_trino_dev.sh" in steps
+    assert "secrets." not in str(job)

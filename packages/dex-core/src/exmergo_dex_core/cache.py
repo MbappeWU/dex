@@ -204,6 +204,12 @@ class Dataset(BaseModel):
     #: it is folded in only under `--use-project` and stated in the payload rather
     #: than inferred from its absence.
     semantic_models: list[str] = Field(default_factory=list)
+    #: Written by a profile in values-free mode (#591), which keeps no column
+    #: value: ``min_value``, ``max_value`` and ``value_domain`` are absent on every
+    #: column. A profile outside that mode treats such an entry as stale and scans
+    #: again, so it is never served as though it were complete. Defaults to
+    #: False, so a cache written before it reads as complete, which it is.
+    values_withheld: bool = False
 
     def notable_columns(
         self,
@@ -522,6 +528,25 @@ class DexCache(BaseModel):
             and (not connected_only or d.identifier.lower() in connected)
         ]
         return sorted(candidates, key=lambda d: (-(d.rank_score or 0.0), d.identifier))
+
+
+def mask_overridden(cache: DexCache, override_paths: set[str]) -> DexCache:
+    """Apply config overrides to a loaded cache in memory, so an override takes
+    effect at query time immediately instead of demanding a re-profile (a billed
+    scan on metered connectors). The persisted cache is untouched; the next
+    profile writes the override through durably."""
+
+    if not override_paths:
+        return cache
+    for dataset in cache.datasets:
+        for column in dataset.columns:
+            if (
+                column.pii is not None
+                and f"{dataset.identifier}.{column.name}".lower() in override_paths
+            ):
+                column.pii_overridden = column.pii.category
+                column.pii = None
+    return cache
 
 
 def join_columns_by_dataset(

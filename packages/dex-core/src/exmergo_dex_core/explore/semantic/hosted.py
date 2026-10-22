@@ -237,6 +237,19 @@ class HostedDbtCloudBackend:
 
         return metricflow_dialect.filter_refs(clauses)
 
+    def time_axis_refs(self, _metrics: list[str]) -> list[str] | None:
+        """None: dbt Cloud resolves ``metric_time`` server-side, and nothing the
+        gate reads before sending a query says which dimension it resolves to.
+
+        The per-metric dimension metadata is keyed by token, and a metric's agg
+        time dimension arrives as a bare name with no semantic model to qualify
+        it by, so matching one to the other would be a guess. ``metric_time`` is
+        therefore screened by its name, and the result's screening note names it
+        among the dimensions only the heuristic spoke to.
+        """
+
+        return None
+
     def query(self, q: SemanticQuery) -> SemanticQueryResult:
         refs = requested_dimension_refs(q, filter_refs=self.filter_refs)
         meta, reported = self._query_metadata(q.metrics)

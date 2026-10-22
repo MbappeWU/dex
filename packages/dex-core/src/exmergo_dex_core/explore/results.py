@@ -21,6 +21,7 @@ from ..adapters.base import VALUE_DOMAIN_CAP
 from ..cache import Dataset, DexCache, Relationship
 from ..errors import StatementStage
 from ..results import Result
+from ..values_free import COLUMN_VALUE_FIELDS
 from .semantic import SemanticCatalog
 from .summary import MapObject, SkippedObjects
 
@@ -100,10 +101,17 @@ def _profile_dataset_payload(
     into the domain's ``elided`` count (``values`` plus ``elided`` stays the
     exact distinct total), so a wide enumeration reads as a summary rather than
     a column dump.
+
+    A dataset profiled or served in values-free mode (#591) carries no column
+    value at all: ``min_value``, ``max_value`` and ``value_domain`` are absent
+    from every column rather than null, named once in ``withheld_fields``, and
+    kept out of ``suppressed_fields``, whose meaning ("null on every column
+    shown") they do not share.
     """
 
+    withheld = list(COLUMN_VALUE_FIELDS) if dataset.values_withheld else []
     kept, elided = dataset.columns_with_findings(everything=show_all_columns)
-    columns = [c.model_dump(mode="json") for c in kept]
+    columns = [c.model_dump(mode="json", exclude=set(withheld)) for c in kept]
     cap = max(0, value_domain_cap)
     for column in columns:
         domain = column.get("value_domain")
@@ -114,7 +122,7 @@ def _profile_dataset_payload(
     for column in columns:
         for name in suppressed:
             del column[name]
-    return {
+    payload: dict[str, Any] = {
         "identifier": dataset.identifier,
         "object_type": dataset.object_type,
         "row_count": dataset.row_count,
@@ -134,9 +142,14 @@ def _profile_dataset_payload(
         "profiled_at": dataset.profiled_at,
         "semantic_models": dataset.semantic_models,
         "suppressed_fields": suppressed,
-        "columns": columns,
-        "elided_column_count": elided,
     }
+    if withheld:
+        # Ahead of `columns`, for the reason `suppressed_fields` is: a truncated
+        # read still says why the fields are not there.
+        payload["withheld_fields"] = withheld
+    payload["columns"] = columns
+    payload["elided_column_count"] = elided
+    return payload
 
 
 def _fields_null_everywhere(columns: list[dict[str, Any]]) -> list[str]:
@@ -469,6 +482,9 @@ class QueryStatementResult(BaseModel):
     error: str | None = None
     reason: str | None = None
     stage: StatementStage | None = None
+    # The stable code a statement's error carries in values-free mode (#591),
+    # the part of it guaranteed to quote no value. Absent outside the mode.
+    code: str | None = None
     # Set only on a call run `--across` mirrored datasets (#545): which target
     # this variant ran against, and which of the caller's templates it was
     # expanded from (0-based), so variants of one probe line up across targets.
@@ -498,7 +514,13 @@ class QueryBatchResult(Result):
         results = []
         for result in self.results:
             payload = result.model_dump(mode="json")
-            for optional in ("column_notes", "query_notes", "target", "template"):
+            for optional in (
+                "column_notes",
+                "query_notes",
+                "target",
+                "template",
+                "code",
+            ):
                 if payload[optional] is None:
                     payload.pop(optional)
             results.append(payload)

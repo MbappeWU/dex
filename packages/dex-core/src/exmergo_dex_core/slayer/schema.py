@@ -36,6 +36,12 @@ SLayer computed it, which is what ``maintain reconcile`` turns into a plan.
 
 from __future__ import annotations
 
+# First, before any SLayer import: importing SLayer rewrites sqlglot's reserved
+# keywords process-wide, and this module undoes that (see `sqlglot_keywords`).
+from .sqlglot_keywords import slayer_keywords
+
+# isort: split
+
 from collections import defaultdict
 from typing import TYPE_CHECKING, Any
 
@@ -192,9 +198,10 @@ def declared_schema_drift(
                         "columns were not compared"
                     )
                     continue
-                diffs[model.name] = diff_sql_table_model(
-                    model=model, live_table=None, available_models_in_ds=names
-                )
+                with slayer_keywords():
+                    diffs[model.name] = diff_sql_table_model(
+                        model=model, live_table=None, available_models_in_ds=names
+                    )
                 located[model.name] = (gone[0], None)
                 continue
             dataset = by_id[matches[0]]
@@ -205,18 +212,20 @@ def declared_schema_drift(
                 )
                 continue
             live, spelled = _live_table(model, dataset)
-            diffs[model.name] = diff_sql_table_model(
-                model=model, live_table=live, available_models_in_ds=names
-            )
+            with slayer_keywords():
+                diffs[model.name] = diff_sql_table_model(
+                    model=model, live_table=live, available_models_in_ds=names
+                )
             located[model.name] = (dataset.identifier, spelled)
 
         if not diffs:
             continue
-        drops = compute_datasource_drops(
-            models=[entry.model for entry in entries],
-            sql_table_diffs=diffs,
-            sql_diffs={},
-        )
+        with slayer_keywords():
+            drops = compute_datasource_drops(
+                models=[entry.model for entry in entries],
+                sql_table_diffs=diffs,
+                sql_diffs={},
+            )
         files = {entry.model.name: entry.file for entry in entries}
         models = {entry.model.name: entry.model for entry in entries}
         for drop in drops:

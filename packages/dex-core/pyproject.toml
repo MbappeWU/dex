@@ -26,6 +26,7 @@ keywords = [
   "redshift",
   "postgres",
   "clickhouse",
+  "trino",
   "metricflow",
   "ossie",
   "agent-skills",
@@ -134,6 +135,14 @@ clickhouse = [
   "dbt-clickhouse>=1.8",
   "exmergo-dex-core[sql]",
 ]
+# Like [clickhouse], the extra carries the dbt adapter so transform can build
+# against a Trino dev schema with one install. dbt-trino pins the same client
+# range, so the two always resolve to one trino package.
+trino = [
+  "trino>=0.336,<1",
+  "dbt-trino>=1.10",
+  "exmergo-dex-core[sql]",
+]
 # The local semantic-layer query backend (`explore semantic query --local`):
 # MetricFlow renders metric SQL via explain(), and dex executes it through its own
 # connector and cost guard. Just the metricflow library (not dbt-metricflow, whose
@@ -227,16 +236,26 @@ project-conformance = ["pytest>=8"]
 # an implementer runs the suite against their own backend without installing
 # MetricFlow or httpx to do it. Packaging tests hold that true for both.
 semantic-conformance = ["pytest>=8"]
+# The values-free conformance contract (`exmergo_dex_core.values_free_conformance`),
+# for a host that relies on values-free mode (#591) and wants to check the release
+# it pins rather than take the changelog's word for it. Named on the same rule as
+# the three above.
+#
+# Unlike them it needs a warehouse: the suite builds a small DuckDB file seeded with
+# sentinel values and runs real profiles and queries against it, because the
+# guarantee is about what comes back from a warehouse and cannot be checked
+# without one. So it self-references [duckdb], which brings the dialect engine too.
+values-free-conformance = ["pytest>=8", "exmergo-dex-core[duckdb]"]
 # One command for users who want every optional capability at once: every
 # connector, both semantic-layer backends, and clustering. Self-references the
 # other extras so their requirement lists stay defined in exactly one place, which
 # does mean this reference list is the part that rots, so a test asserts it covers
 # every extra. Excludes dev and storage-conformance, both contributor tooling rather
 # than a capability: nobody installing "everything dex can do" wants a test runner.
-# This is the heaviest install there is (seven dbt adapters, MetricFlow, and
+# This is the heaviest install there is (eight dbt adapters, MetricFlow, and
 # scikit-learn); the light default and the [duckdb] on-ramp are unchanged.
 all = [
-  "exmergo-dex-core[bigquery,clickhouse,cluster,databricks,duckdb,ossie,postgres,redshift,semantic,semantic-api,slayer,snowflake,sql]",
+  "exmergo-dex-core[bigquery,clickhouse,cluster,databricks,duckdb,ossie,postgres,redshift,semantic,semantic-api,slayer,snowflake,sql,trino]",
 ]
 # Contributor tooling, plus the optional libraries the suite exercises directly
 # (the clustering tests need scikit-learn, the firewall tests need the dialect
@@ -248,6 +267,7 @@ dev = ["ruff==0.15.19", "towncrier==26.9.0", "scikit-learn>=1.4", "exmergo-dex-c
 
 [project.urls]
 Homepage = "https://www.exmergo.com/dex"
+Documentation = "https://docs.exmergo.com/dex"
 Repository = "https://github.com/exmergo/dex"
 Changelog = "https://github.com/exmergo/dex/blob/main/CHANGELOG.md"
 Issues = "https://github.com/exmergo/dex/issues"
@@ -287,5 +307,7 @@ markers = [
   "redshift: Redshift-specific integration tests",
   "clickhouse: ClickHouse-specific integration tests",
   "clickhouse_cloud: narrow ClickHouse Cloud integration tests (protected credentials required)",
+  "trino: Trino-specific integration tests (the keyless local container)",
+  "trino_iceberg: narrow Trino integration tests against the Glue and S3 Iceberg catalog (protected credentials required)",
   "packaging: builds a wheel and runs against it in an isolated environment; slow, needs uv",
 ]

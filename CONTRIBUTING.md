@@ -298,6 +298,53 @@ so a continuity check reporting no gap has the window function wrong. Both
 failures are silent by nature: they produce a clean result rather than an
 error.
 
+## Live Trino integration tests
+
+The Trino suite lives in the same directory: connection discovery and the
+honest `session_read_only: false`, the cluster-seconds handshake priced from
+`EXPLAIN (TYPE IO)` with its `estimate_basis`, profiled fractions that must
+match DuckDB's on the same seed, the firewall in Trino's idioms (`CROSS JOIN
+UNNEST`, `json_parse`) and its refusals (partial names, table functions, time
+travel against real Iceberg history), the run-time and physical-bytes caps
+binding on a live server, a partial fetch cancelled server-side, `transform
+init` and a capped dbt build into the dev schema, an incremental model merging
+on Iceberg, and `maintain snapshot`, `check` and `reconcile` over drift made
+behind dex's back. It bills nothing and needs no account.
+
+The target is a container pair, Trino plus the Postgres database its keyless
+Iceberg catalog keeps table pointers in, hardened the same way as the Postgres
+and ClickHouse containers. One script seeds it, locally and in CI, through the
+`trino` CLI inside the container. File-based access control
+(`scripts/trino/rules.json`) gives `dex_ro` read-only access everywhere and
+`dbt_dev` writes to its dev schemas only, so the suite proves the server-side
+half of read-only as well as dex's own guard:
+
+```
+scripts/setup_trino_dev.sh
+DEX_TEST_TRINO_URL=http://dex_ro@127.0.0.1:8085 \
+    uv run pytest tests/integration -q -m trino
+scripts/setup_trino_dev.sh --down
+```
+
+### Narrow Trino Glue Iceberg tests
+
+`tests/integration/test_trino_iceberg.py` runs under the protected
+`trino-iceberg-integration` environment against an Iceberg catalog on AWS Glue
+and S3: real Parquet statistics in the estimate, Iceberg metadata tables and
+time travel refused, the source unwritable by either identity, and an
+incremental build into the dev database. CI reaches it through a GitHub OIDC
+role that trusts only that environment and may write only the dbt dev database,
+so no key is stored. `scripts/setup_trino_iceberg_ci.sh` provisions the bucket,
+the Glue databases, the role and the environment. Locally, `--aws` attaches the
+same catalog from the current AWS CLI session:
+
+```
+scripts/setup_trino_dev.sh --aws
+DEX_TEST_TRINO_URL=http://dex_ro@127.0.0.1:8085 \
+    DEX_TEST_TRINO_GLUE_SCHEMA=dex_ci \
+    uv run pytest tests/integration -q -m trino_iceberg
+```
+
 ## Agent evals (`evals/`)
 
 The Tier-2 agent-eval harness lives at the repo root in `evals/`, separate from
@@ -815,7 +862,7 @@ commit:
    scripts/prepare_release.sh <engine-version> <plugin-version>
    ```
 
-   It pins the three skill wrappers to the engine version, bumps the three plugin
+   It pins the three skill wrappers to the engine version, bumps the four plugin
    manifests, writes the release's section of `CHANGELOG.md` dated today in UTC,
    and deletes the fragments it collected. It stages nothing; every change is
    left in the working tree.

@@ -14,6 +14,9 @@
 --   - v_order_totals: a view (no stored rows)
 --   - events: ~100k rows via generate_series (sampling / statement_timeout target)
 --   - dbt_dev: the empty dev schema dbt builds into (never a source)
+--   - slayer.orders: six fixed rows a SLayer metric query is answered over
+--     (tests/integration/test_slayer_query.py), apart from app so the counts
+--     every other suite reads there stay put
 -- Roles:
 --   - dex_ro: the read-only role dex connects as (USAGE + SELECT on app only)
 --   - dbt_dev: reads app, writes only schema dbt_dev, statement_timeout pinned
@@ -22,9 +25,11 @@ BEGIN;
 
 DROP SCHEMA IF EXISTS app CASCADE;
 DROP SCHEMA IF EXISTS dbt_dev CASCADE;
+DROP SCHEMA IF EXISTS slayer CASCADE;
 
 CREATE SCHEMA app;
 CREATE SCHEMA dbt_dev;
+CREATE SCHEMA slayer;
 
 CREATE TYPE app.product_category AS ENUM ('electronics', 'grocery', 'apparel', 'home');
 CREATE TYPE app.order_status AS ENUM ('pending', 'paid', 'shipped', 'cancelled');
@@ -148,6 +153,23 @@ SELECT 1 + g % 500,
        now() - (g % 90) * interval '1 hour'
 FROM generate_series(1, 100000) AS g;
 
+-- Fixed rows, not generated ones, so a metric query has an answer to be held
+-- to. The `test` row is one the SLayer model's own filter excludes.
+CREATE TABLE slayer.orders (
+    order_id    integer PRIMARY KEY,
+    status      text NOT NULL,
+    amount      double precision NOT NULL,
+    ordered_at  timestamp NOT NULL
+);
+
+INSERT INTO slayer.orders (order_id, status, amount, ordered_at) VALUES
+    (1, 'paid', 10.0, '2026-01-03 10:00:00'),
+    (2, 'paid', 5.5, '2026-01-20 08:30:00'),
+    (3, 'open', 7.0, '2026-02-01 12:00:00'),
+    (4, 'paid', 2.5, '2026-02-14 09:15:00'),
+    (5, 'refunded', 4.0, '2026-03-09 17:45:00'),
+    (6, 'test', 1000.0, '2026-03-10 11:00:00');
+
 COMMIT;
 
 -- Roles (idempotent: created once per cluster, re-granted per seed run).
@@ -164,10 +186,12 @@ $$;
 
 GRANT CONNECT ON DATABASE dex_dogfood TO dex_ro, dbt_dev;
 
--- dex_ro: read the app schema, nothing else. No access to dbt_dev.
+-- dex_ro: read the app and slayer schemas, nothing else. No access to dbt_dev.
 GRANT USAGE ON SCHEMA app TO dex_ro;
 GRANT SELECT ON ALL TABLES IN SCHEMA app TO dex_ro;
 ALTER DEFAULT PRIVILEGES IN SCHEMA app GRANT SELECT ON TABLES TO dex_ro;
+GRANT USAGE ON SCHEMA slayer TO dex_ro;
+GRANT SELECT ON ALL TABLES IN SCHEMA slayer TO dex_ro;
 
 -- dbt_dev: read sources, write only the dev schema; server-side time cap.
 GRANT USAGE ON SCHEMA app TO dbt_dev;

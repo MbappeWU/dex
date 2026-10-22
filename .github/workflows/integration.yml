@@ -50,6 +50,14 @@ name: Integration
 #   ClickHouse Cloud job uses the protected clickhouse-cloud-integration
 #   environment, refuses on the UTC-day CHC threshold before any SQL connection
 #   wakes the service, and shares the same parameterized data fixture.
+#   Trino: no setup for the exhaustive suite. It runs against a container pair
+#   started by scripts/setup_trino_dev.sh (Trino plus the Postgres database its
+#   keyless Iceberg catalog keeps table pointers in): free, keyless, and
+#   fork-runnable, Iceberg included. A separate narrow trino_iceberg job reads
+#   the Glue and S3 Iceberg catalog under the protected
+#   trino-iceberg-integration environment, through an IAM role that trusts only
+#   that environment's OIDC tokens and may write only the dbt dev database
+#   (scripts/setup_trino_iceberg_ci.sh; a budget alert is the backstop).
 on:
   push:
     branches: [main]
@@ -61,6 +69,9 @@ on:
       - "scripts/setup_clickhouse_cloud_ci.sh"
       - "scripts/postgres_seed.sql"
       - "scripts/check_container_hardening.sh"
+      - "scripts/trino*"
+      - "scripts/trino/**"
+      - "scripts/setup_trino_iceberg_ci.sh"
       - ".github/workflows/integration.yml"
   schedule:
     - cron: "17 5 * * 1"
@@ -109,8 +120,10 @@ jobs:
       - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           enable-cache: true
-      - name: Sync (bigquery + duckdb + dev extras)
-        run: uv sync --extra bigquery --extra duckdb --extra dev
+      # [slayer] runs the governed SLayer query smoke (test_slayer_query.py),
+      # which skips itself without it.
+      - name: Sync (bigquery + duckdb + slayer + dev extras)
+        run: uv sync --extra bigquery --extra duckdb --extra slayer --extra dev
       - name: Live BigQuery integration suite
         run: uv run pytest tests/integration -q -m bigquery
 
@@ -154,8 +167,10 @@ jobs:
       - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           enable-cache: true
-      - name: Sync (snowflake + duckdb + dev extras)
-        run: uv sync --extra snowflake --extra duckdb --extra dev
+      # [slayer] runs the governed SLayer query smoke (test_slayer_query.py),
+      # which skips itself without it.
+      - name: Sync (snowflake + duckdb + slayer + dev extras)
+        run: uv sync --extra snowflake --extra duckdb --extra slayer --extra dev
       # Keyless: connect, explore, and the transform tests' own skip guard all
       # run on the workload identity above. The transform tests skip themselves
       # here (dbt cannot authenticate that way) and run in the next step.
@@ -302,8 +317,10 @@ jobs:
       - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           enable-cache: true
-      - name: Sync (redshift + duckdb + dev extras)
-        run: uv sync --extra redshift --extra duckdb --extra dev
+      # [slayer] runs the governed SLayer query smoke (test_slayer_query.py),
+      # which skips itself without it.
+      - name: Sync (redshift + duckdb + slayer + dev extras)
+        run: uv sync --extra redshift --extra duckdb --extra slayer --extra dev
       - name: Live Redshift integration suite
         run: >-
           uv run pytest tests/integration -q -m redshift
@@ -382,8 +399,8 @@ jobs:
       - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           enable-cache: true
-      - name: Sync (postgres + duckdb + dev extras)
-        run: uv sync --extra postgres --extra duckdb --extra dev
+      - name: Sync (postgres + duckdb + slayer + dev extras)
+        run: uv sync --extra postgres --extra duckdb --extra slayer --extra dev
       - name: Live Postgres integration suite
         run: uv run pytest tests/integration -q -m postgres
 
@@ -416,6 +433,87 @@ jobs:
         run: uv sync --extra clickhouse --extra duckdb --extra dev
       - name: Live ClickHouse integration suite
         run: uv run pytest tests/integration -q -m clickhouse
+
+  trino:
+    # No repository gate and no environment: the targets are containers this
+    # job starts, so there is nothing to authenticate against and nothing a
+    # fork could spend. The Iceberg catalog is keyless too (Parquet on the
+    # Trino container's file system, table pointers in a Postgres sidecar), so
+    # this one job covers the lakehouse path as well.
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: packages/dex-core
+    env:
+      DEX_TEST_TRINO_URL: http://dex_ro@127.0.0.1:8085
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # Not a `services:` container, for the ClickHouse job's reason: the seed
+      # goes through the trino CLI inside the container, so the job needs a
+      # container it can `docker exec` by name, and the pair has to share a
+      # network. Calling the dogfood script keeps the seeding path single.
+      - name: Start and seed Trino
+        working-directory: .
+        run: scripts/setup_trino_dev.sh
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          enable-cache: true
+      - name: Sync (trino + duckdb + dev extras)
+        run: uv sync --extra trino --extra duckdb --extra dev
+      - name: Live Trino integration suite
+        run: uv run pytest tests/integration -q -m trino
+
+  trino_iceberg:
+    # The narrow Glue and S3 suite. The same container pair as the job above,
+    # with the Glue catalog attached under a short-lived session from the OIDC
+    # role scripts/setup_trino_iceberg_ci.sh provisions: no key is stored, and
+    # the role can read the sources and write only the dbt dev database.
+    if: github.repository == 'exmergo/dex'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # Restricted to main by the environment's deployment branch policy, so a
+    # branch cannot assume the role.
+    environment: trino-iceberg-integration
+    permissions:
+      contents: read
+      id-token: write
+    defaults:
+      run:
+        working-directory: packages/dex-core
+    env:
+      DEX_TEST_TRINO_URL: http://dex_ro@127.0.0.1:8085
+      DEX_TEST_TRINO_GLUE_SCHEMA: ${{ vars.DEX_TEST_TRINO_GLUE_SCHEMA }}
+    steps:
+      # Fails rather than skips: a missing variable means the environment was
+      # never provisioned, and a green skip would hide that.
+      - name: Require the provisioned environment
+        working-directory: .
+        env:
+          ROLE_ARN: ${{ vars.DEX_TEST_TRINO_ROLE_ARN }}
+          REGION: ${{ vars.DEX_TEST_TRINO_REGION }}
+        run: |
+          for name in ROLE_ARN REGION DEX_TEST_TRINO_GLUE_SCHEMA; do
+            if [ -z "${!name}" ]; then
+              echo "::error::$name is not set; run scripts/setup_trino_iceberg_ci.sh"
+              exit 1
+            fi
+          done
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.DEX_TEST_TRINO_ROLE_ARN }}
+          aws-region: ${{ vars.DEX_TEST_TRINO_REGION }}
+      - name: Start and seed Trino with the Glue catalog
+        working-directory: .
+        run: scripts/setup_trino_dev.sh --aws
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          enable-cache: true
+      - name: Sync (trino + duckdb + dev extras)
+        run: uv sync --extra trino --extra duckdb --extra dev
+      - name: Live Trino Glue Iceberg suite
+        run: uv run pytest tests/integration -q -m trino_iceberg
 
   clickhouse_cloud:
     if: github.repository == 'exmergo/dex'

@@ -210,6 +210,17 @@ REFERENCE_PAGES: tuple[ReferencePage, ...] = (
         ),
     ),
     ReferencePage(
+        "trino.md",
+        "connectors/trino",
+        PageMeta(
+            "Trino connector",
+            "Connect dex to self-hosted Trino, Starburst Enterprise, or Trino on "
+            "EMR: three-part names, cluster-seconds priced from EXPLAIN, and "
+            "server-side caps.",
+            "Trino",
+        ),
+    ),
+    ReferencePage(
         "semantic-layer.md",
         "semantic-layers/overview",
         PageMeta(
@@ -261,6 +272,17 @@ REFERENCE_PAGES: tuple[ReferencePage, ...] = (
             "means, the blocking threshold, the query firewall rule, and how a "
             "human clears a flag.",
             "PII policy",
+        ),
+    ),
+    ReferencePage(
+        "values-free-mode.md",
+        "guardrails/values-free-mode",
+        PageMeta(
+            "Values-free mode",
+            "Explore a warehouse with no table value in any result: how a host "
+            "pins the mode, the aggregate-only query rule, code-only errors, and "
+            "the conformance suite.",
+            "Values-free mode",
         ),
     ),
     ReferencePage(
@@ -465,7 +487,13 @@ class _Slots:
         return f"\x00{len(self._values) - 1}\x01"
 
     def restore(self, text: str) -> str:
-        return re.sub(r"\x00(\d+)\x01", lambda m: self._values[int(m.group(1))], text)
+        # Repeated, because a held span can itself hold one: a link whose text
+        # is a code span is held with that code span's token inside it, and a
+        # single pass would leave the inner token in the page.
+        token = re.compile(r"\x00(\d+)\x01")
+        while token.search(text):
+            text = token.sub(lambda m: self._values[int(m.group(1))], text)
+        return text
 
 
 def _escape(text: str) -> str:
@@ -1034,6 +1062,23 @@ def _frontmatter(text: str) -> tuple[dict[str, Any], str, int]:
     return data, body, text.count("\n", 0, end + 5) + 1
 
 
+#: Appended to the title a shared link shows. The site's name is Exmergo, which
+#: Mintlify appends to the browser title; a link to a Dex page should also say
+#: which product it is about, and "dex" alone is a crowded word to search for.
+SOCIAL_TITLE_SUFFIX = " · Exmergo Dex"
+
+
+def _social_titles(page: Page) -> dict[str, str]:
+    """The `og:title` and `twitter:title` a shared link to this page shows.
+
+    A page's own frontmatter wins, so a hand-written page can still choose.
+    """
+
+    title = page.meta.get("title") or ""
+    social = "Exmergo Dex" if page.page == "index" else f"{title}{SOCIAL_TITLE_SUFFIX}"
+    return {key: page.meta.get(key, social) for key in ("og:title", "twitter:title")}
+
+
 def _render_page(meta: dict[str, Any], body: str) -> str:
     head = yaml.safe_dump(meta, sort_keys=False, allow_unicode=True, width=10_000)
     return f"---\n{head}---\n\n{body.rstrip()}\n"
@@ -1541,7 +1586,9 @@ class SiteBuilder:
         """Every text file the build emits, keyed by its path in the output."""
 
         files = {
-            f"{SECTION}/{page.page}.mdx": _render_page(page.meta, page.body)
+            f"{SECTION}/{page.page}.mdx": _render_page(
+                {**page.meta, **_social_titles(page)}, page.body
+            )
             for page in self.pages.values()
         }
         # The two files exmergo/docs's docs.json reads with `$ref`, so this
@@ -1566,6 +1613,18 @@ class SiteBuilder:
             for hit in check(text):
                 self.problems.append(
                     Problem(f"(built) {name}", hit[0], f"em-dash rule: {hit[2]!r}")
+                )
+            # Nothing a page should contain is a control character, and one
+            # renders as nothing at all, so a lost placeholder or stray byte
+            # would otherwise ship as silently missing text.
+            for match in re.finditer(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", text):
+                line = text.count("\n", 0, match.start()) + 1
+                self.problems.append(
+                    Problem(
+                        f"(built) {name}",
+                        line,
+                        f"contains the control character {match.group()!r}",
+                    )
                 )
             for pattern, why in LEAK_PATTERNS:
                 for match in pattern.finditer(text):

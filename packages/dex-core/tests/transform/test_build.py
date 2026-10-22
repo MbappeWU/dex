@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
+import yaml
 
 from exmergo_dex_core.cli import main
 from exmergo_dex_core.envelope import Paradigm
@@ -603,7 +604,11 @@ def test_confirmed_dev_build_runs_dbt_for_real(
         "outcome",
         "evidence",
         "verification",
+        # The assumptions the built models declare (#491); empty here, since the
+        # fixture project declares none.
+        "decisions",
     }
+    assert envelope["data"]["decisions"] == []
     # `success` is dbt's exit code; `outcome` is whether anything was validated,
     # and this run built real nodes against current artifacts.
     assert envelope["data"]["outcome"] == "validated"
@@ -919,6 +924,162 @@ def test_billed_build_unconfirmed_needs_confirmation_with_estimate(
     assert envelope["data"]["per_table_bytes"]["stg_customers"] == 5_000_000.0
 
 
+_WATERMARKED_EVENTS = (
+    "select * from `p`.`raw`.`events`\n"
+    "where event_date >= (select date_sub(max(event_date), interval 3 day) "
+    "from `p`.`dev`.`stg_events`)"
+)
+
+
+def _write_incremental_artifacts(project: Path) -> None:
+    """The compile artifacts of a build with one watermarked incremental model
+    beside a plain table, as `dbt compile` leaves them once the incremental
+    relation exists (so its `is_incremental()` branch is rendered)."""
+
+    nodes = {
+        "model.p.stg_events": {
+            "resource_type": "model",
+            "name": "stg_events",
+            "compiled_code": _WATERMARKED_EVENTS,
+            "config": {"materialized": "incremental"},
+        },
+        "model.p.dim_customers": {
+            "resource_type": "model",
+            "name": "dim_customers",
+            "compiled_code": "select * from `p`.`raw`.`customers`",
+            "config": {"materialized": "table"},
+        },
+    }
+    _write_manifest(project, nodes)
+    (project / "target" / "run_results.json").write_text(
+        json.dumps({"results": [{"unique_id": uid} for uid in nodes]}),
+        encoding="utf-8",
+    )
+
+
+def test_billed_build_marks_a_watermarked_incremental_line_an_upper_bound(
+    bigquery_project_dir: Path, tmp_path: Path, capsys, monkeypatch
+):
+    """Issue #323: a dry run cannot prune on a watermark computed by a subquery,
+    so the incremental line prices the whole history while the job bills the
+    window. The ask keeps the number and says which lines are upper bounds."""
+
+    from exmergo_dex_core.envelope import Paradigm
+
+    adapter = _install_fake_pricing(
+        monkeypatch,
+        connector="bigquery",
+        paradigm=Paradigm.BYTES_SCANNED,
+        estimate=7_000_000_000.0,
+        per_node={"stg_events": 6_000_000_000.0, "dim_customers": 1_000_000_000.0},
+        confirmed=False,
+        ceiling=10_000_000_000,
+    )
+    adapter.prunes_dynamic_bounds_at_run_time = True
+    _write_incremental_artifacts(bigquery_project_dir)
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "--connector",
+            "bigquery",
+            "transform",
+            "build",
+            "--target",
+            "dev",
+            "--budget",
+            "10000000000",
+        ],
+        capsys,
+    )
+    assert rc == 0
+    assert envelope["status"] == "needs_confirmation"
+    # The breakdown is unchanged: an upper bound is still what to reserve.
+    assert envelope["data"]["per_table_bytes"]["stg_events"] == 6_000_000_000.0
+    assert set(envelope["data"]["upper_bounds"]) == {"stg_events"}
+    assert "event_date" in envelope["data"]["upper_bounds"]["stg_events"]
+    note = next(n for n in envelope["data"]["notes"] if "upper bounds" in n)
+    assert "stg_events" in note and "6,000,000,000" in note
+    assert "dim_customers" not in note
+
+
+def test_over_ceiling_build_refusal_names_its_upper_bound_lines(
+    bigquery_project_dir: Path, tmp_path: Path, capsys, monkeypatch
+):
+    """The refusal is what an operator acts on, so it has to tell an
+    over-estimate from a genuinely expensive build (#323)."""
+
+    from exmergo_dex_core.envelope import Paradigm
+
+    adapter = _install_fake_pricing(
+        monkeypatch,
+        connector="bigquery",
+        paradigm=Paradigm.BYTES_SCANNED,
+        estimate=7_000_000_000.0,
+        per_node={"stg_events": 6_000_000_000.0, "dim_customers": 1_000_000_000.0},
+        confirmed=True,
+        ceiling=5_000_000_000,
+    )
+    adapter.prunes_dynamic_bounds_at_run_time = True
+    _write_incremental_artifacts(bigquery_project_dir)
+    _rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "--connector",
+            "bigquery",
+            "transform",
+            "build",
+            "--target",
+            "dev",
+            "--confirm",
+            "--budget",
+            "5000000000",
+        ],
+        capsys,
+    )
+    assert envelope["status"] == "error"
+    message = " ".join(str(e) for e in envelope["errors"])
+    assert "upper bounds" in message and "stg_events" in message
+
+
+def test_build_marks_no_upper_bound_where_the_estimator_prunes_dynamically(
+    bigquery_project_dir: Path, tmp_path: Path, capsys, monkeypatch
+):
+    """Only a connector that says its estimate cannot prune a dynamic bound gets
+    the label; elsewhere the same SQL carries no claim about its line."""
+
+    from exmergo_dex_core.envelope import Paradigm
+
+    _install_fake_pricing(
+        monkeypatch,
+        connector="bigquery",
+        paradigm=Paradigm.BYTES_SCANNED,
+        estimate=7_000_000_000.0,
+        per_node={"stg_events": 6_000_000_000.0, "dim_customers": 1_000_000_000.0},
+        confirmed=False,
+        ceiling=10_000_000_000,
+    )
+    _write_incremental_artifacts(bigquery_project_dir)
+    _rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "--connector",
+            "bigquery",
+            "transform",
+            "build",
+            "--target",
+            "dev",
+            "--budget",
+            "10000000000",
+        ],
+        capsys,
+    )
+    assert envelope["status"] == "needs_confirmation"
+    assert "upper_bounds" not in envelope["data"]
+
+
 def test_billed_build_surfaces_estimate_quality_on_compute_time(
     bigquery_project_dir: Path, tmp_path: Path, capsys, monkeypatch
 ):
@@ -1159,7 +1320,7 @@ def test_billed_build_sums_bytes_billed_into_the_ledger(
 
     from exmergo_dex_core.envelope import Paradigm
 
-    _install_fake_pricing(
+    adapter = _install_fake_pricing(
         monkeypatch,
         connector="bigquery",
         paradigm=Paradigm.BYTES_SCANNED,
@@ -1236,12 +1397,11 @@ def test_billed_build_sums_bytes_billed_into_the_ledger(
     # that refusal.
     assert entry["entry"] == "settlement"
     assert entry["estimate"] == envelope["cost"]["estimate"] == 5_000_000.0
-    # Issue #277: the whole row, not only the keys this test cares about. A build
-    # settles outside any gate, and the row it wrote used to say so by omission,
-    # carrying no `reservation_id` at all where every gate-written row carries
-    # one. A reader joining settlements on that key skipped or mis-joined every
-    # build, so the row now declares the absence instead of leaving it to be
-    # inferred, and pinning the shape here is what keeps the next writer honest.
+    # Issue #277 / #666: the whole row, not only the keys this test cares about.
+    # A build settles its dbt run outside the gate and stamps the gate's
+    # `reservation_id` when a gate exists (so a `--verify` build's dbt row and
+    # verification count rows join as one command in `settled_ratios`). Pinning
+    # the shape here is what keeps the next writer honest.
     assert set(entry) == {
         "at",
         "connector",
@@ -1253,7 +1413,7 @@ def test_billed_build_sums_bytes_billed_into_the_ledger(
         "job_id",
         "statement_sha256",
     }
-    assert entry["reservation_id"] is None
+    assert entry["reservation_id"] == adapter.cost_gate.reservation_id
 
 
 def test_a_billed_build_that_billed_nothing_still_reports_a_spend_of_zero(
@@ -1481,6 +1641,45 @@ def test_build_env_caps_clickhouse_statements_via_custom_settings(monkeypatch):
     assert _build_env("clickhouse", Paradigm.FREE_LOCAL, 120.0) is None
 
 
+def test_build_env_caps_trino_statements_via_session_properties(monkeypatch):
+    """dbt-trino sends the profile's session_properties with every statement, so
+    the ceiling becomes both caps in the units Trino's properties take. The
+    Postgres and ClickHouse tests above are the siblings that keep this from
+    passing by a dispatch table that hands every connector the same variables."""
+
+    from exmergo_dex_core.transform import init
+    from exmergo_dex_core.transform.build import (
+        _TRINO_SCAN_BYTES_PER_SECOND,
+        _build_env,
+    )
+
+    env = _build_env("trino", Paradigm.DB_LOAD, 120.0)
+    assert env is not None
+    assert env[init.TRINO_QUERY_MAX_RUN_TIME_ENV] == "120s"
+    assert env[init.TRINO_QUERY_MAX_SCAN_BYTES_ENV] == (
+        f"{120 * _TRINO_SCAN_BYTES_PER_SECOND}B"
+    )
+    assert init.CH_MAX_EXECUTION_TIME_ENV not in env or (
+        env[init.CH_MAX_EXECUTION_TIME_ENV]
+        == os.environ.get(init.CH_MAX_EXECUTION_TIME_ENV)
+    )
+    # A sub-second ceiling is floored to one second, never rendered as 0s,
+    # which Trino reads as "fail at once" rather than "unlimited".
+    assert (
+        _build_env("trino", Paradigm.DB_LOAD, 0.4)[init.TRINO_QUERY_MAX_RUN_TIME_ENV]
+        == "1s"
+    )
+    assert _build_env("trino", Paradigm.DB_LOAD, None) is None
+    assert _build_env("trino", Paradigm.FREE_LOCAL, 120.0) is None
+
+
+def test_the_trino_byte_cap_inverts_the_estimate_s_own_rate():
+    from exmergo_dex_core.adapters import trino as trino_adapter
+    from exmergo_dex_core.transform.build import _TRINO_SCAN_BYTES_PER_SECOND
+
+    assert _TRINO_SCAN_BYTES_PER_SECOND == trino_adapter._SCAN_BYTES_PER_SECOND
+
+
 def test_an_uncapped_db_load_connector_gets_no_cap_and_claims_none(monkeypatch):
     """The degradation and the non-degraded path, asserted together.
 
@@ -1505,9 +1704,107 @@ def test_an_uncapped_db_load_connector_gets_no_cap_and_claims_none(monkeypatch):
     )
     # And every connector that does register a mechanism has a note describing
     # it, so the pair can never drift into claiming a cap it did not inject.
+    from exmergo_dex_core.guards.execution import _BUDGET_CONTROLS
     from exmergo_dex_core.transform.build import _CAP_ENV_BUILDERS
 
     assert set(_CAP_ENV_BUILDERS) == set(_DB_LOAD_CAP_NOTES)
+    assert set(_CAP_ENV_BUILDERS) == set(_BUDGET_CONTROLS)
+
+
+def _cap_block(connector: str) -> dict:
+    """The profile block a dex-rendered profile carries the cap references in."""
+
+    from exmergo_dex_core.transform import init
+
+    return {
+        "clickhouse": {"custom_settings": init.clickhouse_custom_settings()},
+        "trino": {"session_properties": init.trino_session_properties()},
+    }[connector]
+
+
+def _write_cap_profile(project: Path, connector: str, *, with_caps: bool) -> None:
+    output = {"type": connector, "host": "localhost", "schema": "dbt_dev"}
+    if with_caps:
+        output.update(_cap_block(connector))
+    (project / "profiles.yml").write_text(
+        yaml.safe_dump({"proj": {"target": "dev", "outputs": {"dev": output}}}),
+        encoding="utf-8",
+    )
+
+
+@pytest.mark.parametrize("connector", ["clickhouse", "trino"])
+def test_the_cap_reader_the_dev_target_warning_and_the_build_note_agree(
+    connector: str, tmp_path: Path
+):
+    """One reader decides whether a build was capped, and every place that says
+    so asks it. The dev-target check used to warn that a hand-written ClickHouse
+    profile could not be capped while the build note, on the same run, said the
+    build had been: two answers to one question.
+
+    Both halves are asserted, so a reader that always found the references (or
+    never did) cannot pass by agreeing with itself."""
+
+    from exmergo_dex_core.config import DexConfig
+    from exmergo_dex_core.envelope import Cost
+    from exmergo_dex_core.storage.memory import MemoryStore
+    from exmergo_dex_core.transform.commands import (
+        _DB_LOAD_CAP_NOTES,
+        _UNCAPPED_BUILD_NOTE,
+        _shape_build_result,
+    )
+    from exmergo_dex_core.transform.dev_target import (
+        _assert_build_cap_reachable,
+        missing_cap_references,
+    )
+
+    summary = {
+        "target": "dev",
+        "success": True,
+        "returncode": 0,
+        "nodes": [],
+        "counts": {},
+        "messages": [],
+    }
+    config = DexConfig(connector=connector)
+    for with_caps in (True, False):
+        _write_cap_profile(tmp_path, connector, with_caps=with_caps)
+        missing = missing_cap_references(tmp_path, "dev", connector)
+        warnings = _assert_build_cap_reachable(tmp_path, "dev", config)
+        result = _shape_build_result(
+            dict(summary),
+            Cost(paradigm=Paradigm.DB_LOAD, estimate=None, ceiling=60.0),
+            Paradigm.DB_LOAD,
+            connector,
+            MemoryStore(),
+            uncapped=bool(missing),
+        )
+        notes = [*result.warnings, *result.data().get("notes", [])]
+        if with_caps:
+            assert missing == [] and warnings == []
+            assert _DB_LOAD_CAP_NOTES[connector] in notes
+            assert _UNCAPPED_BUILD_NOTE not in notes
+        else:
+            assert missing and warnings
+            assert _UNCAPPED_BUILD_NOTE in notes
+            assert _DB_LOAD_CAP_NOTES[connector] not in notes
+
+
+def test_a_connector_whose_cap_rides_the_environment_is_never_missing_references(
+    tmp_path: Path,
+):
+    """Postgres's cap is PGOPTIONS on the dbt subprocess, which no profile can
+    remove, so a profile without any cap block is still a capped build."""
+
+    from exmergo_dex_core.transform.dev_target import missing_cap_references
+
+    (tmp_path / "profiles.yml").write_text(
+        yaml.safe_dump(
+            {"p": {"target": "dev", "outputs": {"dev": {"type": "postgres"}}}}
+        ),
+        encoding="utf-8",
+    )
+    assert missing_cap_references(tmp_path, "dev", "postgres") == []
+    assert missing_cap_references(tmp_path, "dev", "some-future-db") == []
 
 
 def test_dev_target_check_runs_before_the_cost_gate(
@@ -1923,6 +2220,60 @@ def test_compile_estimate_prices_each_version_of_a_model_separately(
     assert per_node == {"dim_customers.v1": 10.0, "dim_customers.v2": 10.0}
     assert total == sum(per_node.values())
     assert build_mod.compiled_model_ids(dbt_project_dir) == set(nodes)
+
+
+def test_dynamic_bound_nodes_finds_an_incremental_watermark_and_nothing_else(
+    dbt_project_dir: Path,
+):
+    """Only an incremental model whose batch filter is bounded by a subquery is
+    an upper bound: a constant bound is pruned by the dry run itself, and a
+    subquery bound on a full rebuild prunes nothing either way."""
+
+    build_mod = importlib.import_module("exmergo_dex_core.transform.build")
+
+    def model(name, code, materialized):
+        return {
+            "resource_type": "model",
+            "name": name,
+            "compiled_code": code,
+            "config": {"materialized": materialized},
+        }
+
+    nodes = {
+        "model.p.watermarked": model("watermarked", _WATERMARKED_EVENTS, "incremental"),
+        # The watermark inside a CTE, as a staging model often writes it.
+        "model.p.cte_watermark": model(
+            "cte_watermark",
+            "with batch as (select * from `p`.`raw`.`events` e where e.loaded_at"
+            " > (select max(loaded_at) from `p`.`dev`.`cte_watermark`))"
+            " select * from batch",
+            "incremental",
+        ),
+        "model.p.constant_window": model(
+            "constant_window",
+            "select * from `p`.`raw`.`events` "
+            "where event_date >= date_sub(current_date(), interval 3 day)",
+            "incremental",
+        ),
+        "model.p.semi_join": model(
+            "semi_join",
+            "select * from `p`.`raw`.`events` where id in (select id from x)",
+            "incremental",
+        ),
+        "model.p.full_table": model("full_table", _WATERMARKED_EVENTS, "table"),
+        "model.p.unparseable": model(
+            "unparseable", "select from where (", "incremental"
+        ),
+    }
+    _write_manifest(dbt_project_dir, nodes)
+    (dbt_project_dir / "target" / "run_results.json").write_text(
+        json.dumps({"results": [{"unique_id": uid} for uid in nodes]}),
+        encoding="utf-8",
+    )
+    bounded = build_mod.dynamic_bound_nodes(dbt_project_dir, dialect="bigquery")
+    assert set(bounded) == {"watermarked", "cte_watermark"}
+    assert "event_date" in bounded["watermarked"]
+    assert "loaded_at" in bounded["cte_watermark"]
 
 
 def test_compile_estimate_skips_and_notes_unpriceable_nodes(
@@ -2676,8 +3027,16 @@ def test_a_verified_metered_build_reports_the_count_spend_beside_the_build(
     dbt bills outside the gate and the counts bill through it, so reporting
     dbt's figure alone would under-report the command. Under-reporting is the
     one direction a cost guard must never round.
+
+    Issue #666: both the dbt row and the verification count row carry the gate's
+    `reservation_id`, so `settled_ratios` folds them into one calibration point
+    against the combined estimate rather than splitting the command in two.
     """
 
+    from exmergo_dex_core.guards.cost_guard import settled_ratios
+    from exmergo_dex_core.storage import FilesystemStore
+
+    store = FilesystemStore(tmp_path)
     adapter = _install_fake_pricing(
         monkeypatch,
         connector="bigquery",
@@ -2686,6 +3045,7 @@ def test_a_verified_metered_build_reports_the_count_spend_beside_the_build(
         per_node={"fct_orders": 1000.0},
         confirmed=True,
         ceiling=1_000_000.0,
+        store=store,
         query_estimate=50_000.0,
         objects=[
             _Meta("dex-test.raw.orders", 1000),
@@ -2722,10 +3082,25 @@ def test_a_verified_metered_build_reports_the_count_spend_beside_the_build(
     assert len(adapter.queries) == 1, "the counts are one batched statement"
     # 3000 from dbt, 50000 from the count statement dex issued through the gate.
     assert envelope["data"]["spend"]["bytes_billed"] == 53_000.0
+    assert envelope["data"]["spend"]["session_spent_today"] == 53_000.0
     verification = envelope["data"]["verification"]
     assert verification["ran"] is True
     assert verification["scope"] == ["fct_orders"]
     assert [f["code"] for f in verification["findings"]] == ["row_loss"]
+
+    rows = [
+        json.loads(line)
+        for line in (tmp_path / ".dex" / "spend.jsonl").read_text().splitlines()
+    ]
+    settlements = [r for r in rows if r["entry"] == "settlement"]
+    assert len(settlements) == 2
+    assert [r["reservation_id"] for r in settlements] == [
+        adapter.cost_gate.reservation_id,
+        adapter.cost_gate.reservation_id,
+    ]
+    assert settled_ratios(rows, connector="bigquery", field="billed_bytes") == [
+        pytest.approx(53_000.0 / 51_000.0)
+    ]
 
 
 def test_a_verified_build_whose_dev_target_is_out_of_scope_says_so(
@@ -3110,12 +3485,15 @@ def test_a_snowflake_build_settled_without_the_uptime_model_says_it_is_a_floor()
         "elapsed_seconds": 4.0,
     }
     cost = Cost(paradigm=Paradigm.COMPUTE_TIME, estimate=None, ceiling=600.0)
+    store = MemoryStore()
     result = _shape_build_result(
-        summary, cost, Paradigm.COMPUTE_TIME, "snowflake", MemoryStore(), adapter=None
+        summary, cost, Paradigm.COMPUTE_TIME, "snowflake", store, adapter=None
     )
     assert result.spend["seconds_billed"] == pytest.approx(1.5)
     assert any("which is a lower bound" in w for w in result.warnings)
     assert "elapsed_seconds" not in result.data()
+    # Settled with no gate, so the row declares `reservation_id: null`.
+    assert store.spend_entries()[0]["reservation_id"] is None
 
 
 def _sf_build(repo: Path, capsys, *, confirm: bool = True):
@@ -3153,7 +3531,7 @@ def test_a_build_that_resumed_the_warehouse_settles_its_uptime(
     rows = [json.loads(line) for line in run.ledger.read_text().splitlines()]
     settlements = [r for r in rows if r["entry"] == "settlement"]
     assert len(settlements) == 1, "the uptime joins dbt's row, keeping one ratio"
-    assert settlements[0]["reservation_id"] is None
+    assert settlements[0]["reservation_id"] == rows[0]["reservation_id"]
     [note] = _uptime_notes(envelope)
     assert "This command resumed DEX_WH" in note
     assert "elapsed_seconds" not in envelope["data"]

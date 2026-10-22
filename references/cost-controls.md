@@ -62,6 +62,7 @@ bills nothing; `null` means no connector was resolved.
 | Redshift | `compute_time` | compute-seconds | [`redshift.md`](redshift.md) |
 | Postgres | `db_load` | database-seconds | [`postgres.md`](postgres.md) |
 | ClickHouse | `db_load`, or `compute_time` on Cloud | database-seconds | [`clickhouse.md`](clickhouse.md) |
+| Trino | `db_load` (self-hosted; Galaxy is refused) | cluster-seconds | [`trino.md`](trino.md) |
 | DuckDB | `free_local` | nothing to confirm | [`duckdb.md`](duckdb.md) |
 | dbt Cloud Semantic Layer | `hosted` | no ceiling possible | see below |
 
@@ -107,7 +108,7 @@ parses to a stable schema and no reader has to interpret an absent key.
 | `connector` | the connector that billed. Several can share one file, so filter on it before summing |
 | `command` | the command that wrote the row |
 | `entry` | the kind: `reservation`, `settlement` or `release`, and nothing else |
-| `reservation_id` | ties one command's rows together. `null` on a `transform build` settlement, which settles outside any gate because dbt runs the statements |
+| `reservation_id` | ties one command's rows together. `null` on a `transform build` settlement that settled with no gate (pricing degraded before a connection opened) |
 | `billed_bytes` or `billed_seconds` | the magnitude, in the connector's unit. Signed |
 | `estimate` | the whole-command preflight figure the settlement was admitted on. `null` on the other two kinds, and on a settlement whose pricing degraded to no estimate at all |
 | `job_id` | the warehouse's identifier for the job, where it has one |
@@ -152,6 +153,31 @@ can see:
   exactly settled spend.
 - A command killed outright leaves its estimate booked until the UTC rollover.
   Every softer exit, including an interrupt, releases.
+
+What the day is charged is what commands billed: a settlement replaces the
+booked estimate. What a new command is admitted on is its estimate, and on a
+partitioned or clustered warehouse a dry run is an upper bound, so a raw
+comparison refuses the last command of a working day against headroom real
+spending never touched. So the cumulative ceiling compares a **calibrated**
+estimate: the estimate times the worst billed-over-estimated ratio among this
+connector's last settled commands (the same history the over-ceiling refusal
+quotes). In the case that motivated it, a build billed 3.45 GB of a 6.70 GB
+estimate, and the 8.69 GB re-map that had to follow it on the same day is now
+admitted against the 6.55 GB left, because history says it bills about 59% of
+its estimate. The rest is unchanged by design:
+
+- `--budget` still meets the raw estimate: it is the per-command handshake the
+  caller confirmed.
+- `cost.ceiling` and the cap the warehouse is handed are still the real
+  remainder, so a command whose bill comes in above its calibrated estimate
+  stops at the day's ceiling server-side rather than overspending it.
+- The booking is still the raw estimate, so a concurrent command reads the
+  conservative figure.
+- Calibration only loosens the check. With fewer than three settled commands on
+  this connector, a worst ratio at or above 100%, or a ratio of 0 (every recent
+  command billed nothing), the raw estimate is compared as before.
+
+A command admitted only because of calibration says so in `warnings`.
 
 Unlike `budget.ceiling`, a missing `budget.session_ceiling` only warns, because
 refusing would break every project that never set one. Config is read from

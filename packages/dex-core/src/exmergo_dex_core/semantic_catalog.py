@@ -300,7 +300,20 @@ class SemanticCatalogView:
     profiled column, which makes that resolution the project format's job rather
     than something a query backend re-derives. A token whose reference is a
     computed expression is absent rather than guessed, because guessing a column
-    out of an expression makes the gate over-claim.
+    out of an expression makes the gate over-claim. The relation may be partially
+    qualified where the format names one only partially (a SLayer ``sql_table``
+    such as ``main.orders``): the gate resolves it against the cache by suffix,
+    so it belongs here even where the catalog's own ``relation`` stays empty.
+
+    ``computed_columns`` is the other half of that resolution, for the tokens
+    ``physical_columns`` leaves out: ``token -> (relation, expression)`` for an
+    element defined as an expression over its model's columns. It is never
+    serialized either. The gate parses the expression and screens the columns it
+    reads, because a computed dimension over a flagged column with a neutral name
+    (``upper(email)`` named ``contact_key``) would otherwise pass on that name,
+    and refuses one it cannot parse. It is not a column guessed out of an
+    expression: the gate screens every column the expression reads and reports
+    them as what was read, never as the column behind the element.
 
     ``notes`` is how a format says what it could not supply, the way
     ``ProjectDefinitions.notes`` and ``SemanticLayer.notes`` do.
@@ -314,6 +327,7 @@ class SemanticCatalogView:
     dimension_scope: str = DIMENSIONS_PER_DECLARATION
     notes: list[str] = field(default_factory=list)
     physical_columns: dict[str, tuple[str, str]] = field(default_factory=dict)
+    computed_columns: dict[str, tuple[str, str]] = field(default_factory=dict)
 
     def narrowed_to(self, metrics: list[str]) -> tuple[SemanticCatalogView, list[str]]:
         """This catalog narrowed to the metrics named, as ``(catalog, unknown)``.
@@ -698,3 +712,66 @@ def qualified_dimension(entity: str | None, name: str) -> str:
     """
 
     return f"{entity}__{name}" if entity else name
+
+
+def time_axis_tokens(view: SemanticCatalogView, metrics: list[str]) -> list[str] | None:
+    """The dimension tokens a time grouping on these metrics actually buckets.
+
+    A layer's time token (MetricFlow's ``metric_time``, or a SLayer ``--grain``)
+    is one name over many columns: it resolves per measure to that measure's agg
+    time dimension, on the measure's own semantic model. So a query grouped by it
+    projects those columns as surely as one grouped by their own tokens, and this
+    is those tokens, the same ones a caller would name to group by the same
+    columns, so the PII gate can screen them as it screens a grouped dimension.
+
+    Read through ``input_measures`` where the layer reports them. A layer that
+    declares no measures (SLayer) states the axis on the metric, over the one
+    semantic model it is queried from, and that is read instead.
+
+    None where any part of the answer is unknown (a metric, measure, model or
+    declaration the view cannot place), never a partial list: a ratio whose one
+    side resolves would otherwise read as fully screened. A None leaves the time
+    token on the name heuristic, and the result says so.
+    """
+
+    by_metric = {metric.name: metric for metric in view.metrics}
+    by_measure = {measure.name: measure for measure in view.measures}
+    by_model = {model.name: model for model in view.semantic_models}
+
+    def declaration(model_name: str | None, definition: str | None) -> str | None:
+        model = by_model.get(model_name or "")
+        if model is None or not definition:
+            return None
+        own = qualified_dimension(model.primary_entity, definition)
+        candidates = [
+            row.name
+            for row in view.dimensions
+            if row.semantic_model == model.name and row.definition == definition
+        ]
+        if own in candidates:
+            return own
+        return candidates[0] if candidates else None
+
+    tokens: list[str] = []
+    for name in metrics:
+        metric = by_metric.get(name)
+        if metric is None:
+            return None
+        if metric.input_measures:
+            axes = []
+            for measure_name in metric.input_measures:
+                measure = by_measure.get(measure_name)
+                if measure is None:
+                    return None
+                axes.append((measure.semantic_model, measure.agg_time_dimension))
+        elif metric.time_axis and len(metric.semantic_models or ()) == 1:
+            owner = (metric.semantic_models or [None])[0]
+            axes = [(owner, axis) for axis in metric.time_axis]
+        else:
+            return None
+        for model_name, definition in axes:
+            token = declaration(model_name, definition)
+            if token is None:
+                return None
+            tokens.append(token)
+    return list(dict.fromkeys(tokens)) or None

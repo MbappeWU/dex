@@ -95,6 +95,9 @@ def _scan_resolver(sql: str):
         values[f"mn_{i}"] = 1
         values[f"mx_{i}"] = 100
         values[f"d_{i}"] = 100 if i == 0 else 40
+        # The same counts under the aliases a batched drift probe reads (#275).
+        values[f"kd_{i}"] = values[f"d_{i}"]
+        values[f"cd_{i}"] = values[f"d_{i}"]
     values["nonnull_fk"] = 100
     values["orphans"] = 0
     return [values]

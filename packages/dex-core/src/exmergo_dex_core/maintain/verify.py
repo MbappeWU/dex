@@ -1192,6 +1192,7 @@ def row_population_plan(
 
     checks: list[RowPopulationCheck] = []
     notes: list[str] = []
+    uncompiled: list[str] = []
     informational: list[str] = []
     incremental: list[str] = []
     generated: list[str] = []
@@ -1203,15 +1204,14 @@ def row_population_plan(
         code = node.get("compiled_code")
         if not (isinstance(node.get("name"), str) and node["name"]):
             continue
-        if scope is not None and uid not in scope:
-            continue
         name = manifest_node_label(uid, node)
+        if scope is not None and uid not in scope and name.lower() not in scope:
+            continue
         # An ephemeral model compiles with no relation of its own and is inlined
         # into whatever reads it, so it has no row count to compare; a model
-        # with no compiled SQL was never compiled and says nothing either.
+        # with no compiled SQL was never compiled, so it is collected for the
+        # note rather than checked.
         if not (isinstance(relation, str) and relation):
-            continue
-        if not (isinstance(code, str) and code.strip()):
             continue
         config = node.get("config")
         materialized = (
@@ -1219,6 +1219,11 @@ def row_population_plan(
             if isinstance(config, dict)
             else ""
         )
+        if materialized == "ephemeral":
+            continue
+        if not (isinstance(code, str) and code.strip()):
+            uncompiled.append(name)
+            continue
         if materialized in _UNCOMPARABLE_MATERIALIZATIONS:
             incremental.append(name)
             continue
@@ -1265,6 +1270,11 @@ def row_population_plan(
             )
         )
 
+    if uncompiled:
+        notes.append(
+            f"no compiled SQL found for {', '.join(sorted(uncompiled))}; "
+            "run `dbt compile` or `dbt build` for row-population findings"
+        )
     if incremental:
         notes.append(
             f"row population was not compared for {', '.join(sorted(incremental))}: "

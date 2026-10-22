@@ -142,6 +142,11 @@ class LocalOssieLayer:
             "catalog; profile that relation instead"
         )
 
+    def time_axis_refs(self, _metrics: list[str]) -> list[str] | None:
+        """None: Ossie defines no query runtime, so no time token to resolve."""
+
+        return None
+
     def filter_refs(self, _clauses: list[str]) -> list[str] | None:
         """No filter dialect to read, because there is no query to filter.
 

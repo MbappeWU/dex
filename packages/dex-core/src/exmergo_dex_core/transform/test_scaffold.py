@@ -22,6 +22,7 @@ from __future__ import annotations
 from typing import NamedTuple
 
 import sqlglot
+import yaml
 from sqlglot import exp
 
 from ..cache import DexCache, match_identifier
@@ -68,6 +69,7 @@ def unit_test_scaffold_edits(
             f"'{model_name}' has no ref()/source() inputs; there is nothing "
             "to scaffold a fixture from"
         )
+    cache = _pinned_to_sources(cache, view, sql)
 
     try:
         rendered = render_model_sql(sql, naming_resolver)
@@ -109,6 +111,71 @@ def unit_test_scaffold_edits(
 
 
 # --- model + input discovery ---------------------------------------------------
+
+
+def _pinned_to_sources(
+    cache: DexCache | None, view: DbtProjectView, sql: str
+) -> DexCache | None:
+    """The cache, with each ``source()`` input narrowed to the relation its
+    declaration names.
+
+    Inputs are looked up by bare table name, which is ambiguous wherever two
+    cached relations share one: two schemas, or on Trino two catalogs. A
+    source declares exactly which relation it is, so where that relation is
+    cached, every other dataset sharing its table name is dropped from the
+    lookup. A source whose relation is not cached is left to the name lookup,
+    which refuses with the fix as before.
+    """
+
+    if cache is None:
+        return None
+    declared = _declared_source_relations(view)
+    known = {d.identifier.lower() for d in cache.datasets}
+    pinned: dict[str, str] = {}
+    for match in SOURCE_PATTERN.finditer(sql):
+        relation = declared.get((match.group(1), match.group(2)))
+        if relation is not None and relation.lower() in known:
+            pinned[match.group(2).lower()] = relation.lower()
+    if not pinned:
+        return cache
+    kept = [
+        d
+        for d in cache.datasets
+        if pinned.get(d.identifier.rsplit(".", 1)[-1].lower(), d.identifier.lower())
+        == d.identifier.lower()
+    ]
+    return cache.model_copy(update={"datasets": kept})
+
+
+def _declared_source_relations(view: DbtProjectView) -> dict[tuple[str, str], str]:
+    """``(source, table)`` -> the dotted relation it declares, for every source
+    the project's YAML declares. dbt's own defaults apply: ``schema`` is the
+    source's name when unset, and a table's ``identifier`` overrides its name.
+    A file that does not parse declares nothing here."""
+
+    relations: dict[tuple[str, str], str] = {}
+    for path, file in view.files.items():
+        if not path.endswith((".yml", ".yaml")) or "sources:" not in file.content:
+            continue
+        try:
+            doc = yaml.safe_load(file.content) or {}
+        except yaml.YAMLError:
+            continue
+        for source in doc.get("sources") or [] if isinstance(doc, dict) else []:
+            if not isinstance(source, dict) or not source.get("name"):
+                continue
+            name = str(source["name"])
+            schema = str(source.get("schema") or name)
+            database = source.get("database")
+            for table in source.get("tables") or []:
+                if not isinstance(table, dict) or not table.get("name"):
+                    continue
+                identifier = str(table.get("identifier") or table["name"])
+                parts = [str(database)] if database else []
+                relations[(name, str(table["name"]))] = ".".join(
+                    [*parts, schema, identifier]
+                )
+    return relations
 
 
 def _find_inputs(sql: str) -> list[ModelInput]:

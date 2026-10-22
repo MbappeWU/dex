@@ -31,6 +31,10 @@ from .guards.cost_guard import (
 from .results import ConfirmationRequest, Result
 from .storage import DEX_DIR
 
+#: How many upper-bound lines the note names before counting the rest; the
+#: structured `upper_bounds` key carries every one.
+_UPPER_BOUND_LINES_SHOWN = 10
+
 
 def resolve_dex_root(start: Path) -> Path | None:
     """Nearest ancestor of ``start`` holding a ``.dex/config.yml``, or None.
@@ -176,6 +180,37 @@ def session_ceiling_ask(
     return data
 
 
+def upper_bound_notes(
+    upper_bounds: dict[str, str] | None, per_table: dict[str, float] | None
+) -> list[str]:
+    """One sentence naming the estimate's lines that are upper bounds, or none.
+
+    A line priced as though its filter pruned nothing is still the right number
+    to reserve against, since the job can bill no more than it; what it cannot
+    be is read as what the job will bill. The sentence says how much of the
+    estimate those lines are, so an operator can discount them deliberately
+    rather than guess at an over-estimate (issue #323).
+    """
+
+    if not upper_bounds:
+        return []
+    lines = sorted(upper_bounds)
+    amount = sum((per_table or {}).get(line, 0.0) for line in lines)
+    shown = ", ".join(lines[:_UPPER_BOUND_LINES_SHOWN])
+    more = (
+        f", and {len(lines) - _UPPER_BOUND_LINES_SHOWN} more"
+        if len(lines) > _UPPER_BOUND_LINES_SHOWN
+        else ""
+    )
+    return [
+        f"{len(lines)} line(s) of this estimate, {amount:,.0f} in all, are upper "
+        f"bounds rather than measurements ({shown}{more}): each one's incremental "
+        "batch filter is bounded by a subquery the dry run cannot prune on, and "
+        "the warehouse prunes it when the job runs, so these lines will likely "
+        "bill less"
+    ]
+
+
 def billed_handshake(
     command: str,
     adapter: Adapter,
@@ -184,6 +219,7 @@ def billed_handshake(
     per_table: dict[str, float] | None = None,
     notes: list[str] | None = None,
     axes: list[str] | None = None,
+    upper_bounds: dict[str, str] | None = None,
 ) -> None:
     """The cost-before-spend handshake on billed connectors.
 
@@ -197,6 +233,12 @@ def billed_handshake(
 
     Free connectors have no gate, so this is a no-op on them and their commands
     stay confirmation-free.
+
+    ``upper_bounds`` names the lines of ``per_table`` the estimator priced as
+    though nothing pruned them, with why (issue #323). Both the ask and the
+    over-ceiling refusal carry them, because the refusal is the message an
+    operator acts on, and without them a build refused on an estimate it would
+    never bill reads as a genuinely expensive one.
     """
 
     gate = cost_gate(adapter)
@@ -229,9 +271,15 @@ def billed_handshake(
         # the two apart is to reconstruct the split from the spend ledger
         # afterwards (issue #299). Re-raised rather than mutated so the
         # exception stays a plain immutable refusal, carrying the same cost.
-        if reserve is None:
+        explained = [
+            *([reserve["note"]] if reserve is not None else []),
+            *upper_bound_notes(upper_bounds, per_table),
+        ]
+        if not explained:
             raise
-        raise OverCeilingError(f"{exc}. {reserve['note']}", cost=exc.cost) from exc
+        raise OverCeilingError(
+            ". ".join([str(exc), *explained]), cost=exc.cost
+        ) from exc
     except ConfirmationRequiredError as exc:
         # The payload speaks the connector's unit. An adapter that knows more
         # than the raw magnitude (Snowflake's credit translation, its
@@ -266,6 +314,14 @@ def billed_handshake(
             data["reserved_bytes"] = reserve["reserved_bytes"]
             data["reserved_queries"] = reserve["reserved_queries"]
             data["notes"] = [*data.get("notes", []), reserve["note"]]
+        if upper_bounds:
+            # Keyed like `per_table_bytes`, so a host can discount exactly those
+            # lines without parsing the note that explains them.
+            data["upper_bounds"] = dict(upper_bounds)
+            data["notes"] = [
+                *data.get("notes", []),
+                *upper_bound_notes(upper_bounds, per_table),
+            ]
         if axes:
             # What the estimate would add. Load-bearing for an offer, whose
             # envelope reports `ok`: without it, an axis that did not run is

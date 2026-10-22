@@ -1688,6 +1688,11 @@ def semantic_catalog(
     # gets. Without it the PII gate would fall back to the name heuristic on every
     # token the join resolution added, which is the weaker screening.
     columns_by_definition: dict[tuple[str, str], tuple[str, str]] = {}
+    # The same, for a declaration defined as an expression: (relation, expression),
+    # which the gate parses for the columns it reads rather than screening the
+    # element's name alone.
+    computed: dict[str, tuple[str, str]] = {}
+    expressions_by_definition: dict[tuple[str, str], tuple[str, str]] = {}
     # (semantic model, bare dimension name) -> what the project says about it and
     # which column it sits on, so a path that reaches a declaration carries the
     # same words and the same physical column the declaration does. The hosted API
@@ -1813,10 +1818,19 @@ def semantic_catalog(
             for element in [*(entry.get("dimensions") or []), *declared_entities]:
                 column = physical_column(element)
                 name = element.get("name") if isinstance(element, dict) else None
-                if not column or not isinstance(name, str):
+                if not isinstance(name, str):
+                    continue
+                tokens = {name, qualified_dimension(primary, name)}
+                if not column:
+                    expression = element.get("expr")
+                    if isinstance(expression, str) and expression.strip():
+                        target = (relation, expression)
+                        expressions_by_definition[(model_name, name)] = target
+                        for token in tokens:
+                            computed.setdefault(token, target)
                     continue
                 columns_by_definition[(model_name, name)] = (relation, column)
-                for token in {name, qualified_dimension(primary, name)}:
+                for token in tokens:
                     physical.setdefault(token, (relation, column))
 
         models.append(
@@ -1861,6 +1875,9 @@ def semantic_catalog(
             column = columns_by_definition.get(declaration)
             if column is not None:
                 physical.setdefault(path.token, column)
+            expression = expressions_by_definition.get(declaration)
+            if expression is not None:
+                computed.setdefault(path.token, expression)
 
     index = _LayerIndex(
         measure_owner=measure_owner,
@@ -1907,6 +1924,11 @@ def semantic_catalog(
         ),
         notes=_catalog_notes(metrics),
         physical_columns=physical,
+        # A token both maps resolve belongs to the column, which is the stronger
+        # evidence: a bare name two models share can be a column on one of them.
+        computed_columns={
+            token: target for token, target in computed.items() if token not in physical
+        },
     )
 
 

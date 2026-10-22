@@ -32,9 +32,11 @@ from .base import (
     ColumnMeta,
     ObjectMeta,
     QueryResult,
+    TableProbe,
     ValueDomainSample,
     affordable_combinations,
     blame,
+    distinct_combination_parts,
     distinct_combination_sql,
     is_blob_type,
     is_integer_type,
@@ -173,6 +175,11 @@ class BigQueryAdapter:
     # A dry run is what the job will bill, not a model of it, so this is the
     # one connector whose estimate is exact.
     estimate_quality = EstimateQuality.EXACT
+    # Exact, except where a predicate's bound is computed by a subquery: a dry
+    # run prunes partitions only on constant predicates, and the job prunes on
+    # the subquery's result when it runs. An incremental model's watermark is
+    # that shape, so `transform build` marks its line an upper bound (#323).
+    prunes_dynamic_bounds_at_run_time = True
 
     def __init__(
         self,
@@ -578,11 +585,17 @@ class BigQueryAdapter:
                 # An unqueryable shape discovered only at query time (for
                 # example an external table whose source is unreadable):
                 # degrade to metadata-only rather than failing the profile.
+                # The note names BigQuery's structured reason and never its
+                # message: notes are cached and copied into `explore map`, and
+                # a server message can quote the value it failed on (#591).
+                reason = _bad_request_reason(exc)
                 self._note(
                     identifier,
-                    f"aggregate profiling failed and was skipped: {exc.message}"
-                    if hasattr(exc, "message")
-                    else "aggregate profiling failed and was skipped",
+                    "aggregate profiling failed and was skipped (BigQuery "
+                    f"refused the batch: {reason})"
+                    if reason
+                    else "aggregate profiling failed and was skipped (BigQuery "
+                    "refused the batch)",
                 )
                 results.extend(self._empty_aggregate(col) for col in batch)
                 continue
@@ -606,14 +619,9 @@ class BigQueryAdapter:
         return bool(getattr(table, "require_partition_filter", False))
 
     def _sample_percent(self, identifier: str) -> float | None:
-        threshold = self.target.max_full_profile_bytes
-        if threshold is None:
+        percent = self._sampled_percent(identifier)
+        if percent is None:
             return None
-        table = self._get_table(identifier)
-        num_bytes = getattr(table, "num_bytes", None)
-        if not num_bytes or num_bytes <= threshold:
-            return None
-        percent = max(round(100.0 * threshold / num_bytes, 2), 0.01)
         self._note(
             identifier,
             f"profiled from a ~{percent}% block sample (table exceeds "
@@ -621,6 +629,20 @@ class BigQueryAdapter:
             "approximate and uniqueness is not judged",
         )
         return percent
+
+    def _sampled_percent(self, identifier: str) -> float | None:
+        """The block-sample percentage a profile of ``identifier`` would read,
+        or ``None`` for a full scan. Pure: :meth:`_sample_percent` is the one
+        that notes the sampling, because only a scan that samples should say so."""
+
+        threshold = self.target.max_full_profile_bytes
+        if threshold is None:
+            return None
+        table = self._get_table(identifier)
+        num_bytes = getattr(table, "num_bytes", None)
+        if not num_bytes or num_bytes <= threshold:
+            return None
+        return max(round(100.0 * threshold / num_bytes, 2), 0.01)
 
     @staticmethod
     def _empty_aggregate(col: ColumnMeta) -> ColumnAggregate:
@@ -644,6 +666,7 @@ class BigQueryAdapter:
         temporal_req: set[str],
         *,
         sample_percent: float | None = None,
+        extra_parts: list[str] | None = None,
     ) -> tuple[
         str, list[tuple[int, ColumnMeta, bool, bool, bool, bool, bool, bool, bool]]
     ]:
@@ -729,6 +752,9 @@ class BigQueryAdapter:
                     wants_temporal,
                 )
             )
+        # Further aggregates over the same scan, for a caller folding its own
+        # probes into this statement (`table_probe`); aliased by that caller.
+        select_parts.extend(extra_parts or [])
         # Interpolated parts are quoted identifiers and fixed aggregate
         # keywords, never values; the result is guarded as a read-only SELECT.
         sql = f"SELECT {', '.join(select_parts)} FROM {source}"  # noqa: S608
@@ -871,6 +897,129 @@ class BigQueryAdapter:
         _job, iterator = self._run(sql, floored)
         rows = list(iterator)
         return {tuple(combo): int(rows[0][f"d_{i}"]) for i, combo in enumerate(probed)}
+
+    def table_probe_sql(
+        self,
+        identifier: str,
+        *,
+        distinct: list[str],
+        combinations: list[list[str]],
+        null_columns: list[ColumnMeta],
+    ) -> str | None:
+        """The one statement :meth:`table_probe` runs, for pricing it.
+
+        ``None`` where one statement cannot stand in for the separate probes: a
+        table that requires a partition filter (every probe skips it), or a null
+        survey over a table large enough to be block-sampled, since the survey
+        would read the sample and the distinct counts must read every row.
+        """
+
+        if self._unqueryable(identifier):
+            return None
+        if null_columns and self._sampled_percent(identifier) is not None:
+            return None
+        sql, _plan = self._table_probe_statement(
+            identifier, distinct, combinations, null_columns
+        )
+        return sql
+
+    def table_probe(
+        self,
+        identifier: str,
+        *,
+        distinct: list[str],
+        combinations: list[list[str]],
+        null_columns: list[ColumnMeta],
+    ) -> TableProbe | None:
+        """:meth:`exact_distinct_counts`, :meth:`distinct_combination_counts`
+        and an unsampled :meth:`column_aggregates` null survey over one table,
+        as one billed statement (#275).
+
+        BigQuery bills its minimum per statement and per table a statement
+        references, so the separate probes paid it once each on the same
+        table, and on the small tables a drift sweep mostly reads that minimum
+        is nearly the whole bill. One statement referencing the table pays it
+        once and scans no column the separate probes would not have.
+
+        ``None`` hands every probe back to the caller to issue separately, as
+        before, which keeps their own degradation: a statement BigQuery will
+        not plan, and a remaining budget that cannot cover the combined scan,
+        both fall back, where each probe skips, narrows or refuses on its own
+        terms and leaves its own note.
+
+        Unlike :meth:`column_aggregates` this records no exact row count: the
+        caller re-reads each table's metadata after its probes, and what it
+        reads there must be what it read when the probes were separate.
+        """
+
+        if (
+            self.table_probe_sql(
+                identifier,
+                distinct=distinct,
+                combinations=combinations,
+                null_columns=null_columns,
+            )
+            is None
+        ):
+            return None
+        sql, plan = self._table_probe_statement(
+            identifier, distinct, combinations, null_columns
+        )
+        try:
+            floored = max(self._dry_run(sql), float(_MIN_BILLED_BYTES))
+        except self._api_exceptions.BadRequest:
+            return None
+        if not self.cost_gate.try_charge(floored):
+            return None
+        _job, iterator = self._run(sql, floored)
+        rows = list(iterator)
+        row = rows[0]
+        return TableProbe(
+            distinct={name: int(row[f"kd_{i}"]) for i, name in enumerate(distinct)},
+            combinations={
+                tuple(combo): int(row[f"cd_{i}"])
+                for i, combo in enumerate(combinations)
+            },
+            aggregates=(
+                self._read_aggregates(row, plan, sampled=False)
+                if null_columns
+                else None
+            ),
+        )
+
+    def _table_probe_statement(
+        self,
+        identifier: str,
+        distinct: list[str],
+        combinations: list[list[str]],
+        null_columns: list[ColumnMeta],
+    ) -> tuple[
+        str, list[tuple[int, ColumnMeta, bool, bool, bool, bool, bool, bool, bool]]
+    ]:
+        # The exact distincts ride the null survey's own aggregate, so a key
+        # column is read once; each combination is a scalar subquery over the
+        # one-row result, the shape `distinct_combination_sql` already uses.
+        aggregate, plan = self._build_aggregate_sql(
+            identifier,
+            null_columns,
+            set(),
+            set(),
+            set(),
+            set(),
+            set(),
+            extra_parts=[
+                f"COUNT(DISTINCT {_quote_ident(name)}) AS kd_{i}"
+                for i, name in enumerate(distinct)
+            ],
+        )
+        parts = [
+            "a.*",
+            *distinct_combination_parts(
+                self._quote(identifier), combinations, _quote_ident, alias="cd"
+            ),
+        ]
+        sql = f"SELECT {', '.join(parts)} FROM ({aggregate}) AS a"  # noqa: S608
+        return assert_select_only(sql, dialect=self.dialect), plan
 
     def value_domain_counts(
         self, identifier: str, columns: list[str], *, limit: int
@@ -1384,3 +1533,18 @@ def _parse_bytes_billed_required(message: str) -> float | None:
 
     match = _BYTES_BILLED_REQUIRED_RE.search(message)
     return float(match.group(1)) if match else None
+
+
+def _bad_request_reason(exc: Exception) -> str | None:
+    """BigQuery's own code for a refusal (``invalidQuery``, ``accessDenied``),
+    read from the structured errors the client attaches, or None.
+
+    A code from a fixed vocabulary, so unlike the message it can never quote a
+    value; anything that does not look like one is dropped rather than echoed.
+    """
+
+    for error in getattr(exc, "errors", None) or []:
+        reason = error.get("reason") if isinstance(error, dict) else None
+        if isinstance(reason, str) and reason.isidentifier():
+            return reason
+    return None

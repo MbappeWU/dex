@@ -23,6 +23,10 @@ MetricFlow, and SLayer is shaped differently:
   carries no measures at all: the gap is declared rather than filled.
 - A custom ``Aggregation`` is a function a formula applies to a column, not an
   element that answers a number, so it is named in a note rather than listed.
+- A metric's ``filter`` is the model's ``filters``, plus a column ``filter``
+  where every aggregation in the formula reads a column carrying that one
+  filter: SLayer has no per-measure filter, and a filtered column is where it
+  puts a predicate meant for one metric.
 - ``default_time_dimension`` is per model rather than per measure, and becomes
   the model's time dimension and the time axis of every metric on it.
 - SLayer has no entities. Joins and declared keys reach dex through the
@@ -40,6 +44,7 @@ their attributes are read.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any
 
@@ -83,6 +88,9 @@ METRIC_TYPE = "formula"
 # treats as time.
 _TEMPORAL = frozenset({"DATE", "TIMESTAMP"})
 
+# One unquoted identifier part, the shape `parse_relation` accepts.
+_IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_$]*")
+
 
 def dimension_token(model: str, column: str) -> str:
     """The reference a SLayer query uses for a model's column: ``model.column``.
@@ -106,6 +114,7 @@ def semantic_catalog(
     dimensions: list[DimensionInfo] = []
     metrics: list[MetricInfo] = []
     physical: dict[str, tuple[str, str]] = {}
+    computed_columns: dict[str, tuple[str, str]] = {}
     found: list[str] = list(notes)
 
     for entry in loaded:
@@ -113,6 +122,10 @@ def semantic_catalog(
         relation, relation_note = _relation(model, connector)
         if relation_note:
             found.append(relation_note)
+        # What the PII gate resolves against, which may be the partial name the
+        # catalog declines to claim as a relation: the gate matches it against
+        # the profiled cache by suffix, failing closed when it is ambiguous.
+        gate_relation = relation or _partial_relation(model)
         time_dimension = _time_dimension(model)
         models.append(
             SemanticModelInfo(
@@ -126,10 +139,9 @@ def semantic_catalog(
         tokens: list[str] = []
         computed: list[str] = []
         for col in model.columns:
-            column = physical_column(col)
-            if relation is None:
-                column = None
-            elif column is None:
+            gate_column = physical_column(col)
+            column = gate_column if relation else None
+            if gate_relation and gate_column is None:
                 computed.append(col.name)
             token = dimension_token(model.name, col.name)
             tokens.append(token)
@@ -150,8 +162,12 @@ def semantic_catalog(
                     vendor_params=_column_params(col),
                 )
             )
-            if column and relation:
-                physical[token] = (relation, column)
+            if gate_column and gate_relation:
+                physical[token] = (gate_relation, gate_column)
+            elif gate_relation and isinstance(col.sql, str) and col.sql.strip():
+                # Not a column to name, but an expression the gate can read: it
+                # screens every column the expression reads instead of the name.
+                computed_columns[token] = (gate_relation, col.sql)
         if computed:
             one = len(computed) == 1
             found.append(
@@ -174,11 +190,13 @@ def semantic_catalog(
                 "is listed here, but SLayer leaves it out of its own listings"
             )
 
-        model_filter = _filter(model.filters)
-        metrics.extend(
-            _metric(model.name, measure, tokens, model_filter, time_dimension)
-            for measure in model.measures
-        )
+        for measure in model.measures:
+            metric_filter, filter_note = _metric_filter(entry, measure)
+            if filter_note:
+                found.append(filter_note)
+            metrics.append(
+                _metric(model.name, measure, tokens, metric_filter, time_dimension)
+            )
 
     return SemanticCatalogView(
         semantic_models=models,
@@ -187,6 +205,7 @@ def semantic_catalog(
         dimension_scope=DIMENSIONS_PER_DECLARATION,
         notes=found,
         physical_columns=physical,
+        computed_columns=computed_columns,
     )
 
 
@@ -194,7 +213,7 @@ def _metric(
     model: str,
     measure: Any,
     tokens: list[str],
-    model_filter: str | None,
+    metric_filter: str | None,
     time_dimension: str | None,
 ) -> MetricInfo:
     """One saved measure as a formula metric."""
@@ -211,7 +230,7 @@ def _metric(
         dimensions=list(tokens),
         semantic_models=[model],
         composition=MetricComposition(expr=measure.template),
-        filter=model_filter,
+        filter=metric_filter,
         time_axis=[time_dimension] if time_dimension else None,
         vendor_params=_measure_params(measure),
     )
@@ -251,9 +270,31 @@ def _relation(model: Any, connector: str | None) -> tuple[str | None, str | None
             f"cannot read as one fully qualified relation on "
             f"{connector or 'this connector'}, so it carries no physical link. "
             "SLayer completes a partial name from its datasource, and dex does "
-            "not read datasources, which carry credentials"
+            "not read datasources, which carry credentials. The PII gate still "
+            "matches an unquoted partial name against the profiled cache by "
+            "suffix"
         )
     return relation, None
+
+
+def _partial_relation(model: Any) -> str | None:
+    """A ``sql_table`` too short to be a relation, kept for the PII gate alone.
+
+    ``main.orders`` or ``orders`` names a relation dex cannot qualify without
+    SLayer's datasource, so the catalog claims none. The gate needs no claim: it
+    matches a name against the profiled cache by suffix, as ``explore profile``
+    resolves its arguments, and with nothing to match it falls to the heuristic.
+    Only unquoted dotted identifiers qualify; anything else names no column dex
+    can look up, and leaving it out keeps the gate from screening a guess.
+    """
+
+    table = model.sql_table
+    if not table:
+        return None
+    parts = table.split(".")
+    if not all(_IDENTIFIER.fullmatch(part) for part in parts):
+        return None
+    return table
 
 
 def _time_dimension(model: Any) -> str | None:
@@ -276,8 +317,48 @@ def _type(col: Any) -> str:
     return str(getattr(col.type, "value", col.type))
 
 
+def _metric_filter(entry: LoadedModel, measure: Any) -> tuple[str | None, str | None]:
+    """The predicate a saved measure measures under, and a note when part of it
+    could not be read.
+
+    Two places in SLayer narrow a metric. A model's ``filters`` apply to every
+    query on the model. A column's ``filter`` applies wherever that column is
+    aggregated (SLayer desugars it to ``CASE WHEN filter THEN value END``), which
+    is where SLayer puts a predicate meant for one metric rather than for every
+    metric on the model. So a formula whose every aggregation reads a column
+    carrying one same filter measures that subset as a whole, and the filter is
+    the metric's. Where only some aggregations are filtered (a ratio of a
+    filtered count to an unfiltered one), the predicate narrows a part of the
+    number rather than the number, and is not reported as the metric's, which is
+    how a MetricFlow ratio over a filtered side reads too.
+    """
+
+    model = entry.model
+    filters = list(model.filters)
+    columns = entry.aggregated_columns(measure)
+    if columns is None:
+        note = None
+        if any(col.filter for col in model.columns):
+            note = (
+                f"model '{model.name}': the formula of saved measure "
+                f"'{measure.name}' could not be read, so whether it aggregates a "
+                "filtered column is unknown and its filter states only the "
+                "model's own filters"
+            )
+        return _filter(filters), note
+    # `*` and a dotted name resolve to no column of this model, so a formula
+    # reading one is never wholly narrowed by a column filter here.
+    found = {
+        (col.filter if col is not None else None)
+        for col in (model.get_column(name) for name in columns)
+    }
+    if columns and len(found) == 1 and (shared := found.pop()):
+        filters.append(shared)
+    return _filter(filters), None
+
+
 def _filter(filters: Sequence[str]) -> str | None:
-    """A model's always-applied filters, as one predicate.
+    """Always-applied predicates, as one.
 
     SLayer applies every model filter to every query on the model, so a metric
     there measures the subset they select, which is what ``filter`` discloses.

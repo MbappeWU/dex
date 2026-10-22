@@ -475,6 +475,63 @@ def test_a_dropped_column_takes_its_own_entry_and_not_its_neighbour(sidecar_repo
     assert "description: the natural key" in written
 
 
+def test_a_dropped_column_takes_the_comment_written_directly_above_it(sidecar_repo):
+    """A note on a column goes with the column; a section header does not.
+
+    A comment at an entry's own indent belongs to the entry below it, which is
+    the rule the span already applies at the entry's far end. Leaving it behind
+    when that entry is removed puts the note above the neighbour, where it
+    describes a column it was never written about. A comment set apart by a blank
+    line is a header over everything after it, and a deeper comment closing the
+    entry above is that entry's, so both stay.
+    """
+
+    (sidecar_repo.root / _SIDECAR).write_text(
+        "version: 2\n"
+        "models:\n"
+        "  - name: orders\n"
+        "    columns:\n"
+        "      - name: order_id\n"
+        "        tests: [not_null]\n"
+        "        # order_id is reused by the legacy system\n"
+        "      # who placed the order\n"
+        "      # (one customer, many orders)\n"
+        "      - name: customer_id\n"
+        "        tests: [not_null]\n"
+        "\n"
+        "      # descriptive columns\n"
+        "\n"
+        "      # where the order is in its life\n"
+        "      - name: status\n"
+        "      - name: amount\n",
+        encoding="utf-8",
+    )
+    _schema_drift(
+        sidecar_repo,
+        "ALTER TABLE orders DROP customer_id",
+        "ALTER TABLE orders DROP status",
+    )
+
+    rc, payload = sidecar_repo.dex("maintain", "reconcile", "schema")
+    assert rc == 0, payload.get("errors")
+    sidecar_repo.dex("transform", "apply", payload["data"]["plan_id"])
+
+    written = (sidecar_repo.root / _SIDECAR).read_text(encoding="utf-8")
+    assert written == (
+        "version: 2\n"
+        "models:\n"
+        "  - name: orders\n"
+        "    columns:\n"
+        "      - name: order_id\n"
+        "        tests: [not_null]\n"
+        "        # order_id is reused by the legacy system\n"
+        "\n"
+        "      # descriptive columns\n"
+        "\n"
+        "      - name: amount\n"
+    ), written
+
+
 def test_a_retype_is_advisory_because_the_declaration_carries_no_type(sidecar_repo):
     """A type change is surfaced, not written, and the action says why.
 
