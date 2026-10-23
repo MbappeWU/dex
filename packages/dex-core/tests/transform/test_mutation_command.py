@@ -1594,6 +1594,36 @@ def _with_summary(project: Path) -> Path:
     return project
 
 
+def _with_versioned_summary(project: Path) -> Path:
+    """Same mart and count pin as `_with_summary`, declared as dbt model version 1.
+
+    The SQL lives at `fct_summary_v1.sql` and `schema.yml` names it
+    `fct_summary` with `versions: [{v: 1}]`. The singular test still refs the
+    unversioned name; routing must report the version label `fct_summary.v1`.
+    """
+
+    schema = """version: 2
+models:
+  - name: fct
+    columns:
+      - name: id
+        data_tests: [not_null]
+  - name: fct_summary
+    latest_version: 1
+    versions:
+      - v: 1
+"""
+    (project / "models" / "schema.yml").write_text(schema, encoding="utf-8")
+    (project / "models" / "fct_summary_v1.sql").write_text(
+        SUMMARY_SQL, encoding="utf-8"
+    )
+    (project / "tests").mkdir(exist_ok=True)
+    (project / "tests" / "assert_summary_counts.sql").write_text(
+        SUMMARY_TEST, encoding="utf-8"
+    )
+    return project
+
+
 def test_a_defect_a_downstream_test_catches_is_reported_apart(
     measurable_project: Path,
 ):
@@ -1681,6 +1711,31 @@ def test_a_model_with_only_downstream_tests_is_measured(measurable_project: Path
 
     with pytest.raises(mutation.MutationError, match="has no tests"):
         engine.test_mutations("fct", downstream=False)
+
+
+def test_a_versioned_downstream_model_is_routed_by_its_version_label(
+    measurable_project: Path,
+):
+    """A versioned mart is selected by its dbt label, not the bare name.
+
+    `--downstream` walks the child map and feeds `--select` the labels
+    `manifest_node_label` produces. For a model with `versions:`, that label is
+    `name.vN`. Pinning it here keeps a refactor of the selector from dropping
+    versioned projects silently.
+    """
+
+    pytest.importorskip("dbt.adapters.duckdb")
+    engine = _engine(_with_versioned_summary(measurable_project))
+    engine.build(target="dev")
+
+    result = engine.test_mutations("fct")
+
+    assert result.downstream["enabled"] is True, result.downstream
+    assert result.downstream["models"] == ["fct_summary.v1"]
+    statuses = {m["operator"]: m for m in result.mutants}
+    drop = statuses["predicate_drop"]
+    assert drop["status"] == "caught_downstream"
+    assert drop["caught_downstream_by"] == ["assert_summary_counts"]
 
 
 class _DownstreamCopy:
