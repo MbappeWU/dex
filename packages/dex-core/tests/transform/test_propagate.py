@@ -599,16 +599,13 @@ class TestCommandSurface:
         assert "stg_orders.order_id" in json.dumps(payload["errors"])
 
 
-
 class TestPythonAndYamlSnapshotReaders:
     """Regression for #657: rename/remove honor readers references already finds."""
 
     def test_rename_rewrites_a_yaml_snapshot_relation(self, project: Path):
         _write(
             project / "snapshots/snapshots.yml",
-            "snapshots:\n"
-            "  - name: orders_snapshot\n"
-            "    relation: ref('stg_orders')\n",
+            "snapshots:\n  - name: orders_snapshot\n    relation: ref('stg_orders')\n",
         )
 
         result = _propagate(project, "model", "stg_orders", "stg_order_events")
@@ -666,8 +663,7 @@ class TestPythonAndYamlSnapshotReaders:
     def test_rename_refuses_a_surviving_python_ref(self, project: Path):
         _write(
             project / "models/marts/py_orders.py",
-            "def model(dbt, session):\n"
-            '    return dbt.ref("stg_orders")\n',
+            'def model(dbt, session):\n    return dbt.ref("stg_orders")\n',
         )
 
         with pytest.raises(PropagationRefusedError) as exc:
@@ -679,8 +675,7 @@ class TestPythonAndYamlSnapshotReaders:
     def test_rename_accepts_when_the_python_reader_is_updated(self, project: Path):
         _write(
             project / "models/marts/py_orders.py",
-            "def model(dbt, session):\n"
-            '    return dbt.ref("stg_orders")\n',
+            'def model(dbt, session):\n    return dbt.ref("stg_orders")\n',
         )
 
         result = _propagate(
@@ -708,8 +703,7 @@ class TestPythonAndYamlSnapshotReaders:
         _write(project / "models/staging/stg_isolated.sql", "select 1 as id\n")
         _write(
             project / "models/marts/py_isolated.py",
-            "def model(dbt, session):\n"
-            '    return dbt.ref("stg_isolated")\n',
+            'def model(dbt, session):\n    return dbt.ref("stg_isolated")\n',
         )
 
         with pytest.raises(PropagationRefusedError) as exc:

@@ -430,9 +430,7 @@ class ReferenceIndex:
         # ``.py`` entry, that set is authoritative so an in-memory plan is not
         # contradicted by the on-disk file the plan has not applied yet.
         root = Path(view.root)
-        overlay_python = sorted(
-            path for path in view.files if path.endswith(".py")
-        )
+        overlay_python = sorted(path for path in view.files if path.endswith(".py"))
         if overlay_python:
             for raw_path in overlay_python:
                 self._scan_python_model_content(

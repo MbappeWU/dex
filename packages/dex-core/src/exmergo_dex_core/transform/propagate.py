@@ -184,9 +184,7 @@ _NODE_READING_FORMS = (
 )
 
 
-def _project_after_edits(
-    view: DbtProjectView, edits: list[PlanEdit]
-) -> DbtProjectView:
+def _project_after_edits(view: DbtProjectView, edits: list[PlanEdit]) -> DbtProjectView:
     """Project state after ``edits``, including Python models from disk.
 
     ``load()`` leaves ``.py`` out of ``view.files``. Rename/remove guards need

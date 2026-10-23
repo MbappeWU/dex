@@ -836,7 +836,6 @@ def test_plan_guard_refuses_a_delete_that_orphans_a_ref(
     )
 
 
-
 def test_plan_guard_refuses_a_delete_that_orphans_a_python_ref(
     dbt_project_dir: Path, tmp_path: Path, capsys
 ):
@@ -845,8 +844,7 @@ def test_plan_guard_refuses_a_delete_that_orphans_a_python_ref(
     py_path = dbt_project_dir / "models" / "marts" / "py_customers.py"
     py_path.parent.mkdir(parents=True, exist_ok=True)
     py_path.write_text(
-        "def model(dbt, session):\n"
-        '    return dbt.ref("stg_customers")\n',
+        'def model(dbt, session):\n    return dbt.ref("stg_customers")\n',
         encoding="utf-8",
     )
     payload = _write_payload(
