@@ -150,7 +150,7 @@ statement, each with its own `status` (`ok`, `refused`, `failed`, `skipped`).
 Results are capped (rows, cell width, bytes), and `query.max_payload_bytes` is
 the budget for the whole call.
 
-Example envelopes (columnar — never `rows`):
+Example envelopes (columnar; never `rows`):
 
 Single statement:
 
@@ -169,7 +169,7 @@ Single statement:
 }
 ```
 
-Two or more statements — read `data.results[].cells`, not a top-level `cells`:
+Two or more statements: read `data.results[].cells`, not a top-level `cells`:
 
 ```json
 {
@@ -403,7 +403,7 @@ layer reports for the metrics queried. A PII-shaped grouped or filtered dimensio
 
 
 Example envelope for `explore semantic query sessions --group-by metric_time__month`
-— results are `data.cells`, not `rows`:
+(results are `data.cells`, not `rows`):
 
 ```json
 {
@@ -456,16 +456,16 @@ it as `execution` (`dex` or `vendor`).
   datasource or reading a credential, and dex runs it through the same guards
   as `--local` (PII gate, SELECT-only, relation pre-check, cost handshake,
   columnar cap). The `[semantic]` extra is not needed. What a query can say:
-  - every metric in one query sits on one model, and an ad-hoc formula is
+ - every metric in one query sits on one model, and an ad-hoc formula is
     refused;
-  - `--group-by` takes that model's own columns (`orders.status`); a column
+ - `--group-by` takes that model's own columns (`orders.status`); a column
     reached through a join is not groupable;
-  - `--grain` buckets the model's `default_time_dimension` at a built-in SLayer
+ - `--grain` buckets the model's `default_time_dimension` at a built-in SLayer
     grain (`day`, `week`, `month`, ...), and a model with none refuses it;
-  - `--where` is SLayer's filter syntax, not Jinja: `status = 'paid'`, read
+ - `--where` is SLayer's filter syntax, not Jinja: `status = 'paid'`, read
     relative to the query's model, or a dotted column through a declared join.
     A clause dex cannot read, or one carrying `{variable}` syntax, is refused;
-  - `--order-by` names one of the query's own metrics or grouped columns;
+ - `--order-by` names one of the query's own metrics or grouped columns;
     write a descending one as `--order-by=-orders.revenue`, since with a space
     the leading `-` is read as a flag and refused.
 
