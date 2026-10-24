@@ -150,6 +150,58 @@ statement, each with its own `status` (`ok`, `refused`, `failed`, `skipped`).
 Results are capped (rows, cell width, bytes), and `query.max_payload_bytes` is
 the budget for the whole call.
 
+Example envelopes (columnar — never `rows`):
+
+Single statement:
+
+```json
+{
+  "status": "ok",
+  "data": {
+    "shape": "columnar",
+    "columns": ["HOST_ID", "n"],
+    "types": ["INTEGER", "BIGINT"],
+    "cells": [[1, 1], [2, 1]],
+    "row_count": 2,
+    "truncated": false,
+    "notes": []
+  }
+}
+```
+
+Two or more statements — read `data.results[].cells`, not a top-level `cells`:
+
+```json
+{
+  "status": "ok",
+  "data": {
+    "shape": "columnar",
+    "statement_count": 2,
+    "ok_count": 2,
+    "results": [
+      {
+        "index": 0,
+        "status": "ok",
+        "shape": "columnar",
+        "columns": ["n"],
+        "types": ["BIGINT"],
+        "cells": [[3]],
+        "row_count": 1
+      },
+      {
+        "index": 1,
+        "status": "ok",
+        "shape": "columnar",
+        "columns": ["n"],
+        "types": ["BIGINT"],
+        "cells": [[2]],
+        "row_count": 1
+      }
+    ]
+  }
+}
+```
+
 A table you have not profiled, including a model you just built, is profiled
 first and the statement then runs. The envelope names it under
 `data.profiled_on_demand`, and on a metered connector that profile is priced
@@ -254,12 +306,90 @@ nothing comes back as a note. The catalog is capped, with every cut counted in
 `elided` and named in `notes`; `elided` is always present, so all zeros and no
 cap notes means this is the whole layer. `--full` lifts the caps.
 
+
+Example envelope for `explore semantic list --metric orders` (fields unset on an
+element are omitted rather than null):
+
+```json
+{
+  "status": "ok",
+  "data": {
+    "backend": "local",
+    "vendor": "dbt",
+    "deployment": "local",
+    "execution": "dex",
+    "dimension_scope": "groupable",
+    "scoped_to": ["orders"],
+    "elided": {
+      "semantic_models": 0,
+      "metrics": 0,
+      "dimensions": 0,
+      "entities": 0,
+      "measures": 0,
+      "dimensions_per_metric": 0
+    },
+    "semantic_models": [
+      {
+        "name": "orders",
+        "model": "ref('fct_orders')",
+        "relation": "analytics.main.fct_orders"
+      }
+    ],
+    "metrics": [
+      {
+        "name": "orders",
+        "type": "simple",
+        "dimensions": ["order__status"],
+        "measures": ["order_count"],
+        "semantic_models": ["orders"]
+      }
+    ],
+    "dimensions": [
+      {
+        "name": "order__status",
+        "type": "categorical",
+        "semantic_model": "orders",
+        "column": "status"
+      }
+    ],
+    "entities": [{"name": "order", "type": "primary", "semantic_model": "orders"}],
+    "measures": [{"name": "order_count", "agg": "count", "semantic_model": "orders"}],
+    "notes": ["scoped to 1 of 4 metrics"]
+  }
+}
+```
+
 ### `values <dimension>`
 
 Returns one dimension's value domain, which is what a `--where` filter may be
 filtered to, and on a hosted layer the only dex command that can reach it
 (`profile` cannot see a semantic dimension). A PII-flagged dimension refuses the
 command outright, because the whole output is values.
+
+
+Example envelope for `explore semantic values user__pricing_tier` (same columnar
+shape as `query`; `dimension` and `scoped_to` lead so a truncated read still
+says which question was answered):
+
+```json
+{
+  "status": "ok",
+  "data": {
+    "dimension": "user__pricing_tier",
+    "scoped_to": [],
+    "columns": ["user__pricing_tier"],
+    "types": ["string"],
+    "cells": [["free"], ["pro"]],
+    "row_count": 2,
+    "truncated": false,
+    "backend": "dbt_cloud",
+    "vendor": "dbt",
+    "deployment": "cloud",
+    "execution": "vendor",
+    "query_id": "FAKE_VID"
+  }
+}
+```
 
 ### `query`
 
@@ -270,6 +400,27 @@ comma-separated list or a repeated flag; `--where` is never split, because a
 filter clause carries its own commas. `--grain` is checked against the grains the
 layer reports for the metrics queried. A PII-shaped grouped or filtered dimension
 (for example `user__email`) is refused before the query runs.
+
+
+Example envelope for `explore semantic query sessions --group-by metric_time__month`
+— results are `data.cells`, not `rows`:
+
+```json
+{
+  "status": "ok",
+  "data": {
+    "columns": ["metric_time__month", "sessions"],
+    "types": ["string", "number"],
+    "cells": [["2026-01-01", 12], ["2026-02-01", 18]],
+    "row_count": 2,
+    "truncated": false,
+    "backend": "local",
+    "vendor": "dbt",
+    "deployment": "local",
+    "execution": "dex"
+  }
+}
+```
 
 ### Backends
 
