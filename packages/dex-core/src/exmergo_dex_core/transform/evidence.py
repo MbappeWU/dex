@@ -69,6 +69,11 @@ class BuildOutcome(str, Enum):
     UNRELATED = "unrelated"
     #: Some of the required nodes ran and some did not.
     PARTIAL = "partial"
+    #: A plan was named, but no buildable requirement could be derived for its
+    #: edits (a metric whose measure cannot be located, a macro, a project-config
+    #: change). Distinct from ``validated`` with an empty required list, which
+    #: previously over-claimed coverage.
+    COVERAGE_UNDETERMINED = "coverage_undetermined"
     #: Everything required ran and passed, but not against what the plan said.
     #: Either the compiled artifacts predate the model sources, or a file the
     #: plan wrote no longer holds the content the plan wrote, which means the
@@ -129,8 +134,10 @@ class BuildCoverage(BaseModel):
     ``basis`` says how the requirement was derived, because the derivation is not
     uniform: a model edit names its own node, a schema.yml names the nodes it
     documents, and a semantic YAML names the transformation model its semantic
-    model sits on. An edit that can affect any node at all (a macro, the project
-    config) contributes no requirement and says so here rather than silently
+    model sits on — including following a metric to its measure and that measure
+    to its model. An edit that can affect any node at all (a macro, the project
+    config), or a metric whose measure cannot be located, contributes no
+    requirement, sets ``undetermined``, and says so here rather than silently
     contributing nothing.
     """
 
@@ -138,6 +145,10 @@ class BuildCoverage(BaseModel):
     covered: list[str] = Field(default_factory=list)
     missing: list[str] = Field(default_factory=list)
     basis: list[str] = Field(default_factory=list)
+    #: True when at least one edit could not derive a buildable requirement and
+    #: ``required`` is therefore empty. Hosts must not read an empty required list
+    #: as "nothing to check" / validated.
+    undetermined: bool = False
 
 
 class BuildDigests(BaseModel):
@@ -192,18 +203,29 @@ def _file_digest(path: Path) -> str | None:
     return "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def required_nodes(edits: list[PlanEdit], project: Path) -> tuple[list[str], list[str]]:
+def required_nodes(
+    edits: list[PlanEdit], project: Path
+) -> tuple[list[str], list[str], bool]:
     """The nodes a plan's edits require a build to exercise, and how each was derived.
 
     Read from the edits themselves rather than from a compiled artifact, so this
     answers for a plan that has been applied but never built, which is the state
     a sandbox is in when it decides what to select.
+
+    Returns ``(required, basis, undetermined)``. ``undetermined`` is true when
+    every concrete requirement is empty because at least one edit could not name
+    a buildable node (an unresolved metric, a macro, a project-config change).
     """
 
     from ..dbt_project import node_name
 
     required: set[str] = set()
     basis: list[str] = []
+    undetermined_edits = False
+    # Measure -> transformation model, union of plan edits and on-disk YAML.
+    measure_owners = _measure_owners(edits, project)
+    metric_defs = _metric_definitions(edits, project)
+
     for edit in edits:
         if edit.op is EditOp.DELETE:
             # A removed node cannot be built, and requiring it would make every
@@ -216,26 +238,159 @@ def required_nodes(edits: list[PlanEdit], project: Path) -> tuple[list[str], lis
             basis.append(f"{edit.path}: builds '{name}'")
             continue
         if edit.kind in {EditKind.SCHEMA_YML, EditKind.SEMANTIC_YML}:
-            named = _names_in_yaml(edit.new_content or "")
+            named, detail, unresolved = _requirements_from_yaml(
+                edit.new_content or "",
+                measure_owners=measure_owners,
+                metric_defs=metric_defs,
+            )
             if named:
                 required.update(named)
-                basis.append(f"{edit.path}: documents {', '.join(sorted(named))}")
+                basis.append(f"{edit.path}: {detail}")
+            elif unresolved:
+                undetermined_edits = True
+                basis.append(f"{edit.path}: {detail}")
             else:
+                undetermined_edits = True
                 basis.append(f"{edit.path}: names no buildable node")
             continue
+        undetermined_edits = True
         basis.append(
             f"{edit.path}: a {edit.kind.value} edit can affect any node, so it "
             "requires none in particular"
         )
-    return sorted(required), basis
+    undetermined = undetermined_edits and not required
+    return sorted(required), basis, undetermined
 
 
-def _names_in_yaml(content: str) -> set[str]:
-    """Buildable node names a schema or semantic YAML points at.
+def _ref_model(value: Any) -> str | None:
+    from ..dbt_project import REF_PATTERN
 
-    A semantic model's ``model:`` is read through its ``ref()`` because that is
-    how the layer names the transformation model underneath it, which is the
-    link that makes a semantic change checkable against a build at all.
+    if not isinstance(value, str):
+        return None
+    match = REF_PATTERN.search(value)
+    return match.group(1) if match else None
+
+
+def _measure_owners(edits: list[PlanEdit], project: Path) -> dict[str, str]:
+    """Map measure name -> transformation model from plan edits then on-disk YAML."""
+
+    owners: dict[str, str] = {}
+
+    def absorb(document: Any) -> None:
+        if not isinstance(document, dict):
+            return
+        for entry in document.get("semantic_models") or []:
+            if not isinstance(entry, dict):
+                continue
+            model = _ref_model(entry.get("model"))
+            if not model:
+                continue
+            for measure in entry.get("measures") or []:
+                if isinstance(measure, dict) and isinstance(measure.get("name"), str):
+                    owners[measure["name"]] = model
+
+    for edit in edits:
+        if edit.kind is not EditKind.SEMANTIC_YML or not edit.new_content:
+            continue
+        try:
+            absorb(yaml.safe_load(edit.new_content))
+        except yaml.YAMLError:
+            continue
+
+    if project.is_dir():
+        for path in project.rglob("*"):
+            if path.suffix not in {".yml", ".yaml"} or not path.is_file():
+                continue
+            try:
+                absorb(yaml.safe_load(path.read_text(encoding="utf-8")))
+            except (yaml.YAMLError, OSError, UnicodeDecodeError):
+                continue
+    return owners
+
+
+def _metric_definitions(
+    edits: list[PlanEdit], project: Path
+) -> dict[str, dict[str, Any]]:
+    """Metric name -> raw YAML entry, plan edits overriding on-disk files."""
+
+    defs: dict[str, dict[str, Any]] = {}
+
+    def absorb(document: Any) -> None:
+        if not isinstance(document, dict):
+            return
+        for entry in document.get("metrics") or []:
+            if isinstance(entry, dict) and isinstance(entry.get("name"), str):
+                defs[entry["name"]] = entry
+        # create_metric: true measures are addressable as metrics.
+        for entry in document.get("semantic_models") or []:
+            if not isinstance(entry, dict):
+                continue
+            for measure in entry.get("measures") or []:
+                if (
+                    isinstance(measure, dict)
+                    and measure.get("create_metric")
+                    and isinstance(measure.get("name"), str)
+                ):
+                    defs.setdefault(
+                        measure["name"],
+                        {
+                            "name": measure["name"],
+                            "type": "simple",
+                            "type_params": {"measure": measure["name"]},
+                        },
+                    )
+
+    if project.is_dir():
+        for path in project.rglob("*"):
+            if path.suffix not in {".yml", ".yaml"} or not path.is_file():
+                continue
+            try:
+                absorb(yaml.safe_load(path.read_text(encoding="utf-8")))
+            except (yaml.YAMLError, OSError, UnicodeDecodeError):
+                continue
+    for edit in edits:
+        if edit.kind is not EditKind.SEMANTIC_YML or not edit.new_content:
+            continue
+        try:
+            absorb(yaml.safe_load(edit.new_content))
+        except yaml.YAMLError:
+            continue
+    return defs
+
+
+def _grounded_measures(
+    metric_name: str,
+    metric_defs: dict[str, dict[str, Any]],
+    seen: set[str] | None = None,
+) -> list[str]:
+    from ..dbt_project import metric_inputs
+
+    if seen is None:
+        seen = set()
+    if metric_name in seen:
+        return []
+    seen.add(metric_name)
+    entry = metric_defs.get(metric_name)
+    if entry is None:
+        return []
+    measures, metrics = metric_inputs(entry)
+    grounded = list(measures)
+    for name in metrics:
+        grounded.extend(_grounded_measures(name, metric_defs, seen))
+    return grounded
+
+
+def _requirements_from_yaml(
+    content: str,
+    *,
+    measure_owners: dict[str, str],
+    metric_defs: dict[str, dict[str, Any]],
+) -> tuple[set[str], str, bool]:
+    """Buildable node names a schema or semantic YAML requires.
+
+    Returns ``(names, detail, unresolved)``. ``unresolved`` is true when the
+    document named metrics (or similar) whose measures could not be located, so
+    the caller can mark coverage undetermined rather than silently empty.
     """
 
     from ..dbt_project import REF_PATTERN
@@ -243,9 +398,9 @@ def _names_in_yaml(content: str) -> set[str]:
     try:
         document = yaml.safe_load(content)
     except yaml.YAMLError:
-        return set()
+        return set(), "names no buildable node", True
     if not isinstance(document, dict):
-        return set()
+        return set(), "names no buildable node", True
 
     names: set[str] = set()
     for key in ("models", "seeds", "snapshots"):
@@ -260,7 +415,45 @@ def _names_in_yaml(content: str) -> set[str]:
             match = REF_PATTERN.search(model)
             if match:
                 names.add(match.group(1))
-    return names
+
+    unresolved_metrics: list[str] = []
+    metric_models: set[str] = set()
+    for entry in document.get("metrics") or []:
+        if not isinstance(entry, dict) or not isinstance(entry.get("name"), str):
+            continue
+        metric_name = entry["name"]
+        # Prefer the edit's own body for this metric's inputs.
+        local_defs = dict(metric_defs)
+        local_defs[metric_name] = entry
+        grounded = _grounded_measures(metric_name, local_defs)
+        if not grounded:
+            unresolved_metrics.append(metric_name)
+            continue
+        found_any = False
+        for measure in grounded:
+            owner = measure_owners.get(measure)
+            if owner:
+                metric_models.add(owner)
+                found_any = True
+        if not found_any:
+            unresolved_metrics.append(metric_name)
+
+    names.update(metric_models)
+    if names and not unresolved_metrics:
+        detail = f"documents {', '.join(sorted(names))}"
+        return names, detail, False
+    if names and unresolved_metrics:
+        detail = (
+            f"documents {', '.join(sorted(names))}; unresolved metrics: "
+            + ", ".join(unresolved_metrics)
+        )
+        return names, detail, False
+    if unresolved_metrics:
+        detail = "names metrics whose measures could not be located: " + ", ".join(
+            unresolved_metrics
+        )
+        return set(), detail, True
+    return set(), "names no buildable node", True
 
 
 def plan_drift(edits: list[PlanEdit], project: Path) -> list[PlanDrift]:
@@ -315,6 +508,8 @@ def _outcome(
             return BuildOutcome.UNRELATED
         if coverage.missing:
             return BuildOutcome.PARTIAL
+    if coverage is not None and coverage.undetermined and not coverage.required:
+        return BuildOutcome.COVERAGE_UNDETERMINED
     if drift or stale:
         return BuildOutcome.STALE
     return BuildOutcome.VALIDATED
@@ -432,13 +627,14 @@ def build_evidence(
     drift: list[PlanDrift] = []
     if edits is not None:
         drift = plan_drift(edits, root)
-        required, basis = required_nodes(edits, root)
+        required, basis, undetermined = required_nodes(edits, root)
         covered = [name for name in required if name in answers]
         coverage = BuildCoverage(
             required=required,
             covered=covered,
             missing=[name for name in required if name not in answers],
             basis=basis,
+            undetermined=undetermined,
         )
 
     stale: bool | None = None

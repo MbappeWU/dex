@@ -316,9 +316,10 @@ def test_required_nodes_says_how_each_requirement_was_derived(project):
             path="models/staging/gone.sql", op=EditOp.DELETE, kind=EditKind.MODEL_SQL
         ),
     ]
-    required, basis = required_nodes(edits, project)
+    required, basis, undetermined = required_nodes(edits, project)
 
     assert required == ["mart"]
+    assert undetermined is False
     # A macro can affect any node, so it requires none in particular, and says so
     # rather than contributing nothing silently.
     assert any("can affect any node" in line for line in basis)
@@ -339,8 +340,9 @@ def test_a_semantic_model_requires_the_dbt_model_it_sits_on(project):
             kind=EditKind.SEMANTIC_YML,
         )
     ]
-    required, _basis = required_nodes(edits, project)
+    required, _basis, undetermined = required_nodes(edits, project)
     assert required == ["fct_orders"]
+    assert undetermined is False
 
 
 def test_a_test_node_is_named_rather_than_reported_as_its_hash(project, edits):
@@ -434,3 +436,138 @@ def test_a_versioned_model_answers_to_every_name_dbt_selects_it_by(dbt_project_d
 
     missed = build_evidence(dbt_project_dir, target="dev", select="dim_customers.v1")
     assert missed.selection.unmatched == ["dim_customers.v1"]
+
+
+def test_a_metric_only_edit_requires_the_model_behind_its_measure(project):
+    """Issue #573: metrics.yml alone must follow measure -> semantic model -> model."""
+
+    (project / "models" / "staging" / "semantic.yml").write_text(
+        "semantic_models:\n"
+        "  - name: things\n"
+        "    model: ref('things')\n"
+        "    entities: [{name: thing, type: primary, expr: id}]\n"
+        "    measures: [{name: things_count, agg: count, expr: id}]\n",
+        encoding="utf-8",
+    )
+    (project / "models" / "staging" / "things.sql").write_text(
+        "select 1 as id\n", encoding="utf-8"
+    )
+    edits = [
+        PlanEdit(
+            path="models/staging/metrics.yml",
+            new_content=(
+                "metrics:\n"
+                "  - name: thing_total\n"
+                "    type: simple\n"
+                "    type_params:\n"
+                "      measure: things_count\n"
+            ),
+            op=EditOp.UPSERT,
+            kind=EditKind.SEMANTIC_YML,
+        )
+    ]
+    required, basis, undetermined = required_nodes(edits, project)
+    assert required == ["things"]
+    assert undetermined is False
+    assert any("documents things" in line for line in basis)
+
+
+def test_a_metric_only_plan_built_elsewhere_is_unrelated(project):
+    (project / "models" / "staging" / "semantic.yml").write_text(
+        "semantic_models:\n"
+        "  - name: things\n"
+        "    model: ref('things')\n"
+        "    measures: [{name: things_count, agg: count, expr: id}]\n",
+        encoding="utf-8",
+    )
+    edits = [
+        PlanEdit(
+            path="models/staging/metrics.yml",
+            new_content=(
+                "metrics:\n"
+                "  - name: thing_total\n"
+                "    type: simple\n"
+                "    type_params: {measure: things_count}\n"
+            ),
+            op=EditOp.UPSERT,
+            kind=EditKind.SEMANTIC_YML,
+        )
+    ]
+    write_run_results(project, [node("other")])
+    evidence = build_evidence(project, target="dev", select="other", edits=edits)
+    assert evidence.outcome is BuildOutcome.UNRELATED
+    assert evidence.coverage.required == ["things"]
+    assert evidence.coverage.missing == ["things"]
+
+
+def test_a_ratio_metric_requires_models_behind_every_measure(project):
+    (project / "models" / "staging" / "semantic.yml").write_text(
+        "semantic_models:\n"
+        "  - name: orders\n"
+        "    model: ref('fct_orders')\n"
+        "    measures:\n"
+        "      - {name: order_count, agg: count}\n"
+        "      - {name: refund_count, agg: sum}\n"
+        "metrics:\n"
+        "  - name: orders\n"
+        "    type: simple\n"
+        "    type_params: {measure: order_count}\n"
+        "  - name: refunds\n"
+        "    type: simple\n"
+        "    type_params: {measure: refund_count}\n",
+        encoding="utf-8",
+    )
+    edits = [
+        PlanEdit(
+            path="models/staging/ratio.yml",
+            new_content=(
+                "metrics:\n"
+                "  - name: refund_rate\n"
+                "    type: ratio\n"
+                "    type_params:\n"
+                "      numerator: refunds\n"
+                "      denominator: orders\n"
+            ),
+            op=EditOp.UPSERT,
+            kind=EditKind.SEMANTIC_YML,
+        )
+    ]
+    required, _basis, undetermined = required_nodes(edits, project)
+    assert required == ["fct_orders"]
+    assert undetermined is False
+
+
+def test_an_unresolved_metric_never_yields_validated(project):
+    edits = [
+        PlanEdit(
+            path="models/staging/metrics.yml",
+            new_content=(
+                "metrics:\n"
+                "  - name: ghost\n"
+                "    type: simple\n"
+                "    type_params: {measure: missing_measure}\n"
+            ),
+            op=EditOp.UPSERT,
+            kind=EditKind.SEMANTIC_YML,
+        )
+    ]
+    write_run_results(project, [node("mart")])
+    evidence = build_evidence(project, target="dev", edits=edits)
+    assert evidence.outcome is BuildOutcome.COVERAGE_UNDETERMINED
+    assert evidence.coverage.undetermined is True
+    assert evidence.coverage.required == []
+
+
+def test_a_macro_only_plan_is_coverage_undetermined(project):
+    edits = [
+        PlanEdit(
+            path="macros/helper.sql",
+            new_content="{% macro helper() %}1{% endmacro %}",
+            op=EditOp.UPSERT,
+            kind=EditKind.MACRO_SQL,
+        )
+    ]
+    write_run_results(project, [node("mart")])
+    evidence = build_evidence(project, target="dev", edits=edits)
+    assert evidence.outcome is BuildOutcome.COVERAGE_UNDETERMINED
+    assert evidence.coverage.undetermined is True
