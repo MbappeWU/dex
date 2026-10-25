@@ -212,6 +212,21 @@ def init_project(
     )
 
 
+# Attributes init writes back onto an existing connector block. A model
+# default the profile never assigned stays off this list, so loading the file
+# cannot grow it (``clickhouse.deployment``, ``trino.deployment``).
+_INIT_CONFIG_FIELDS: dict[str, tuple[str, ...]] = {
+    "duckdb": ("path",),
+    "bigquery": ("project", "dev_dataset", "location"),
+    "snowflake": ("dev_database", "dev_schema"),
+    "databricks": ("dev_catalog", "dev_schema"),
+    "postgres": ("dev_schema",),
+    "redshift": ("dev_schema",),
+    "clickhouse": ("dev_database",),
+    "trino": ("dev_schema",),
+}
+
+
 def _persist_init_config(
     config: DexConfig,
     root: Path,
@@ -224,7 +239,8 @@ def _persist_init_config(
     repo that already has one is amended through ``ConfigDocument`` (the same
     in-place editor ``dex config set`` uses), so comments, key order, unread
     keys, and explicit nulls survive. Only the keys ``init`` itself changes are
-    touched.
+    touched. Those are the project pointers and the connector fields named in
+    ``_INIT_CONFIG_FIELDS``.
     """
 
     if old_config is None:
@@ -237,19 +253,12 @@ def _persist_init_config(
         ("dbt_project_dir", config.dbt_project_dir),
         ("dbt_target", config.dbt_target),
     ]
-    if (
-        config.connector == "duckdb"
-        and config.duckdb
-        and config.duckdb.path is not None
-    ):
-        amendments.append(("duckdb.path", config.duckdb.path))
-    if config.connector == "bigquery" and config.bigquery is not None:
-        if config.bigquery.project is not None:
-            amendments.append(("bigquery.project", config.bigquery.project))
-        if config.bigquery.dev_dataset is not None:
-            amendments.append(("bigquery.dev_dataset", config.bigquery.dev_dataset))
-        if config.bigquery.location is not None:
-            amendments.append(("bigquery.location", config.bigquery.location))
+    block = getattr(config, config.connector, None)
+    if block is not None:
+        for field in _INIT_CONFIG_FIELDS[config.connector]:
+            value = getattr(block, field)
+            if value is not None:
+                amendments.append((f"{config.connector}.{field}", value))
     for key, value in amendments:
         if value is None:
             continue
