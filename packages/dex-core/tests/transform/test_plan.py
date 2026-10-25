@@ -1162,3 +1162,52 @@ def test_a_reference_dex_cannot_resolve_warns_instead_of_refusing(
     assert rc == 0, envelope
     assert any("could not resolve" in warning for warning in envelope["warnings"])
     assert any("dynamic.sql:1" in warning for warning in envelope["warnings"])
+
+
+def test_plan_deletes_empty_scaffold_gitkeep_when_first_model_lands(tmp_path: Path):
+    """Issue #653: the first real file into a Dex-scaffolded folder drops `.gitkeep`."""
+
+    from exmergo_dex_core.edits import EditOp
+    from exmergo_dex_core.storage import MemoryStore
+    from exmergo_dex_core.transform.plans import EditKind, PlanEdit
+    from exmergo_dex_core.transform.plans import plan as make_plan
+
+    project = tmp_path / "analytics"
+    staging = project / "models" / "staging"
+    staging.mkdir(parents=True)
+    (project / "dbt_project.yml").write_text(
+        "name: analytics\nversion: '1.0'\nprofile: analytics\n"
+        "model-paths: ['models']\n",
+        encoding="utf-8",
+    )
+    (project / "profiles.yml").write_text(
+        "analytics:\n  target: dev\n  outputs:\n    dev:\n      type: duckdb\n"
+        "      path: ../warehouse.duckdb\n",
+        encoding="utf-8",
+    )
+    (staging / ".gitkeep").write_text("", encoding="utf-8")
+    # A non-empty keeper in marts must survive.
+    marts = project / "models" / "marts"
+    marts.mkdir(parents=True)
+    (marts / ".gitkeep").write_text("keep me\n", encoding="utf-8")
+
+    store = MemoryStore()
+    edits = [
+        PlanEdit(
+            path="models/staging/stg_orders.sql",
+            new_content="select 1 as id\n",
+            kind=EditKind.MODEL_SQL,
+        )
+    ]
+    new_plan, diffs, _warnings = make_plan(
+        "scaffold stg_orders",
+        edits,
+        project,
+        tmp_path,
+        store=store,
+    )
+    by_path = {e.path: e for e in new_plan.edits}
+    assert "models/staging/.gitkeep" in by_path
+    assert by_path["models/staging/.gitkeep"].op is EditOp.DELETE
+    assert "models/marts/.gitkeep" not in by_path
+    assert any(d["path"] == "models/staging/.gitkeep" for d in diffs)

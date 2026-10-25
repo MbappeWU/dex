@@ -549,6 +549,9 @@ def plan(
             file_diff(edit.path, current.content if current else None, edit.new_content)
         )
 
+    if dbt_shaped:
+        _append_scaffold_gitkeep_deletes(project, view, pinned, diffs)
+
     # The whole-plan delete guard: a delete is refused if any file that survives
     # the plan still refers to a deleted model. Run against the pinned edits so
     # an update in this same plan that removes the offending ref is honored.
@@ -686,6 +689,67 @@ _BREAKS_ON_DELETE = frozenset(
         "yaml_snapshot_relation",
     }
 )
+
+
+def _append_scaffold_gitkeep_deletes(
+    project: Path,
+    _view: DbtProjectView,
+    pinned: list[PlanEdit],
+    diffs: list[dict[str, Any]],
+) -> None:
+    """Drop a Dex-scaffolded empty ``.gitkeep`` once a folder gets its first file.
+
+    ``transform init`` leaves ``.gitkeep`` in ``models/staging``, ``marts``, and
+    (with layered schemas) ``intermediate``. When a plan upserts the first real
+    file into one of those folders and the only thing still there is an empty
+    ``.gitkeep``, include a ``delete`` for it in the same plan so apply removes
+    it under the plan/apply guard (issue #653). A non-empty keeper, a folder that
+    already holds other files, or a keeper the plan already touches is left alone.
+    """
+
+    already = {edit.path for edit in pinned}
+    # Folders this plan is creating a file into (upsert whose path is new or
+    # replacing content under models/).
+    candidate_dirs: set[str] = set()
+    for edit in pinned:
+        if edit.op is not EditOp.UPSERT:
+            continue
+        parent = PurePosixPath(edit.path).parent.as_posix()
+        if parent == "." or not parent.startswith("models/"):
+            continue
+        # Only the layer folders init scaffolds keepers into, not arbitrary nests.
+        parts = parent.split("/")
+        if len(parts) != 2 or parts[1] not in {"staging", "intermediate", "marts"}:
+            continue
+        candidate_dirs.add(parent)
+
+    for folder in sorted(candidate_dirs):
+        keep_rel = f"{folder}/.gitkeep"
+        if keep_rel in already:
+            continue
+        keep_path = project / keep_rel
+        if not keep_path.is_file():
+            continue
+        try:
+            content = keep_path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        if content != "":
+            continue
+        # Folder must hold only this keeper on disk (the plan's new files are not
+        # written yet). Anything else means a human already filled the folder.
+        siblings = [p.name for p in (project / folder).iterdir() if p.is_file()]
+        if siblings != [".gitkeep"]:
+            continue
+        pinned.append(
+            PlanEdit(
+                path=keep_rel,
+                op=EditOp.DELETE,
+                kind=EditKind.MODEL_SQL,
+                old_content_hash=content_hash(content),
+            )
+        )
+        diffs.append(file_diff(keep_rel, content, None))
 
 
 def validate_deletions(view: DbtProjectView, edits: list[PlanEdit]) -> list[str]:
