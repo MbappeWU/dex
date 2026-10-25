@@ -151,6 +151,51 @@ def test_init_writes_no_absolute_path_for_an_in_repo_warehouse(tmp_path: Path, c
     assert envelope["data"]["warehouse_path"] == "warehouse/x.duckdb"
 
 
+def test_init_preserves_comments_and_unread_keys_in_an_existing_config(
+    tmp_path: Path, capsys
+):
+    """Issue #555: ``transform init`` must not rewrite an existing config through
+    a full YAML dump. Comments, unread keys, and an explicit ``null`` seed have
+    to survive; only the keys init itself sets may change."""
+
+    dex = tmp_path / ".dex"
+    dex.mkdir()
+    (dex / "config.yml").write_text(
+        "# Settings for this repo; the comments carry the reasoning.\n"
+        "connector: duckdb\n"
+        "duckdb:\n"
+        "  path: warehouse.duckdb   # the shared dev copy\n"
+        "cluster:\n"
+        "  sample_seed: null        # a fresh draw per run, on purpose\n"
+        "unknown_future_key: keep_me\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "warehouse.duckdb").write_bytes(b"")
+
+    rc, envelope = _run(
+        _init_argv(tmp_path, "--connector", "duckdb", "--path", "warehouse.duckdb"),
+        capsys,
+    )
+    assert rc == 0, envelope
+
+    text = (dex / "config.yml").read_text(encoding="utf-8")
+    assert "Settings for this repo" in text
+    assert "the shared dev copy" in text
+    assert "a fresh draw per run" in text
+    assert "sample_seed: null" in text
+    assert "unknown_future_key: keep_me" in text
+    assert "cluster: {}" not in text
+
+    config = yaml.safe_load(text)
+    assert config["connector"] == "duckdb"
+    assert config["dbt_project_dir"] == "analytics"
+    assert config["dbt_target"] == "dev"
+    assert config["duckdb"]["path"] == "warehouse.duckdb"
+    assert config["cluster"]["sample_seed"] is None
+    assert config["unknown_future_key"] == "keep_me"
+    assert str(tmp_path) not in text
+
+
 def test_init_keeps_an_absolute_path_for_a_warehouse_outside_the_repo(
     tmp_path: Path, capsys
 ):

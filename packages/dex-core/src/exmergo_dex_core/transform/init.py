@@ -39,6 +39,7 @@ from ..config import (
     load_config,
     save_config,
 )
+from ..config_document import ABSENT, ConfigDocument
 from ..dbt_project import (
     PROFILES_FILE,
     PROJECT_FILE,
@@ -193,7 +194,7 @@ def init_project(
     diffs = [file_diff(rel, None, content) for rel, content in files.items()]
     for rel, content in files.items():
         write_project_file(root / rel, content)
-    save_config(config, root)
+    _persist_init_config(config, root, config_path, old_config)
     diffs.append(
         file_diff(config_rel, old_config, config_path.read_text(encoding="utf-8"))
     )
@@ -209,6 +210,54 @@ def init_project(
         created=created,
         diffs=diffs,
     )
+
+
+def _persist_init_config(
+    config: DexConfig,
+    root: Path,
+    config_path: Path,
+    old_config: str | None,
+) -> None:
+    """Write the keys ``init`` sets into ``.dex/config.yml``.
+
+    A repo with no config keeps ``save_config``: there is nothing to preserve. A
+    repo that already has one is amended through ``ConfigDocument`` (the same
+    in-place editor ``dex config set`` uses), so comments, key order, unread
+    keys, and explicit nulls survive. Only the keys ``init`` itself changes are
+    touched.
+    """
+
+    if old_config is None:
+        save_config(config, root)
+        return
+
+    document = ConfigDocument.read(config_path)
+    amendments: list[tuple[str, Any]] = [
+        ("connector", config.connector),
+        ("dbt_project_dir", config.dbt_project_dir),
+        ("dbt_target", config.dbt_target),
+    ]
+    if (
+        config.connector == "duckdb"
+        and config.duckdb
+        and config.duckdb.path is not None
+    ):
+        amendments.append(("duckdb.path", config.duckdb.path))
+    if config.connector == "bigquery" and config.bigquery is not None:
+        if config.bigquery.project is not None:
+            amendments.append(("bigquery.project", config.bigquery.project))
+        if config.bigquery.dev_dataset is not None:
+            amendments.append(("bigquery.dev_dataset", config.bigquery.dev_dataset))
+        if config.bigquery.location is not None:
+            amendments.append(("bigquery.location", config.bigquery.location))
+    for key, value in amendments:
+        if value is None:
+            continue
+        current = document.written(key)
+        if current is not ABSENT and current == value:
+            continue
+        document = document.with_value(key, value)
+    document.write(config_path)
 
 
 # --- per-connector profile renderers -------------------------------------------
