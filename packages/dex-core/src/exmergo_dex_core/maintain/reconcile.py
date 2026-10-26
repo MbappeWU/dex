@@ -140,7 +140,7 @@ def build(
         ):
             # A model added, removed, or content-changed is the project's own
             # edit, the same as a semantic definition changing: there is no
-            # warehouse-side fix to propose, only a baseline to catch up.
+            # warehouse-side fix to propose.
             definition_churn = True
         else:
             if finding.code == "orphan_relation":
@@ -248,11 +248,7 @@ def build(
     _drop_empty_proposals(proposals, {edit.path for edit in edits})
 
     if definition_churn:
-        warnings.append(
-            "definition or model changes since the baseline are recorded but "
-            "not reconciled: if the current project state is intended, "
-            "re-run `maintain snapshot` to accept it as the new baseline"
-        )
+        warnings.append(_definition_churn_warning(findings))
     if len(orphan_identifiers) > 1:
         warnings.append(
             f"{len(orphan_identifiers)} orphan relations found this run; once "
@@ -264,6 +260,34 @@ def build(
 
 
 # --- helpers -------------------------------------------------------------------
+
+
+def _definition_churn_warning(findings: list[DriftFinding]) -> str:
+    """Both ways forward for definition or model churn.
+
+    A high-severity grain finding in the same check is a regression. The
+    repair command comes first there, so a reader does not snapshot it.
+    """
+
+    recorded = (
+        "definition or model changes since the baseline are recorded but not reconciled"
+    )
+    accept = (
+        "run `explore map` then `maintain snapshot` to accept it as the new baseline"
+    )
+    repair = "repair the project through `transform plan`"
+    if any(
+        finding.axis == "grain" and finding.severity == "high" for finding in findings
+    ):
+        return (
+            f"{recorded}: {repair} before accepting a baseline, because a "
+            "high-severity grain finding is in this check; once the repair "
+            f"holds and the project state is intended, {accept}"
+        )
+    return (
+        f"{recorded}: if the current project state is intended, {accept}; "
+        f"otherwise {repair}"
+    )
 
 
 def _run_operation_args(identifiers: list[str]) -> str:

@@ -11,11 +11,33 @@ def _proposals_by_axis(payload: dict) -> dict[str, list[dict]]:
     return grouped
 
 
+_INTENDED_CHURN = (
+    "definition or model changes since the baseline are recorded but "
+    "not reconciled: if the current project state is intended, run "
+    "`explore map` then `maintain snapshot` to accept it as the new "
+    "baseline; otherwise repair the project through `transform plan`"
+)
+
+_GRAIN_FIRST_CHURN = (
+    "definition or model changes since the baseline are recorded but "
+    "not reconciled: repair the project through `transform plan` "
+    "before accepting a baseline, because a high-severity grain "
+    "finding is in this check; once the repair holds and the project "
+    "state is intended, run `explore map` then `maintain snapshot` "
+    "to accept it as the new baseline"
+)
+
+
+def _churn_warning(warnings: list[str]) -> str:
+    return next(w for w in warnings if w.startswith("definition or model changes"))
+
+
 def test_model_findings_warn_toward_resnapshot_rather_than_propose_a_fix():
     """A model added/removed/changed (#164's transform_drift) gets the same
     treatment as a semantic definition_* finding: it is the project's own
-    edit, so there is no warehouse-side fix to propose, only a nudge to
-    re-baseline if the change is intended."""
+    edit, so there is no warehouse-side fix to propose. The warning names
+    both ways forward: accept the state after `explore map`, or repair it
+    through `transform plan`."""
 
     from exmergo_dex_core.maintain.drift import DriftFinding
     from exmergo_dex_core.maintain.reconcile import build
@@ -45,7 +67,51 @@ def test_model_findings_warn_toward_resnapshot_rather_than_propose_a_fix():
 
     assert proposals == []
     assert edits == []
-    assert any("re-run `maintain snapshot`" in w for w in warnings)
+    assert warnings == [_INTENDED_CHURN]
+    churn = warnings[0]
+    assert churn.index("`explore map`") < churn.index("`maintain snapshot`")
+    assert churn.index("`maintain snapshot`") < churn.index("`transform plan`")
+
+
+def test_high_severity_grain_finding_is_not_offered_a_snapshot_first():
+    """definition_changed beside a high-severity key_lost_uniqueness is a
+    regression, not a state to baseline. Snapshot must not be the first
+    branch. A grain finding below high still uses the intended-state path."""
+
+    from exmergo_dex_core.maintain.drift import DriftFinding
+    from exmergo_dex_core.maintain.reconcile import build
+    from exmergo_dex_core.maintain.snapshot import Snapshot, WarehouseBaseline
+
+    definition = DriftFinding(
+        axis="semantic",
+        code="definition_changed",
+        severity="low",
+        detail="the definition of metric 'revenue' changed since the baseline",
+        data={"kind": "metric", "name": "revenue"},
+    )
+    lost_key = DriftFinding(
+        axis="grain",
+        code="key_lost_uniqueness",
+        identifier="db.main.orders",
+        column="order_id",
+        severity="high",
+        detail="order_id on db.main.orders is no longer unique",
+    )
+    snap = Snapshot(
+        created_at="2026-07-03T10:00:00+00:00",
+        connector="duckdb",
+        warehouse=WarehouseBaseline(datasets=[]),
+    )
+
+    _proposals, _edits, warnings = build([definition, lost_key], snap, None, None)
+    churn = _churn_warning(warnings)
+    assert churn == _GRAIN_FIRST_CHURN
+    assert churn.index("`transform plan`") < churn.index("`explore map`")
+    assert churn.index("`explore map`") < churn.index("`maintain snapshot`")
+
+    damped = lost_key.model_copy(update={"severity": "medium"})
+    _proposals, _edits, warnings = build([definition, damped], snap, None, None)
+    assert _churn_warning(warnings) == _INTENDED_CHURN
 
 
 def test_drift_added_column_honors_pii_override():
