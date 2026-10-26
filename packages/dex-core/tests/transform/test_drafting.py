@@ -373,6 +373,69 @@ def test_an_unprofiled_input_is_named_with_the_command_that_profiles_it():
     assert any("`explore profile stg_refunds`" in w for w in warnings)
 
 
+def test_a_time_spine_from_range_is_not_told_to_profile_an_empty_relation():
+    """#832: MetricFlow's time spine is ``select ... from range(...)``. sqlglot
+    reads that table function as a table with no name, and the draft must not
+    tell the reader to profile a relation that does not exist."""
+
+    sql = (
+        "select cast(range as date) as date_day "
+        "from range(date '2024-01-01', date '2031-01-01', interval 1 day)\n"
+    )
+    drafts, warnings = draft(
+        ["metricflow_time_spine"],
+        {"models/metricflow_time_spine.sql": sql},
+        ["models"],
+        CACHE,
+        dialect="duckdb",
+    )
+
+    entry = drafts["metricflow_time_spine"]
+    assert "inputs" not in entry["drafted"]
+    assert entry["drafted"]["grain"] == {
+        "value": None,
+        "withheld": "it is generated in SQL, so no key of it is proven",
+    }
+    assert (
+        "'metricflow_time_spine' is generated in SQL; nothing to draft from"
+        in warnings
+    )
+    assert not any("explore profile" in w or "reads ," in w for w in warnings)
+
+
+def test_a_values_clause_is_generated_sql_with_nothing_to_draft_from():
+    entry, warnings = _draft(
+        "select date_day from (\n"
+        "  values (date '2020-01-01'), (date '2020-01-02')\n"
+        ") as t(date_day)\n"
+    )
+
+    assert "inputs" not in entry["drafted"]
+    assert "'fct' is generated in SQL; nothing to draft from" in warnings
+    assert not any("explore profile" in w for w in warnings)
+
+
+def test_a_table_function_with_no_parent_is_not_told_to_profile_an_empty_name():
+    entry, warnings = _draft("select * from read_csv_auto('data.csv')\n")
+
+    assert "inputs" not in entry["drafted"]
+    assert "'fct' is generated in SQL; nothing to draft from" in warnings
+    assert not any("explore profile" in w or "reads ," in w for w in warnings)
+
+
+def test_a_named_relation_beside_range_still_names_the_profile_command():
+    entry, warnings = _draft(
+        "select order_id from {{ ref('stg_refunds') }}\n"
+        "cross join range(date '2024-01-01', date '2024-01-03', interval 1 day)\n"
+    )
+
+    [missing_input] = entry["drafted"]["inputs"]
+    assert missing_input["relation"] == "stg_refunds"
+    assert missing_input["command"] == "explore profile stg_refunds"
+    assert any("`explore profile stg_refunds`" in w for w in warnings)
+    assert not any("generated in SQL" in w or "reads ," in w for w in warnings)
+
+
 def test_no_cache_at_all_still_drafts_nothing_and_names_every_input():
     files = {"models/marts/fct.sql": "select id from {{ ref('stg_orders') }}\n"}
 

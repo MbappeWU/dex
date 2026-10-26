@@ -111,6 +111,8 @@ class _Reading:
     #: Bare column names the SQL filters on, for the population hint.
     filtered: list[str] = field(default_factory=list)
     relations: list[str] = field(default_factory=list)
+    #: The statement manufactures its rows and names no warehouse relation.
+    generated_sql: bool = False
     incomplete: list[str] = field(default_factory=list)
     #: Placeholder identifier -> the dbt relation name it stands for.
     tokens: dict[str, str] = field(default_factory=dict)
@@ -439,14 +441,23 @@ class _Lineage:
         for scope in [*self.ctes.values(), self.tree]:
             self._collect_usage(scope)
 
-        # Every relation the statement reads, in the order it names them: the
-        # `ref()`/`source()` calls, and any table written into the SQL directly.
-        named = []
+        # Warehouse relations only, in the order the statement names them.
+        # ``range()`` and ``read_csv_auto()`` parse as a table with an empty
+        # name, and a VALUES clause is not a table at all. Neither is a
+        # relation ``explore profile`` can read.
+        named: list[str] = []
+        parentless = False
         for table in self.tree.find_all(exp.Table):
             kind, target = self.target(table)
-            if kind == "physical" and target not in named:
+            if kind == "generated":
+                parentless = True
+                continue
+            if kind == "physical" and target and target not in named:
                 named.append(target)
+        if any(True for _ in self.tree.find_all(exp.Values)):
+            parentless = True
         self.reading.relations = named
+        self.reading.generated_sql = parentless and not named
 
     @staticmethod
     def _output_order(outputs: dict[str, Any] | None):
@@ -487,14 +498,23 @@ class _Lineage:
         return relation.alias_or_name.lower()
 
     def target(self, relation: Any) -> tuple[str, Any]:
-        """``("physical", name)``, ``("scope", select)`` or ``("unknown", None)``."""
+        """``("physical", name)``, ``("scope", select)``, ``("generated", None)``
+        or ``("unknown", None)``.
+
+        ``generated`` is a table function or VALUES clause. sqlglot gives the
+        table an empty name, and that empty string is not a warehouse relation.
+        """
 
         from sqlglot import expressions as exp
 
+        if isinstance(relation, exp.Values):
+            return "generated", None
         if isinstance(relation, exp.Subquery) and isinstance(relation.this, exp.Select):
             return "scope", relation.this
         if isinstance(relation, exp.Table):
             name = relation.name
+            if not name and not relation.db and not relation.catalog:
+                return "generated", None
             if not relation.db and name in self.relations:
                 return "physical", self.relations[name]
             if not relation.db and name.lower() in self.ctes:
@@ -707,6 +727,8 @@ class _Lineage:
         kind, target = self.target(relation)
         if kind == "scope":
             return self.keys(target, depth + 1)
+        if kind == "generated":
+            return [], "it is generated in SQL, so no key of it is proven"
         if kind != "physical":
             return [], "its driving relation is not one dex can follow"
         dataset = dataset_for(self.cache, target)
@@ -1457,13 +1479,19 @@ def _warnings(
             f"{', '.join(columns)} without {'their' if plural else 'its'} "
             f"{', '.join(fields)}"
         )
-    unprofiled = [i["relation"] for i in drafted.get("inputs", []) if not i["profiled"]]
+    unprofiled = [
+        i["relation"]
+        for i in drafted.get("inputs", [])
+        if not i["profiled"] and i["relation"]
+    ]
     if unprofiled:
         out.append(
             f"'{model}' reads {', '.join(unprofiled)}, which the cache has not "
             "profiled, so nothing was drafted from it; run "
             + ", ".join(f"`explore profile {r}`" for r in unprofiled)
         )
+    elif reading.generated_sql:
+        out.append(f"'{model}' is generated in SQL; nothing to draft from")
     # A contradiction already says the same thing about this edit, with the side
     # that looks stale, so the generic disagreement would only repeat it.
     if (grain_declared := declared.get("grain")) and not grain_judged:
