@@ -397,8 +397,7 @@ def test_a_time_spine_from_range_is_not_told_to_profile_an_empty_relation():
         "withheld": "it is generated in SQL, so no key of it is proven",
     }
     assert (
-        "'metricflow_time_spine' is generated in SQL; nothing to draft from"
-        in warnings
+        "'metricflow_time_spine' is generated in SQL; nothing to draft from" in warnings
     )
     assert not any("explore profile" in w or "reads ," in w for w in warnings)
 
