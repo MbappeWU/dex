@@ -1,0 +1,1 @@
+**Multiset compare for two compiled SELECTs.** `transform.multiset_compare.compare_selects` returns aggregate DuckDB multiset diffs (left/right row counts and excess multiplicities) so a refactor can be checked for exact row equivalence without returning source values. First contribution for #856; plan integration follows separately.
