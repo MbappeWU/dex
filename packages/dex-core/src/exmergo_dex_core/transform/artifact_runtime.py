@@ -19,6 +19,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from ..errors import DexError
+
 #: Relative path under ``target/`` where the file-vs-directory collision has been
 #: observed across dbt versions (snapshot compiled SQL).
 _SNAPSHOT_RUN_GLOB = "run/*/snapshots"
@@ -144,7 +146,7 @@ def runtime_artifact_dir(base: Path | str, runtime_key: str) -> Path:
     return Path(base) / f"dex-runtime-{key}"
 
 
-class ArtifactCollisionError(ValueError):
+class ArtifactCollisionError(DexError, ValueError):
     """Shared artifact dir has a cross-runtime file/directory collision."""
 
 

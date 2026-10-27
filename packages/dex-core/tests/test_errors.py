@@ -109,6 +109,9 @@ INTERNAL_REFUSALS = {
     # driving `transform plan --scaffold` has to tell "run `explore map`" from
     # "qualify the name" from "edit the sources file", and ScaffoldError goes
     # with its two subclasses so `except ScaffoldError` works from the root too.
+    # Transform/artifact isolation control flow (hosts catch DexError or
+    # use isolate_on_collision=True).
+    "ArtifactCollisionError",
     "BuildFailedError",
     "DbtParseError",
     "DbtProjectError",
