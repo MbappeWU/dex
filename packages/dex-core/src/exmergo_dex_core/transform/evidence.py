@@ -787,6 +787,26 @@ def build_evidence(
     except Exception:
         stale = None
 
+    from .artifact_runtime import artifact_producer
+
+    producer = artifact_producer(
+        project_root=root,
+        target=target,
+        artifact_directory=root / "target",
+        metadata=metadata if isinstance(metadata, dict) else {},
+        project_name=(
+            str(manifest.get("metadata", {}).get("project_name"))
+            if isinstance(manifest.get("metadata"), dict)
+            and manifest.get("metadata", {}).get("project_name")
+            else None
+        ),
+        adapter_version=(
+            str(metadata["adapter_version"])
+            if isinstance(metadata, dict) and metadata.get("adapter_version")
+            else None
+        ),
+    )
+
     return BuildEvidence(
         outcome=_outcome(ran, nodes, coverage, stale, drift),
         invocation={
@@ -797,6 +817,7 @@ def build_evidence(
             "command": "build",
             "target": target,
             "select": select,
+            "artifact_producer": producer.as_dict(),
             # dbt writes this at the top of run_results, not inside `metadata`.
             "elapsed_seconds": (
                 float(elapsed)
