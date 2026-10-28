@@ -1,18 +1,40 @@
-"""Tests for the DuckDB aggregate multiset comparator (#856)."""
+"""Tests for the guarded aggregate multiset comparator (#856)."""
 
 from __future__ import annotations
+
+from pathlib import Path
 
 import duckdb
 import pytest
 
+from exmergo_dex_core.adapters.duckdb import DuckDBAdapter
+from exmergo_dex_core.cache import DexCache
+from exmergo_dex_core.config import QueryLimits
 from exmergo_dex_core.transform.multiset_compare import MultisetDiff, compare_selects
 
 
 @pytest.fixture
-def conn():
-    c = duckdb.connect(":memory:")
-    yield c
-    c.close()
+def adapter(tmp_path: Path):
+    path = tmp_path / "compare.duckdb"
+    connection = duckdb.connect(str(path))
+    connection.execute("create table people (id integer, email varchar)")
+    connection.close()
+    opened = DuckDBAdapter(path)
+    try:
+        yield opened
+    finally:
+        opened.close()
+
+
+def _counts(left: str, right: str, adapter: DuckDBAdapter) -> MultisetDiff:
+    return compare_selects(
+        left,
+        right,
+        adapter=adapter,
+        cache=DexCache(),
+        limits=QueryLimits(),
+        command="transform plan",
+    )
 
 
 # Issue #856 minimal synthetic case: left-join coalesce stays 1; extracting an
@@ -42,41 +64,41 @@ left join joined j on j.team_id = t.team_id
 """
 
 
-def test_join_extraction_is_not_equivalent(conn):
-    diff = compare_selects(_BASELINE, _EXTRACTED, conn)
+def test_join_extraction_is_not_equivalent(adapter):
+    diff = _counts(_BASELINE, _EXTRACTED, adapter)
     assert diff == MultisetDiff(
         left_rows=1, right_rows=1, only_in_left=1, only_in_right=1
     )
     assert not diff.equivalent
 
 
-def test_identical_selects_are_equivalent(conn):
-    diff = compare_selects(_BASELINE, _BASELINE, conn)
+def test_identical_selects_are_equivalent(adapter):
+    diff = _counts(_BASELINE, _BASELINE, adapter)
     assert diff.equivalent
     assert diff == MultisetDiff(
         left_rows=1, right_rows=1, only_in_left=0, only_in_right=0
     )
 
 
-def test_duplicate_multiplicity_is_detected(conn):
+def test_duplicate_multiplicity_is_detected(adapter):
     left = "select 1 as n union all select 1 as n"
     right = "select 1 as n"
-    diff = compare_selects(left, right, conn)
+    diff = _counts(left, right, adapter)
     assert diff == MultisetDiff(
         left_rows=2, right_rows=1, only_in_left=1, only_in_right=0
     )
     assert not diff.equivalent
 
 
-def test_null_and_empty_string_differ(conn):
+def test_null_and_empty_string_differ(adapter):
     left = "select cast(NULL as varchar) as label"
     right = "select '' as label"
-    diff = compare_selects(left, right, conn)
+    diff = _counts(left, right, adapter)
     assert not diff.equivalent
     assert diff.only_in_left == 1
     assert diff.only_in_right == 1
 
 
-def test_empty_sql_is_refused(conn):
+def test_empty_sql_is_refused(adapter):
     with pytest.raises(ValueError, match="required"):
-        compare_selects("   ", "select 1 as n", conn)
+        _counts("   ", "select 1 as n", adapter)

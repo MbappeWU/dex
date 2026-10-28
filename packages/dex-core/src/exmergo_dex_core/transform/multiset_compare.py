@@ -1,13 +1,12 @@
-"""Aggregate exact comparison of two compiled SELECTs (#856).
+"""Exact comparison of two compiled SELECTs (#856).
 
-``compare_selects`` compares two supplied statements as multisets of whole
-rows and returns only aggregate counts, so no source value leaves the
-warehouse. ``compare_refactors`` adds the schema check, caller-supplied
-identities, and optional key counts around that same fingerprint.
+``compare_refactors`` checks the output schema, then the row multiset, then an
+optional declared key. Counts are the only values that come back. The statements
+run through the query firewall, the adapter, and the cost handshake. DuckDB is
+the only adapter that describes a query's output today. Other connectors stay
+unchecked until they grow ``describe_query``.
 
-DuckDB only. The row fingerprint matches ``mutation._ROW_FINGERPRINT["duckdb"]``
-so mutation equivalence and this comparator agree on what "the same row"
-means. Compiling a dbt graph into the two statements stays with the caller.
+Compiling a dbt graph into the two statements stays with the caller.
 """
 
 from __future__ import annotations
@@ -15,74 +14,67 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any, Literal, Protocol
+from typing import Literal
 
+import sqlglot.expressions as exp
+
+from ..adapters.base import Adapter, ColumnMeta, QueryResult
+from ..cache import DexCache
+from ..config import QueryLimits
 from ..errors import DexError
+from ..guards.query_firewall import QueryRefusedError, assert_query_shape, inspect_query
+from ..results import ConfirmationRequest
 
+#: A type name ``DESCRIBE`` does not produce. DuckDB 2 groups BLOB, BIT, lists,
+#: structs, maps, UUID, INTERVAL, and JSON, so the check has nothing real to
+#: refuse until a connector reports a type it cannot group.
+_UNGROUPABLE_TYPES = frozenset({"UNGROUPABLE"})
 
-class _DuckConn(Protocol):
-    def execute(self, query: str) -> Any: ...
+ReasonCode = Literal[
+    "equivalent_on_compared_inputs",
+    "schemas_differ",
+    "rows_differ",
+    "keyed_rows_differ",
+    "baseline_refused",
+    "proposed_refused",
+    "baseline_not_executable",
+    "proposed_not_executable",
+    "schema_unavailable",
+    "firewall_refused",
+    "unsupported_type",
+    "duplicate_output_name",
+    "invalid_mapping",
+    "invalid_key",
+    "awaiting_confirmation",
+    "comparison_unreadable",
+]
 
-
-#: Whole-row fingerprint used for DuckDB multiset equality (same as mutation).
-_DUCKDB_ROW_FINGERPRINT = "hash({alias})"
-
-_EQUIVALENT_ON_INPUTS = "equivalent on the compared inputs only"
-
-_COMPARE_SQL = """\
-with dex_left as (
-    select {left_row} as dex_row from ({left_sql}) as dex_l
-),
-dex_right as (
-    select {right_row} as dex_row from ({right_sql}) as dex_r
-),
-dex_left_rows as (
-    select dex_row, count(*) as dex_n from dex_left group by dex_row
-),
-dex_right_rows as (
-    select dex_row, count(*) as dex_n from dex_right group by dex_row
+_VERDICT_CODES = frozenset(
+    {
+        "equivalent_on_compared_inputs",
+        "schemas_differ",
+        "rows_differ",
+        "keyed_rows_differ",
+    }
 )
-select
-    coalesce(sum(coalesce(l.dex_n, 0)), 0) as left_rows,
-    coalesce(sum(coalesce(r.dex_n, 0)), 0) as right_rows,
-    coalesce(sum(case when coalesce(l.dex_n, 0) > coalesce(r.dex_n, 0)
-        then coalesce(l.dex_n, 0) - coalesce(r.dex_n, 0) else 0 end), 0)
-        as only_in_left,
-    coalesce(sum(case when coalesce(r.dex_n, 0) > coalesce(l.dex_n, 0)
-        then coalesce(r.dex_n, 0) - coalesce(l.dex_n, 0) else 0 end), 0)
-        as only_in_right
-from dex_left_rows as l
-full outer join dex_right_rows as r on l.dex_row = r.dex_row
-"""
-
-_DESCRIBE_SQL = "select column_name, column_type from (describe {sql})"
-_PROJECT_SQL = "select {select_list} from ({sql}) as dex_proj"
-
-_KEYED_SQL = """\
-with dex_left as (
-    select {keys}, {fingerprint} as dex_fp from ({left_sql}) as dex_l
-),
-dex_right as (
-    select {keys}, {fingerprint} as dex_fp from ({right_sql}) as dex_r
-),
-dex_left_keys as (
-    select {keys}, hash(list_sort(list(dex_fp))) as dex_bag
-    from dex_left group by {keys}
-),
-dex_right_keys as (
-    select {keys}, hash(list_sort(list(dex_fp))) as dex_bag
-    from dex_right group by {keys}
+_NOT_CHECKED_CODES = frozenset(
+    {
+        "baseline_refused",
+        "proposed_refused",
+        "baseline_not_executable",
+        "proposed_not_executable",
+        "schema_unavailable",
+        "firewall_refused",
+        "unsupported_type",
+        "duplicate_output_name",
+        "invalid_mapping",
+        "invalid_key",
+        "awaiting_confirmation",
+        "comparison_unreadable",
+    }
 )
-select
-    coalesce(sum(case when r.dex_bag is null then 1 else 0 end), 0)
-        as only_in_left,
-    coalesce(sum(case when l.dex_bag is null then 1 else 0 end), 0)
-        as only_in_right,
-    coalesce(sum(case when l.dex_bag is not null and r.dex_bag is not null
-        and l.dex_bag <> r.dex_bag then 1 else 0 end), 0) as changed
-from dex_left_keys as l
-full outer join dex_right_keys as r on {join_pairs}
-"""
+
+KeyedReason = Literal["key_not_unique"]
 
 
 @dataclass(frozen=True)
@@ -106,7 +98,7 @@ class MultisetDiff:
 
 @dataclass(frozen=True)
 class SchemaColumn:
-    """One output column, as DuckDB ``DESCRIBE`` reports it."""
+    """One output column, as the adapter's ``describe_query`` reports it."""
 
     name: str
     type_name: str
@@ -114,9 +106,9 @@ class SchemaColumn:
 
 @dataclass(frozen=True)
 class TypeMismatch:
-    """A mapped pair whose canonical DuckDB types differ.
+    """A mapped pair whose reported types differ.
 
-    Types are the ``DESCRIBE`` strings. ``INTEGER`` and ``BIGINT`` mismatch.
+    Types are the adapter's type strings. ``INTEGER`` and ``BIGINT`` mismatch.
     There is no numeric widening and no value tolerance.
     """
 
@@ -128,8 +120,8 @@ class TypeMismatch:
 class SchemaDiff:
     """Name and type differences after the optional left-to-right mapping.
 
-    Columns are matched by mapped name, not by position. Tuples keep
-    ``DESCRIBE`` order. A compatible diff has all three empty.
+    Columns are matched by mapped name, not by position. Tuples keep describe
+    order. A compatible diff has all three empty.
     """
 
     only_in_left: tuple[SchemaColumn, ...]
@@ -143,10 +135,10 @@ class SchemaDiff:
 
 @dataclass(frozen=True)
 class KeyedCounts:
-    """Key-level differences. Each count is a number of keys, not rows.
+    """Key-level differences for a key that is unique on both sides.
 
-    ``changed`` is a key present on both sides whose bag of payloads differs,
-    including a difference in how many times the same payload appears.
+    Each count is a number of keys, not rows. ``changed`` is a key present on
+    both sides whose row multiset differs.
     """
 
     only_in_left: int
@@ -158,14 +150,18 @@ class KeyedCounts:
 class RefactorCompareResult:
     """Verdict for two compiled SELECTs on one input scope.
 
-    ``equivalent`` means the schema, the row multiset, and the declared key
-    (when one was given) matched for these statements. ``reason`` is then
-    ``equivalent on the compared inputs only``. That is not a claim about a
-    build, and not a claim about any input that was not compared.
+    ``equivalent`` means the schema and the row multiset matched, and the
+    declared key matched when ``keyed`` is present. ``reason_code`` is then
+    ``equivalent_on_compared_inputs``. That is not a claim about a build, and
+    not a claim about any input that was not compared. A declared key that is
+    not unique leaves ``keyed`` empty and sets ``keyed_reason``. The multiset
+    verdict still stands.
 
     ``different`` carries the schema diff and, when the schemas matched, the
-    multiset and key counts. ``not_checked`` carries ``reason`` and no row
-    verdict. A query DuckDB cannot run is ``not_checked``.
+    multiset and key counts. ``not_checked`` carries ``reason_code`` and no row
+    verdict. ``detail`` is engine-authored text. A warehouse exception contributes
+    its class name and nothing else. ``pending`` is set only while the cost
+    handshake is waiting.
     """
 
     baseline_id: str | None
@@ -175,37 +171,76 @@ class RefactorCompareResult:
     schema: SchemaDiff | None
     multiset: MultisetDiff | None
     status: Literal["equivalent", "different", "not_checked"]
-    reason: str | None
+    reason_code: ReasonCode
+    detail: str | None = None
     keyed: KeyedCounts | None = None
+    keyed_reason: KeyedReason | None = None
+    pending: ConfirmationRequest | None = None
 
     def __post_init__(self) -> None:
         schema_ok = self.schema is not None and self.schema.compatible
         rows_ok = self.multiset is not None and self.multiset.equivalent
-        keys_ok = self.keyed is None or (
+        keys_ok = self.keyed is not None and (
             self.keyed.only_in_left == 0
             and self.keyed.only_in_right == 0
             and self.keyed.changed == 0
         )
+        if self.keyed is not None and self.keyed_reason is not None:
+            raise ValueError("a keyed verdict does not also explain a dropped key")
         if self.status == "not_checked":
-            if not self.reason or self.multiset is not None or self.keyed is not None:
-                raise ValueError("not_checked requires a reason and no verdict")
+            if self.reason_code not in _NOT_CHECKED_CODES:
+                raise ValueError("not_checked requires a not-checked reason code")
+            if self.multiset is not None or self.keyed is not None or self.keyed_reason:
+                raise ValueError("not_checked carries no row or key verdict")
+            if (self.pending is None) == (self.reason_code == "awaiting_confirmation"):
+                raise ValueError("awaiting_confirmation is the only pending result")
             return
+        if self.pending is not None:
+            raise ValueError("a finished comparison does not carry a pending request")
         if self.status == "equivalent":
-            if not (schema_ok and rows_ok and keys_ok):
-                raise ValueError("equivalent requires a match on schema, rows, and key")
-            if self.reason != _EQUIVALENT_ON_INPUTS:
+            if self.reason_code != "equivalent_on_compared_inputs":
                 raise ValueError("equivalent must say it holds for the compared inputs")
+            if not (schema_ok and rows_ok):
+                raise ValueError("equivalent requires a match on schema and rows")
+            if self.keyed is None:
+                if self.keyed_reason not in (None, "key_not_unique"):
+                    raise ValueError("a dropped key must say the key was not unique")
+                return
+            if not keys_ok:
+                raise ValueError("equivalent requires a matching reported key")
             return
         if self.status != "different":
             raise ValueError(f"unknown comparison status {self.status!r}")
-        if self.schema is None or not self.reason:
-            raise ValueError("different requires a schema diff and a reason")
-        if self.schema.compatible:
-            if self.multiset is None or (rows_ok and keys_ok):
-                raise ValueError("different requires a row or key difference")
+        if self.schema is None or self.reason_code not in _VERDICT_CODES:
+            raise ValueError("different requires a schema diff and a verdict code")
+        if not self.schema.compatible:
+            if (
+                self.reason_code != "schemas_differ"
+                or self.multiset is not None
+                or self.keyed is not None
+                or self.keyed_reason is not None
+            ):
+                raise ValueError("a schema difference does not carry a row verdict")
             return
-        if self.multiset is not None or self.keyed is not None:
-            raise ValueError("a schema difference does not carry a row verdict")
+        if self.multiset is None:
+            raise ValueError("a row verdict requires the multiset counts")
+        rows_differ = not rows_ok
+        if self.keyed_reason == "key_not_unique":
+            key_dropped = self.keyed is None and self.reason_code == "rows_differ"
+            if not key_dropped or not rows_differ:
+                raise ValueError("an invalid key keeps the multiset verdict only")
+            return
+        if self.keyed_reason is not None:
+            raise ValueError("unknown keyed reason")
+        if self.reason_code == "rows_differ":
+            if not rows_differ:
+                raise ValueError("rows_differ requires a row difference")
+            return
+        if self.reason_code == "keyed_rows_differ":
+            if rows_differ or self.keyed is None or keys_ok:
+                raise ValueError("keyed_rows_differ requires a key difference only")
+            return
+        raise ValueError("different requires a row or key difference")
 
 
 @dataclass(frozen=True)
@@ -224,80 +259,91 @@ class _Aligned:
 class _NotCheckedError(DexError):
     """The statements ran far enough to know they cannot be verdicted."""
 
-    def __init__(self, reason: str) -> None:
-        super().__init__(reason)
-        self.reason = reason
+    def __init__(
+        self,
+        reason_code: ReasonCode,
+        detail: str | None = None,
+        *,
+        schema: SchemaDiff | None = None,
+        pending: ConfirmationRequest | None = None,
+    ) -> None:
+        super().__init__(reason_code)
+        self.reason_code = reason_code
+        self.detail = detail
+        self.schema = schema
+        self.pending = pending
 
 
 def compare_selects(
     left_sql: str,
     right_sql: str,
-    connection: _DuckConn,
+    *,
+    adapter: Adapter,
+    cache: DexCache,
+    limits: QueryLimits,
+    command: str,
 ) -> MultisetDiff:
-    """Compare two compiled SELECTs as DuckDB multisets; return aggregate counts.
+    """Compare two compiled SELECTs as multisets and return aggregate counts.
 
-    ``left_sql`` and ``right_sql`` must be single SELECT statements (or WITH ...
-    SELECT) that DuckDB can nest as subqueries. The connection is whatever the
-    existing DuckDB test and adapter paths already open; this function does not
-    open warehouses or touch the filesystem.
+    ``left_sql`` and ``right_sql`` must be single SELECT statements the adapter
+    can describe and the firewall can approve. An empty statement raises
+    ``ValueError``. A comparison that cannot be verdicted raises ``ValueError``
+    with the reason code or its detail.
     """
 
-    left, right = _require_sql(left_sql, right_sql)
-    sql = _COMPARE_SQL.format(
-        left_row=_DUCKDB_ROW_FINGERPRINT.format(alias="dex_l"),
-        right_row=_DUCKDB_ROW_FINGERPRINT.format(alias="dex_r"),
-        left_sql=left,
-        right_sql=right,
+    result = compare_refactors(
+        left_sql,
+        right_sql,
+        adapter=adapter,
+        cache=cache,
+        limits=limits,
+        command=command,
     )
-    row = _fetch_one(connection, sql)
-    if row is None or len(row) != 4:
-        raise RuntimeError("multiset comparison returned no counts")
-    left_rows, right_rows, only_in_left, only_in_right = (int(v) for v in row)
-    if (
-        left_rows - right_rows != only_in_left - only_in_right
-        or left_rows < 0
-        or right_rows < 0
-        or only_in_left < 0
-        or only_in_right < 0
-    ):
-        raise RuntimeError("multiset comparison returned inconsistent counts")
-    return MultisetDiff(
-        left_rows=left_rows,
-        right_rows=right_rows,
-        only_in_left=only_in_left,
-        only_in_right=only_in_right,
-    )
+    if result.multiset is None:
+        raise ValueError(result.detail or result.reason_code)
+    return result.multiset
 
 
 def compare_schemas(
     left_sql: str,
     right_sql: str,
-    connection: _DuckConn,
     *,
+    adapter: Adapter,
+    cache: DexCache,
+    limits: QueryLimits,
+    command: str,
     column_mapping: Mapping[str, str] | None = None,
 ) -> SchemaDiff:
-    """Compare output names and canonical DuckDB types.
+    """Compare output names and reported types.
 
     ``column_mapping`` maps a baseline output name to a proposed output name.
     Unmapped baseline columns match a proposed column of the same name.
     Column order is not a difference. An empty statement, a mapping that is
-    not one-to-one, a mapping key that is not a baseline output, or a
-    duplicate output name raises ``ValueError``. DuckDB errors propagate.
+    not one-to-one, or a mapping that collapses two baseline columns raises
+    ``ValueError``. A statement the firewall or the adapter cannot describe
+    raises ``ValueError`` with the engine's detail.
+
+    ``cache``, ``limits``, and ``command`` match ``compare_refactors``. This
+    function stops after the schema, so it does not price a count.
     """
 
     left, right = _require_sql(left_sql, right_sql)
     mapping = _column_mapping(column_mapping)
     try:
-        return _align(left, right, connection, mapping).schema
+        left_cols, right_cols = _describe_pair(left, right, adapter)
+        return _align(left_cols, right_cols, mapping).schema
     except _NotCheckedError as exc:
-        raise ValueError(exc.reason) from exc
+        raise ValueError(exc.detail or exc.reason_code) from exc
 
 
 def compare_refactors(
     left_sql: str,
     right_sql: str,
-    connection: _DuckConn,
     *,
+    adapter: Adapter,
+    cache: DexCache,
+    limits: QueryLimits,
+    command: str,
     baseline_id: str | None = None,
     proposed_id: str | None = None,
     input_scope: str | None = None,
@@ -307,15 +353,15 @@ def compare_refactors(
     """Compare two compiled SELECTs on schema, multiset, and an optional key.
 
     ``key_columns`` are baseline output names. Each is mapped with
-    ``column_mapping`` when the proposed side renamed it. Counts are keys.
-    Omit the key, or pass an empty sequence, for a multiset comparison only.
+    ``column_mapping`` when the proposed side renamed it. Counts are keys, and
+    only a key that is unique on both sides is reported. Omit the key, or pass
+    an empty sequence, for a multiset comparison only.
 
     ``equivalent`` means these statements matched on the compared inputs.
-    It is not evidence that a build passed. A statement DuckDB cannot run,
-    a duplicate output name, a mapping key that is not a baseline output,
-    or a declared key that is not an output column is ``not_checked`` with
-    ``reason`` set. An empty statement raises ``ValueError``, as
-    ``compare_selects`` does.
+    It is not evidence that a build passed. A statement the firewall refuses,
+    a statement the adapter cannot describe, a duplicate output name, a mapping
+    key that is not a baseline output, or a declared key that is not an output
+    column is ``not_checked``. An empty statement raises ``ValueError``.
     """
 
     left, right = _require_sql(left_sql, right_sql)
@@ -326,10 +372,13 @@ def compare_refactors(
     def finish(
         *,
         status: Literal["equivalent", "different", "not_checked"],
-        reason: str | None,
-        schema: SchemaDiff | None,
-        multiset: MultisetDiff | None,
-        keyed: KeyedCounts | None,
+        reason_code: ReasonCode,
+        detail: str | None = None,
+        schema: SchemaDiff | None = None,
+        multiset: MultisetDiff | None = None,
+        keyed: KeyedCounts | None = None,
+        keyed_reason: KeyedReason | None = None,
+        pending: ConfirmationRequest | None = None,
     ) -> RefactorCompareResult:
         return RefactorCompareResult(
             baseline_id=baseline_id,
@@ -339,104 +388,155 @@ def compare_refactors(
             schema=schema,
             multiset=multiset,
             status=status,
-            reason=reason,
+            reason_code=reason_code,
+            detail=detail,
             keyed=keyed,
+            keyed_reason=keyed_reason,
+            pending=pending,
         )
 
     try:
-        aligned = _align(left, right, connection, mapping)
+        return _compare(
+            left,
+            right,
+            mapping,
+            keys,
+            adapter,
+            cache,
+            limits,
+            command,
+            finish,
+        )
     except _NotCheckedError as exc:
         return finish(
             status="not_checked",
-            reason=exc.reason,
-            schema=None,
-            multiset=None,
-            keyed=None,
-        )
-    except (ValueError, RuntimeError):
-        raise
-    except Exception as exc:
-        return finish(
-            status="not_checked",
-            reason=_exc_reason(exc),
-            schema=None,
-            multiset=None,
-            keyed=None,
+            reason_code=exc.reason_code,
+            detail=exc.detail,
+            schema=exc.schema,
+            pending=exc.pending,
         )
 
+
+def _compare(
+    left: str,
+    right: str,
+    mapping: Mapping[str, str],
+    keys: tuple[str, ...] | None,
+    adapter: Adapter,
+    cache: DexCache,
+    limits: QueryLimits,
+    command: str,
+    finish,
+):
+    left_cols, right_cols = _describe_pair(left, right, adapter)
+    aligned = _align(left_cols, right_cols, mapping)
     schema = aligned.schema
     if not schema.compatible:
-        return finish(
-            status="different",
-            reason="output schemas differ",
+        return finish(status="different", reason_code="schemas_differ", schema=schema)
+
+    unsupported = _unsupported_column(aligned.matched)
+    if unsupported is not None:
+        raise _NotCheckedError(
+            "unsupported_type",
+            unsupported,
             schema=schema,
-            multiset=None,
-            keyed=None,
+        )
+    if not aligned.matched:
+        raise _NotCheckedError(
+            "comparison_unreadable",
+            "query returns no columns",
+            schema=schema,
         )
 
     if keys is not None:
         problem = _key_problem(keys, [column.left_name for column in aligned.matched])
         if problem is not None:
-            return finish(
-                status="not_checked",
-                reason=problem,
-                schema=schema,
-                multiset=None,
-                keyed=None,
-            )
+            raise _NotCheckedError("invalid_key", problem, schema=schema)
 
     left_names = [column.left_name for column in aligned.matched]
     right_names = [column.right_name for column in aligned.matched]
-    left_proj = _project(left, left_names, left_names)
-    right_proj = _project(right, right_names, left_names)
-    try:
-        multiset = compare_selects(left_proj, right_proj, connection)
-    except (ValueError, RuntimeError):
-        raise
-    except Exception as exc:
-        return finish(
-            status="not_checked",
-            reason=_exc_reason(exc),
+    dialect = adapter.dialect
+    left_proj = _project(left, left_names, left_names, dialect)
+    right_proj = _project(right, right_names, left_names, dialect)
+    statements = [_multiset_sql(left_proj, right_proj, left_names, dialect)]
+    if keys is not None:
+        statements.append(_keyed_sql(left_proj, right_proj, left_names, keys, dialect))
+
+    approved: list[str] = []
+    for sql in statements:
+        try:
+            inspected = inspect_query(sql, cache, limits, dialect=dialect)
+        except QueryRefusedError as exc:
+            raise _NotCheckedError("firewall_refused", str(exc), schema=schema) from exc
+        approved.append(inspected.sql)
+
+    from .. import command_args
+
+    estimator = getattr(adapter, "query_estimate", None)
+    estimates = [
+        float(estimator(sql)) if callable(estimator) else 0.0 for sql in approved
+    ]
+    per_table = {"(refactor comparison)": estimates[0]}
+    if len(estimates) == 2:
+        per_table["(refactor key comparison)"] = estimates[1]
+    pending = command_args.confirmation_request(
+        command,
+        adapter,
+        sum(estimates),
+        per_table=per_table,
+        notes=["one confirmation covers the refactor comparison"],
+    )
+    if pending is not None:
+        raise _NotCheckedError(
+            "awaiting_confirmation",
             schema=schema,
-            multiset=None,
-            keyed=None,
+            pending=pending,
         )
 
+    try:
+        multiset_row = adapter.run_query(
+            approved[0], max_rows=1, timeout_seconds=limits.timeout_seconds
+        )
+    except Exception as exc:
+        raise _NotCheckedError(
+            "comparison_unreadable", type(exc).__name__, schema=schema
+        ) from exc
+    multiset = _multiset_from_counts(_read_counts(multiset_row, 4))
+
     keyed: KeyedCounts | None = None
-    if keys is not None:
-        payload = [name for name in left_names if name not in set(keys)]
+    keyed_reason: KeyedReason | None = None
+    if len(approved) == 2:
         try:
-            keyed = _keyed_counts(left_proj, right_proj, connection, keys, payload)
-        except (ValueError, RuntimeError):
-            raise
-        except Exception as exc:
-            return finish(
-                status="not_checked",
-                reason=_exc_reason(exc),
-                schema=schema,
-                multiset=None,
-                keyed=None,
+            keyed_row = adapter.run_query(
+                approved[1], max_rows=1, timeout_seconds=limits.timeout_seconds
             )
+        except Exception as exc:
+            raise _NotCheckedError(
+                "comparison_unreadable", type(exc).__name__, schema=schema
+            ) from exc
+        keyed, keyed_reason = _keyed_from_counts(_read_counts(keyed_row, 4))
 
     rows_differ = not multiset.equivalent
     keys_differ = keyed is not None and (
         keyed.only_in_left != 0 or keyed.only_in_right != 0 or keyed.changed != 0
     )
     if rows_differ or keys_differ:
-        reason = "row multisets differ" if rows_differ else "keyed rows differ"
+        reason_code: ReasonCode = "rows_differ" if rows_differ else "keyed_rows_differ"
         return finish(
             status="different",
-            reason=reason,
+            reason_code=reason_code,
             schema=schema,
             multiset=multiset,
             keyed=keyed,
+            keyed_reason=keyed_reason,
         )
     return finish(
         status="equivalent",
-        reason=_EQUIVALENT_ON_INPUTS,
+        reason_code="equivalent_on_compared_inputs",
         schema=schema,
         multiset=multiset,
         keyed=keyed,
+        keyed_reason=keyed_reason,
     )
 
 
@@ -480,74 +580,70 @@ def _key_columns(key_columns: Sequence[str] | None) -> tuple[str, ...] | None:
     return keys
 
 
-def _quote(identifier: str) -> str:
-    return '"' + identifier.replace('"', '""') + '"'
+def _describe_pair(
+    left: str, right: str, adapter: Adapter
+) -> tuple[tuple[ColumnMeta, ...], tuple[ColumnMeta, ...]]:
+    try:
+        assert_query_shape(left, dialect=adapter.dialect)
+    except QueryRefusedError as exc:
+        raise _NotCheckedError("baseline_refused", str(exc)) from exc
+    try:
+        assert_query_shape(right, dialect=adapter.dialect)
+    except QueryRefusedError as exc:
+        raise _NotCheckedError("proposed_refused", str(exc)) from exc
+
+    describe = getattr(adapter, "describe_query", None)
+    if not callable(describe):
+        raise _NotCheckedError(
+            "schema_unavailable",
+            "adapter does not describe query output",
+        )
+    return (
+        _describe_side(describe, left, "baseline_not_executable"),
+        _describe_side(describe, right, "proposed_not_executable"),
+    )
 
 
-def _fetch_one(connection: _DuckConn, sql: str) -> Any:
-    result = connection.execute(sql)
-    fetch = getattr(result, "fetchone", None)
-    if callable(fetch):
-        return fetch()
-    return next(iter(result))
+def _describe_side(describe, sql: str, code: ReasonCode) -> tuple[ColumnMeta, ...]:
+    try:
+        columns = tuple(describe(sql))
+    except Exception as exc:
+        # Class name only. DuckDB conversion errors quote the offending value.
+        raise _NotCheckedError(code, type(exc).__name__) from exc
+    return columns
 
 
-def _fetch_all(connection: _DuckConn, sql: str) -> list[Any]:
-    result = connection.execute(sql)
-    fetch = getattr(result, "fetchall", None)
-    if callable(fetch):
-        return list(fetch())
-    return list(result)
-
-
-def _exc_reason(exc: Exception) -> str:
-    text = str(exc).strip().splitlines()
-    if not text or not text[0].strip():
-        return exc.__class__.__name__
-    return text[0].strip()
-
-
-def _describe(connection: _DuckConn, sql: str) -> tuple[SchemaColumn, ...]:
-    query = _DESCRIBE_SQL.format(sql=sql)
-    columns: list[SchemaColumn] = []
-    for row in _fetch_all(connection, query):
-        if row is None or len(row) != 2:
-            raise RuntimeError("schema description returned no columns")
-        name, type_name = row
-        if not isinstance(name, str) or not isinstance(type_name, str):
-            raise RuntimeError("schema description returned a non-text column")
-        columns.append(SchemaColumn(name, type_name))
-    return tuple(columns)
-
-
-def _reject_duplicate_names(columns: Sequence[SchemaColumn], side: str) -> None:
+def _reject_duplicate_names(columns: Sequence[ColumnMeta], side: str) -> None:
     seen: set[str] = set()
     for column in columns:
         if column.name in seen:
             raise _NotCheckedError(
-                f"duplicate output column name {column.name!r} on {side}"
+                "duplicate_output_name",
+                f"duplicate output column name {column.name!r} on {side}",
             )
         seen.add(column.name)
 
 
 def _align(
-    left_sql: str,
-    right_sql: str,
-    connection: _DuckConn,
+    left_cols: Sequence[ColumnMeta],
+    right_cols: Sequence[ColumnMeta],
     mapping: Mapping[str, str],
 ) -> _Aligned:
-    left_cols = _describe(connection, left_sql)
-    right_cols = _describe(connection, right_sql)
     _reject_duplicate_names(left_cols, "baseline")
     _reject_duplicate_names(right_cols, "proposed")
     if not left_cols or not right_cols:
-        raise _NotCheckedError("query returns no columns")
+        if not left_cols:
+            raise _NotCheckedError(
+                "baseline_not_executable", "query returns no columns"
+            )
+        raise _NotCheckedError("proposed_not_executable", "query returns no columns")
     left_names = {column.name for column in left_cols}
     unknown = [name for name in mapping if name not in left_names]
     if unknown:
         shown = ", ".join(repr(name) for name in unknown)
         raise _NotCheckedError(
-            f"column mapping names a baseline column that is not an output: {shown}"
+            "invalid_mapping",
+            f"column mapping names a baseline column that is not an output: {shown}",
         )
 
     targets = [mapping.get(column.name, column.name) for column in left_cols]
@@ -563,16 +659,20 @@ def _align(
     matched: list[_MatchedColumn] = []
     for column, target in zip(left_cols, targets, strict=True):
         right = right_by_name.get(target)
+        left_schema = SchemaColumn(column.name, column.data_type)
         if right is None:
-            only_left.append(column)
+            only_left.append(left_schema)
             continue
         unmatched_right.discard(target)
-        if column.type_name != right.type_name:
-            mismatches.append(TypeMismatch(left=column, right=right))
+        right_schema = SchemaColumn(right.name, right.data_type)
+        if column.data_type != right.data_type:
+            mismatches.append(TypeMismatch(left=left_schema, right=right_schema))
             continue
-        matched.append(_MatchedColumn(column.name, right.name, column.type_name))
+        matched.append(_MatchedColumn(column.name, right.name, column.data_type))
     only_right = tuple(
-        column for column in right_cols if column.name in unmatched_right
+        SchemaColumn(column.name, column.data_type)
+        for column in right_cols
+        if column.name in unmatched_right
     )
     return _Aligned(
         schema=SchemaDiff(
@@ -584,19 +684,132 @@ def _align(
     )
 
 
-def _project(sql: str, source_names: Sequence[str], output_names: Sequence[str]) -> str:
+def _unsupported_column(columns: Sequence[_MatchedColumn]) -> str | None:
+    for column in columns:
+        base = column.type_name.strip().upper().split("(", 1)[0].strip()
+        if base in _UNGROUPABLE_TYPES:
+            return column.left_name
+    return None
+
+
+def _quote(name: str, dialect: str) -> str:
+    return exp.to_identifier(name, quoted=True).sql(dialect=dialect)
+
+
+def _project(
+    sql: str,
+    source_names: Sequence[str],
+    output_names: Sequence[str],
+    dialect: str,
+) -> str:
     """Select ``source_names`` under ``output_names``, in that order.
 
-    ``hash(row)`` follows column position and ignores names. Both sides are
-    projected into one order and one set of names before the fingerprint, so
-    a rename or a reordering is not reported as a changed row.
+    Both sides are projected into one order and one set of names before the
+    multiset comparison, so a rename or a reordering is not a changed row.
     """
 
     pairs = zip(source_names, output_names, strict=True)
     select_list = ", ".join(
-        f"{_quote(source)} AS {_quote(output)}" for source, output in pairs
+        f"{_quote(source, dialect)} as {_quote(output, dialect)}"
+        for source, output in pairs
     )
-    return _PROJECT_SQL.format(select_list=select_list, sql=sql)
+    # Names are quoted identifiers. sql already passed the SELECT shape check.
+    return f"select {select_list} from ({sql}) as dex_proj"  # noqa: S608
+
+
+def _grouped_cte(name: str, projection: str, column_list: str) -> str:
+    return (
+        f"{name} as (\n"  # noqa: S608
+        f"    select {column_list}, count(*) as dex_n\n"
+        f"    from ({projection}) as s\n"
+        f"    group by {column_list}\n"
+        ")"
+    )
+
+
+def _multiset_sql(
+    left_proj: str,
+    right_proj: str,
+    columns: Sequence[str],
+    dialect: str,
+) -> str:
+    quoted = [_quote(name, dialect) for name in columns]
+    column_list = ", ".join(quoted)
+    join = " and ".join(
+        f"dex_l.{name} is not distinct from dex_r.{name}" for name in quoted
+    )
+    left_cte = _grouped_cte("dex_l", left_proj, column_list)
+    right_cte = _grouped_cte("dex_r", right_proj, column_list)
+    # Quoted identifiers and projections the firewall has already shaped.
+    return (
+        f"with {left_cte},\n"
+        f"{right_cte}\n"
+        "select\n"
+        "    coalesce(sum(coalesce(dex_l.dex_n, 0)), 0) as left_rows,\n"
+        "    coalesce(sum(coalesce(dex_r.dex_n, 0)), 0) as right_rows,\n"
+        "    coalesce(sum(case\n"
+        "        when coalesce(dex_l.dex_n, 0) > coalesce(dex_r.dex_n, 0)\n"
+        "        then coalesce(dex_l.dex_n, 0) - coalesce(dex_r.dex_n, 0)\n"
+        "        else 0 end), 0) as only_in_left,\n"
+        "    coalesce(sum(case\n"
+        "        when coalesce(dex_r.dex_n, 0) > coalesce(dex_l.dex_n, 0)\n"
+        "        then coalesce(dex_r.dex_n, 0) - coalesce(dex_l.dex_n, 0)\n"
+        "        else 0 end), 0) as only_in_right\n"
+        "from dex_l full outer join dex_r\n"
+        f"    on {join}\n"
+    )
+
+
+def _keyed_sql(
+    left_proj: str,
+    right_proj: str,
+    columns: Sequence[str],
+    keys: Sequence[str],
+    dialect: str,
+) -> str:
+    quoted = [_quote(name, dialect) for name in columns]
+    key_quoted = [_quote(name, dialect) for name in keys]
+    column_list = ", ".join(quoted)
+    key_list = ", ".join(key_quoted)
+    # dex_n, not coalesce of the two keys. A NULL key on a present row must not
+    # collapse into the missing side, whose key is also NULL.
+    key_exprs = ", ".join(
+        "case when dex_l.dex_n is not null"
+        f" then dex_l.{name} else dex_r.{name} end as {name}"
+        for name in key_quoted
+    )
+    join = " and ".join(
+        f"dex_l.{name} is not distinct from dex_r.{name}" for name in quoted
+    )
+    left_cte = _grouped_cte("dex_l", left_proj, column_list)
+    right_cte = _grouped_cte("dex_r", right_proj, column_list)
+    return (
+        f"with {left_cte},\n"  # noqa: S608
+        f"{right_cte},\n"
+        "dex_rows as (\n"
+        "    select\n"
+        f"        {key_exprs},\n"
+        "        coalesce(dex_l.dex_n, 0) as dex_ln,\n"
+        "        coalesce(dex_r.dex_n, 0) as dex_rn\n"
+        "    from dex_l full outer join dex_r\n"
+        f"        on {join}\n"
+        "),\n"
+        "dex_keys as (\n"
+        f"    select {key_list}, sum(dex_ln) as dex_ln, sum(dex_rn) as dex_rn,\n"
+        "           max(case when dex_ln <> dex_rn then 1 else 0 end) as dex_diff\n"
+        f"    from dex_rows group by {key_list}\n"
+        ")\n"
+        "select\n"
+        "    coalesce(sum(case when dex_ln > 1 or dex_rn > 1\n"
+        "        then 1 else 0 end), 0) as non_unique_keys,\n"
+        "    coalesce(sum(case when dex_ln > 0 and dex_rn = 0\n"
+        "        then 1 else 0 end), 0) as only_in_left,\n"
+        "    coalesce(sum(case when dex_rn > 0 and dex_ln = 0\n"
+        "        then 1 else 0 end), 0) as only_in_right,\n"
+        "    coalesce(sum(case when dex_ln > 0 and dex_rn > 0 and dex_diff = 1\n"
+        "        then 1 else 0 end), 0) as changed\n"
+        "from dex_keys\n"
+    )
 
 
 def _key_problem(keys: Sequence[str], names: Sequence[str]) -> str | None:
@@ -612,41 +825,55 @@ def _key_problem(keys: Sequence[str], names: Sequence[str]) -> str | None:
     return None
 
 
-def _payload_fingerprint(payload: Sequence[str]) -> str:
-    # DuckDB hash(list_sort(list(0))) is 0 at every list length, so a constant
-    # 0 would hide a change in how many rows a key has. 1 does not.
-    if not payload:
-        return "1"
-    fields = ", ".join(f"{_quote(name)} := {_quote(name)}" for name in payload)
-    return f"hash(struct_pack({fields}))"
+def _read_counts(result: QueryResult, width: int) -> list[int]:
+    if result.truncated or len(result.cells) != 1:
+        raise _NotCheckedError(
+            "comparison_unreadable",
+            "comparison did not return one row",
+        )
+    row = result.cells[0]
+    if len(row) != width:
+        raise _NotCheckedError(
+            "comparison_unreadable",
+            "comparison returned the wrong number of counts",
+        )
+    values: list[int] = []
+    for value in row:
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise _NotCheckedError(
+                "comparison_unreadable",
+                "comparison returned a count that is not a non-negative integer",
+            )
+        values.append(value)
+    return values
 
 
-def _keyed_counts(
-    left_sql: str,
-    right_sql: str,
-    connection: _DuckConn,
-    keys: Sequence[str],
-    payload: Sequence[str],
-) -> KeyedCounts:
-    key_list = ", ".join(_quote(name) for name in keys)
-    join_pairs = " and ".join(
-        f"l.{_quote(name)} is not distinct from r.{_quote(name)}" for name in keys
-    )
-    sql = _KEYED_SQL.format(
-        keys=key_list,
-        fingerprint=_payload_fingerprint(payload),
-        left_sql=left_sql,
-        right_sql=right_sql,
-        join_pairs=join_pairs,
-    )
-    row = _fetch_one(connection, sql)
-    if row is None or len(row) != 3:
-        raise RuntimeError("keyed comparison returned no counts")
-    only_in_left, only_in_right, changed = (int(value) for value in row)
-    if only_in_left < 0 or only_in_right < 0 or changed < 0:
-        raise RuntimeError("keyed comparison returned inconsistent counts")
-    return KeyedCounts(
+def _multiset_from_counts(values: Sequence[int]) -> MultisetDiff:
+    left_rows, right_rows, only_in_left, only_in_right = values
+    if left_rows - right_rows != only_in_left - only_in_right:
+        raise _NotCheckedError(
+            "comparison_unreadable",
+            "comparison counts are inconsistent",
+        )
+    return MultisetDiff(
+        left_rows=left_rows,
+        right_rows=right_rows,
         only_in_left=only_in_left,
         only_in_right=only_in_right,
-        changed=changed,
+    )
+
+
+def _keyed_from_counts(
+    values: Sequence[int],
+) -> tuple[KeyedCounts | None, KeyedReason | None]:
+    non_unique, only_in_left, only_in_right, changed = values
+    if non_unique > 0:
+        return None, "key_not_unique"
+    return (
+        KeyedCounts(
+            only_in_left=only_in_left,
+            only_in_right=only_in_right,
+            changed=changed,
+        ),
+        None,
     )
