@@ -1806,9 +1806,6 @@ def _select_branches(tree, sql_shape) -> list:
     top-level SELECT is already its own one-element answer; anything else
     (no FROM at all, a VALUES list) has no join to find and returns empty.
     """
-
-
-def _select_branches(tree, sql_shape):
     return sql_shape.select_branches(tree)
 
 
