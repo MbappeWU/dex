@@ -102,6 +102,9 @@ INTERNAL_REFUSALS = {
     # every one is caught and rendered as the `reason` on a finding that reports
     # it could not attribute a change. A consumer reads that field, not this type.
     "UnattributableError",
+    # Control flow inside multiset compare; caught and rendered as MultisetDiff
+    # reason; never a boundary event.
+    "_NotCheckedError",
     # The transform surface. Every one of these needs a repo_root, so they sit
     # outside "reachable from the public API without a repo_root". Worth
     # revisiting as a family if a host ever drives transform programmatically.

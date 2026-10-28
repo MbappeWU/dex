@@ -17,6 +17,8 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Literal, Protocol
 
+from ..errors import DexError
+
 
 class _DuckConn(Protocol):
     def execute(self, query: str) -> Any: ...
@@ -219,7 +221,7 @@ class _Aligned:
     matched: tuple[_MatchedColumn, ...]
 
 
-class _NotCheckedError(Exception):
+class _NotCheckedError(DexError):
     """The statements ran far enough to know they cannot be verdicted."""
 
     def __init__(self, reason: str) -> None:
