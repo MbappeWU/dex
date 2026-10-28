@@ -110,8 +110,10 @@ INTERNAL_REFUSALS = {
     # "qualify the name" from "edit the sources file", and ScaffoldError goes
     # with its two subclasses so `except ScaffoldError` works from the root too.
     # Transform/artifact isolation control flow (hosts catch DexError or
-    # use isolate_on_collision=True).
+    # use isolate_on_collision=True). ForeignInvocationError is the same
+    # family: the artifacts belong to another invocation.
     "ArtifactCollisionError",
+    "ForeignInvocationError",
     "BuildFailedError",
     "DbtParseError",
     "DbtProjectError",

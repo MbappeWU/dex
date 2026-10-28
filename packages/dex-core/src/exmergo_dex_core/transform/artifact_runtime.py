@@ -1,15 +1,22 @@
-"""Artifact-producer provenance and cross-runtime isolation (#862).
+"""Artifact-producer provenance and per-runtime artifact isolation (#862).
 
 Dex's dbt runtime and a separately pinned project or CI runtime can share a
 ``target/`` directory. Incompatible dbt versions have left
 ``target/run/<project>/snapshots/<name>.sql`` as a directory that a later
-version then opens as a file (``IsADirectoryError``). This module records who
-produced the artifacts in sanitized evidence, and gives callers a synthetic
-isolation helper for the collision case.
+version then opens as a file (``IsADirectoryError``).
 
-Centralizing every reader/writer onto one target-path policy needs maintainer
-pairing; this first contribution only adds producer metadata and the
-isolation/collision fixture.
+The policy is runtime isolation, through :func:`resolve_artifact_dir` and
+:func:`runtime_artifact_dir`. A clean shared ``target/`` is reused, which is
+the same-runtime case and is unchanged. A collision isolates this runtime in a
+sibling directory, or refuses when isolation is off. Neither choice deletes
+caller-owned artifacts.
+
+A caller that needs the artifacts at a chosen path passes that directory, or a
+runtime key that resolves one. :func:`artifact_paths` is the one naming of
+``run_results.json`` and ``manifest.json`` inside that directory, so the build
+and the evidence read use the same files. A reader that names an expected
+invocation id refuses results from a different invocation. Missing artifacts
+stay missing. Neither case is a successful completion.
 """
 
 from __future__ import annotations
@@ -178,3 +185,79 @@ def resolve_artifact_dir(
     isolated = runtime_artifact_dir(shared_path.parent, runtime_key)
     isolated.mkdir(parents=True, exist_ok=True)
     return isolated
+
+
+@dataclass(frozen=True)
+class ArtifactPaths:
+    """The artifact files dex reads back from one directory.
+
+    ``directory`` is that directory. ``run_results`` and ``manifest`` are the
+    paths inside it, whether or not the files exist yet.
+    """
+
+    directory: Path
+    run_results: Path
+    manifest: Path
+
+
+def artifact_paths(artifact_dir: Path | str) -> ArtifactPaths:
+    """Name ``run_results.json`` and ``manifest.json`` inside ``artifact_dir``."""
+
+    directory = Path(artifact_dir)
+    return ArtifactPaths(
+        directory=directory,
+        run_results=directory / "run_results.json",
+        manifest=directory / "manifest.json",
+    )
+
+
+def prepare_artifact_dir(
+    project_root: Path | str,
+    runtime_key: str,
+    *,
+    shared_relative: str = "target",
+    isolate_on_collision: bool = True,
+) -> Path:
+    """Resolve the artifact directory for ``runtime_key`` in this project.
+
+    ``shared_relative`` is the caller-owned directory, ``target`` by default.
+    The choice is :func:`resolve_artifact_dir`. A clean shared directory is
+    reused. A collision isolates or refuses. Files already in the shared
+    directory are left where they are.
+    """
+
+    return resolve_artifact_dir(
+        Path(project_root) / shared_relative,
+        runtime_key,
+        isolate_on_collision=isolate_on_collision,
+    )
+
+
+def clear_run_results(artifact_dir: Path | str) -> None:
+    """Unlink ``run_results.json`` in this directory and nothing else.
+
+    A missing file is a no-op, so a first build and a directory that was never
+    written both pass. The rest of the directory, including a previous
+    runtime's collision, stays.
+    """
+
+    artifact_paths(artifact_dir).run_results.unlink(missing_ok=True)
+
+
+class ForeignInvocationError(DexError, ValueError):
+    """``run_results.json`` belongs to a different invocation than expected."""
+
+
+def assert_same_invocation(expected_id: str | None, actual_id: str | None) -> None:
+    """Raise when both invocation ids are present and they differ.
+
+    A missing artifact has no id, and a reader that did not name one is not
+    checking. Neither of those is a foreign invocation. Two different ids are,
+    and a successful completion must not be returned from them.
+    """
+
+    if expected_id is None or actual_id is None or expected_id == actual_id:
+        return
+    raise ForeignInvocationError(
+        f"run results belong to invocation '{actual_id}', not '{expected_id}'"
+    )
