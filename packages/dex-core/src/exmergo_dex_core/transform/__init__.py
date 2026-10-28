@@ -11,6 +11,7 @@ surface and stays a stub here.
 The engine entry points are re-exported here so callers address the capability,
 not its file layout: ``transform.plan(...)``, ``transform.apply(...)``,
 ``transform.build(...)``, ``transform.init_project(...)``.
+``transform.compare_refactors(...)`` compares two compiled SELECT statements.
 """
 
 from .build import (
@@ -23,6 +24,7 @@ from .build import (
     shadow_parse,
 )
 from .init import InitError, InitResult, init_project
+from .multiset_compare import RefactorCompareResult, compare_refactors
 from .plans import (
     EditKind,
     EditOp,
@@ -43,10 +45,12 @@ __all__ = [
     "PlanError",
     "PlanNotFoundError",
     "ProdTargetRefusedError",
+    "RefactorCompareResult",
     "TransformPlan",
     "apply",
     "assert_dev_target",
     "build",
+    "compare_refactors",
     "deps",
     "has_package_spec",
     "init_project",
