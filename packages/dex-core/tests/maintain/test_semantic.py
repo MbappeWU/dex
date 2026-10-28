@@ -253,7 +253,6 @@ def test_a_pathless_definition_omits_its_provenance():
     assert changed[0].data == {"kind": "semantic_model", "name": "orders"}
 
 
-
 def test_metric_definition_changed_lists_itself_and_dependents():
     """definition_changed for a metric fills impacted_metrics (#889).
 
