@@ -92,6 +92,12 @@ class SnowflakeTarget(BaseModel):
     (SAMPLE SYSTEM) instead of a full scan. ``credit_price_usd`` is the
     contract-specific dollar price of one credit; set it to see dollar figures
     next to the credit translation (no API exposes it, so dex never guesses).
+    ``suspend_after_command`` (off by default) suspends the pinned warehouse at
+    the end of a command that woke it and left it idle, so the command bills
+    its statements plus Snowflake's 60-second resume minimum rather than the
+    whole AUTO_SUSPEND tail. It needs OPERATE on the warehouse, and it never
+    touches a warehouse that was already running or that other queries are
+    using (issue #664).
     """
 
     account: str | None = None
@@ -102,6 +108,7 @@ class SnowflakeTarget(BaseModel):
     dev_schema: str | None = None
     max_full_profile_bytes: int | None = None
     credit_price_usd: float | None = None
+    suspend_after_command: bool = False
 
 
 class DatabricksTarget(BaseModel):

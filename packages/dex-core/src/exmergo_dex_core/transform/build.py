@@ -44,7 +44,7 @@ from ..dbt_project import (
 from ..dbt_project import load as load_project
 from ..envelope import Cost, EstimateQuality, Paradigm, redact
 from ..errors import DexError, PrerequisiteError
-from ..guards.cost_guard import preflight
+from ..guards.cost_guard import UPTIME_LINE, preflight
 from .artifact_runtime import (
     artifact_paths,
     clear_run_results,
@@ -1035,10 +1035,6 @@ _COMPILE_TIMEOUT_SECONDS = 300.0
 # scan nothing; everything else (operations, analyses, sources) issues no billed
 # build statement.
 _PRICED_RESOURCE_TYPES = {"model", "snapshot", "test"}
-
-#: The breakdown line for what a warehouse bills a command as a whole rather
-#: than any statement in it: Snowflake's resume minimum and idle tail.
-UPTIME_LINE = "(warehouse uptime)"
 
 
 def compile_estimate(

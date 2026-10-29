@@ -1466,6 +1466,7 @@ def test_billed_build_sums_bytes_billed_into_the_ledger(
         "estimate",
         "job_id",
         "statement_sha256",
+        "warehouse_claim",
     }
     assert entry["reservation_id"] == adapter.cost_gate.reservation_id
 
@@ -4052,7 +4053,10 @@ def test_a_build_that_resumed_the_warehouse_settles_its_uptime(
     assert spend["credits_billed"] == pytest.approx(64.0 / 3600, abs=1e-6)
     assert _settled_seconds(run.ledger) == pytest.approx(64.0)
     rows = [json.loads(line) for line in run.ledger.read_text().splitlines()]
-    settlements = [r for r in rows if r["entry"] == "settlement"]
+    # The claim on the resume cycle is a zero row of its own (#664).
+    settlements = [
+        r for r in rows if r["entry"] == "settlement" and not r["warehouse_claim"]
+    ]
     assert len(settlements) == 1, "the uptime joins dbt's row, keeping one ratio"
     assert settlements[0]["reservation_id"] == rows[0]["reservation_id"]
     [note] = _uptime_notes(envelope)

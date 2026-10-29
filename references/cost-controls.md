@@ -143,6 +143,7 @@ parses to a stable schema and no reader has to interpret an absent key.
 | `estimate` | the whole-command preflight figure the settlement was admitted on. `null` on the other two kinds, and on a settlement whose pricing degraded to no estimate at all |
 | `job_id` | the warehouse's identifier for the job, where it has one |
 | `statement_sha256` | a hash of the statement. Never its text, never a value. `null` on a settlement for spend no single statement produced, such as a build's dbt run or Snowflake's warehouse uptime |
+| `warehouse_claim` | what a Snowflake command claimed of the warehouse's current resume cycle: `warehouse`, `resumed_on`, `last_statement_end` (epoch seconds), `auto_suspend`, and `suspend` (what `snowflake.suspend_after_command` did: `suspended`, `refused_grant`, `already_suspended`, `failed`, or `null` when nothing was attempted). On a zero-amount settlement, so it changes no total; the next command in the same cycle reads it back to charge only what it adds rather than a second idle tail. `null` on every other row |
 
 **Settled spend is the `entry == "settlement"` filter**, summed over one
 connector's unit. That is not the same number as `session_spent_today` whenever

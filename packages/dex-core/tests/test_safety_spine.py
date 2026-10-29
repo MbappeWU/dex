@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import re
 import shutil
 import subprocess
 from datetime import UTC, datetime
@@ -4686,6 +4687,8 @@ def _sf_adapter(
     confirmed=True,
     databases=None,
     scope_override=None,
+    suspend_after_command=False,
+    ledger=None,
 ):
     from exmergo_dex_core.adapters.snowflake import SnowflakeAdapter
     from exmergo_dex_core.config import SnowflakeTarget
@@ -4698,15 +4701,22 @@ def _sf_adapter(
         session_spent=0.0,
         confirmed=confirmed,
         connector="snowflake",
+        record=ledger.append if ledger is not None else None,
+        history=(lambda: list(ledger)) if ledger is not None else None,
     )
     return SnowflakeAdapter(
         connection=fake_sf_connection,
         cost_gate=gate,
-        target=SnowflakeTarget(warehouse="DEX_WH", databases=databases or []),
+        target=SnowflakeTarget(
+            warehouse="DEX_WH",
+            databases=databases or [],
+            suspend_after_command=suspend_after_command,
+        ),
         account="TESTORG-TESTACCT",
         auth_method="named_connection:key_pair",
         scope_override=scope_override,
         clock=fake_sf_connection.clock,
+        wall_clock=fake_sf_connection.clock.wall,
     )
 
 
@@ -5107,9 +5117,131 @@ def test_select_only_guard_rejects_snowflake_writes_and_ddl():
         "COPY INTO @mystage/x FROM (SELECT 1)",
         "CALL d.proc()",
         "ALTER WAREHOUSE wh SET WAREHOUSE_SIZE = 'X-Large'",
+        # The one ALTER WAREHOUSE dex issues itself (#664) is no exception: it
+        # comes from a typed adapter method, never through the firewall.
+        'ALTER WAREHOUSE "DEX_WH" SUSPEND',
+        "ALTER WAREHOUSE wh RESUME",
     ):
         with pytest.raises(NotSelectOnlyError):
             assert_select_only(bad, dialect="snowflake")
+
+
+# Every statement the Snowflake adapter may issue that is not a SELECT or a SHOW
+# (issue #664). The suspend is the only one that acts on the account rather than
+# on dex's own session, and it is pinned to the configured warehouse by name.
+_SNOWFLAKE_NON_SELECT = (
+    re.compile(r'^USE WAREHOUSE "DEX_WH"$'),
+    re.compile(r"^ALTER SESSION SET QUERY_TAG = 'dex'$"),
+    re.compile(r"^ALTER SESSION SET STATEMENT_TIMEOUT_IN_SECONDS = \d+$"),
+    re.compile(r'^ALTER WAREHOUSE "DEX_WH" SUSPEND$'),
+)
+
+
+def _sf_one_command(adapter) -> None:
+    adapter.profile_estimate(["SHOP.PUBLIC.CUSTOMERS"])
+    adapter.run_query(
+        'SELECT COUNT(*) AS n FROM "SHOP"."PUBLIC"."CUSTOMERS"',
+        max_rows=10,
+        timeout_seconds=30,
+    )
+    adapter.cost_gate.settle()
+
+
+def _sf_suspends(connection) -> list[str]:
+    return [
+        s.sql
+        for s in connection.statements
+        if s.sql.upper().startswith("ALTER WAREHOUSE")
+    ]
+
+
+def test_snowflake_issues_only_a_fixed_set_of_non_select_statements(
+    fake_sf_connection,
+):
+    # Family 1: read-only against data. Across a whole command with
+    # snowflake.suspend_after_command on, everything that is not a SELECT or a
+    # SHOW matches the fixed set, and the suspend it adds names the pin.
+    adapter = _sf_adapter(fake_sf_connection, suspend_after_command=True, ledger=[])
+    _sf_one_command(adapter)
+    others = [
+        s.sql.strip()
+        for s in fake_sf_connection.statements
+        if not s.sql.strip().upper().startswith(("SELECT", "SHOW "))
+    ]
+    assert 'ALTER WAREHOUSE "DEX_WH" SUSPEND' in others
+    for sql in others:
+        assert any(p.match(sql) for p in _SNOWFLAKE_NON_SELECT), sql
+
+
+def test_snowflake_never_suspends_when_the_setting_is_off(fake_sf_connection):
+    adapter = _sf_adapter(fake_sf_connection, ledger=[])
+    _sf_one_command(adapter)
+    assert _sf_suspends(fake_sf_connection) == []
+    assert fake_sf_connection.warehouses[0].state == "STARTED"
+
+
+def test_snowflake_never_suspends_a_warehouse_it_did_not_wake(fake_sf_connection):
+    fake_sf_connection.warehouses[0].state = "STARTED"
+    adapter = _sf_adapter(fake_sf_connection, suspend_after_command=True, ledger=[])
+    _sf_one_command(adapter)
+    assert _sf_suspends(fake_sf_connection) == []
+
+
+def test_snowflake_never_suspends_a_busy_warehouse(fake_sf_connection):
+    adapter = _sf_adapter(fake_sf_connection, suspend_after_command=True, ledger=[])
+    adapter.run_query(
+        'SELECT COUNT(*) AS n FROM "SHOP"."PUBLIC"."CUSTOMERS"',
+        max_rows=10,
+        timeout_seconds=30,
+    )
+    fake_sf_connection.warehouses[0].queued = 1
+    adapter.cost_gate.settle()
+    assert _sf_suspends(fake_sf_connection) == []
+
+
+def test_snowflake_never_suspends_a_warehouse_with_auto_resume_off(
+    fake_sf_connection,
+):
+    # With AUTO_RESUME off, a suspend would make every query anyone sends
+    # afterwards fail until someone resumes the warehouse by hand.
+    fake_sf_connection.warehouses[0].auto_resume = False
+    adapter = _sf_adapter(fake_sf_connection, suspend_after_command=True, ledger=[])
+    _sf_one_command(adapter)
+    assert _sf_suspends(fake_sf_connection) == []
+    assert fake_sf_connection.warehouses[0].state == "STARTED"
+
+
+def test_snowflake_never_suspends_a_resume_that_was_not_its_own(fake_sf_connection):
+    from fakes.snowflake import _iso
+
+    adapter = _sf_adapter(fake_sf_connection, suspend_after_command=True, ledger=[])
+    adapter.run_query(
+        'SELECT COUNT(*) AS n FROM "SHOP"."PUBLIC"."CUSTOMERS"',
+        max_rows=10,
+        timeout_seconds=30,
+    )
+    fake_sf_connection.warehouses[0].resumed_on = _iso(
+        fake_sf_connection.clock.wall() + 600
+    )
+    adapter.cost_gate.settle()
+    assert _sf_suspends(fake_sf_connection) == []
+
+
+def test_snowflake_never_suspends_a_warehouse_other_than_the_pin(fake_sf_connection):
+    from fakes.snowflake import FakeWarehouse
+
+    other = FakeWarehouse(name="OTHER_WH", state="STARTED")
+    fake_sf_connection.warehouses.append(other)
+    adapter = _sf_adapter(fake_sf_connection, suspend_after_command=True, ledger=[])
+    _sf_one_command(adapter)
+    assert _sf_suspends(fake_sf_connection) == ['ALTER WAREHOUSE "DEX_WH" SUSPEND']
+    assert other.state == "STARTED" and other.suspends == 0
+
+    # And the typed method refuses outright when SHOW's spelling of the
+    # warehouse is not the pin (SHOW ... LIKE treats `_` as a wildcard).
+    adapter._warehouse_info["name"] = "DEXXWH"
+    assert adapter._suspend_warehouse() == "failed"
+    assert _sf_suspends(fake_sf_connection) == ['ALTER WAREHOUSE "DEX_WH" SUSPEND']
 
 
 def test_snowflake_unconfirmed_scan_never_executes(fake_sf_connection):

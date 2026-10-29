@@ -408,12 +408,14 @@ A hosted dbt Cloud token has its own provider:
 from exmergo_dex_core import DexConfig, DexEngine, SemanticSource
 
 # host, environment_id, and token_for_user come from your application.
-config = DexConfig(semantic={
-    "vendor": "dbt",
-    "deployment": "dbt_cloud",
-    "host": host,
-    "environment_id": environment_id,
-})
+config = DexConfig(
+    semantic={
+        "vendor": "dbt",
+        "deployment": "dbt_cloud",
+        "host": host,
+        "environment_id": environment_id,
+    }
+)
 
 with DexEngine(
     config=config,
