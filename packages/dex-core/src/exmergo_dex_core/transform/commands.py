@@ -236,6 +236,7 @@ def init_project(
         created=result.created,
         diffs=result.diffs,
         warnings=preflight,
+        notes=init_mod.identity_notes(connector, fresh, repo_root),
     )
 
 

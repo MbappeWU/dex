@@ -710,6 +710,31 @@ def _trino_namespace(
     return list(warnings)
 
 
+def _identity_refusal(
+    connector: str,
+    noun: str,
+    committed: str | None,
+    role: str,
+    problem: str,
+    dev_schema: str,
+) -> str | None:
+    """The refusal that leads with the committed build identity, or None when
+    the config records no identity other than the profile's: granting CREATE
+    to the role dex reads with would widen dex's own access (#904)."""
+
+    if not committed or committed == role:
+        return None
+    return (
+        f"{connector} {noun} {role} is missing {problem}; but {connector}.user in "
+        f".dex/config.yml commits {committed} as the build identity, and this "
+        f"profile does not name it. Point the profile's user at {committed} "
+        f"(re-run `transform init`, or edit profiles.yml), or grant the {noun} "
+        "it does name with:\n"
+        f"  GRANT USAGE, CREATE ON SCHEMA {dev_schema} TO {role};\n"
+        "(dbt builds every model in that schema)"
+    )
+
+
 def _postgres_namespace(
     project: Path,
     target: str,
@@ -767,6 +792,11 @@ def _postgres_namespace(
             "build otherwise dies on a bare permission error), or point "
             "postgres.dev_schema at a schema the role can write"
         )
+    refusal = _identity_refusal(
+        "postgres", "role", pg.user, role, problem, pg.dev_schema
+    )
+    if refusal is not None:
+        raise DevTargetError(refusal)
     raise DevTargetError(
         f"postgres role {role} is missing {problem}; grant it with:\n"
         f"  GRANT USAGE, CREATE ON SCHEMA {pg.dev_schema} TO {role};\n"
@@ -832,6 +862,11 @@ def _redshift_namespace(
             "build otherwise dies on a bare permission error), or point "
             "redshift.dev_schema at a schema the user can write"
         )
+    refusal = _identity_refusal(
+        "redshift", "user", rs.user, role, problem, rs.dev_schema
+    )
+    if refusal is not None:
+        raise DevTargetError(refusal)
     raise DevTargetError(
         f"redshift user {role} is missing {problem}; grant it with:\n"
         f"  GRANT USAGE, CREATE ON SCHEMA {rs.dev_schema} TO {role};\n"
