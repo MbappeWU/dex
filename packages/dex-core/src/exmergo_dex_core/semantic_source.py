@@ -354,7 +354,7 @@ class SemanticDerivationSource(Protocol):
     the project's YAML and validates with dbt's parse; SLayer writes one model
     file per declared model; Ossie (#500) splices a dataset into a configured
     multi-dataset document and carries metadata in ``ai_context``; Cube (#911)
-    splices a cube into a configured file and joins through
+    writes one cube file per declared model and joins through
     ``DeclaredReference.parent_identifier``.
     """
 

@@ -360,7 +360,8 @@ reads** (`semantic.vendor`). Every vendor sits behind one hook
 | --- | --- |
 | `dbt` (default) | a MetricFlow semantic model, spliced into the dbt plan |
 | `slayer` | a SLayer model file, stored as a plan of its own beside the dbt plan |
-| `ossie`, `cube` | nothing yet (#500, #911): a warning says the layer does not carry declarations, so none is mistaken for derived |
+| `cube` | a Cube model file, stored as a plan of its own beside the dbt plan |
+| `ossie` | nothing yet (#500): a warning says the layer does not carry declarations, so none is mistaken for derived |
 
 Three rules hold for every vendor. Metrics are never derived: a measure is what a
 column holds, a metric is a business definition, and it stays the author's. Nothing
@@ -478,7 +479,31 @@ Whether it is included depends on the write surface:
   pass `data.semantic_proposal.definitions` (an edits payload) to
   `semantic slayer define --edits-file`, or re-run the plan to include it.
 
-### Declarations on `semantic slayer`
+### Cube (`semantic.vendor: cube`)
+
+One file per mart, `<dir>/<mart>.yml`, where `<dir>` is the one directory the
+configured YAML files share (`model/cubes` where they share none):
+
+| Declaration | Cube |
+| --- | --- |
+| `grain` | `primary_key: true` on each grain dimension, a composite grain included |
+| any role but `measure` | a dimension, `sql: "{CUBE}.<column>"`, typed `time`, `number`, `boolean` or `string` from the SQL's casts or the cache's profile; a `time` role is always `time` (with a note where the type could not be read) |
+| `measure` with `aggregation` | a measure named after the column, `sql: "{CUBE}.<column>"`: `sum`, `avg` (`average`, `mean`), `min`, `max`, `count`, `count_distinct`. The column is not also a dimension, as MetricFlow does not make it one |
+| `median`, `semi_additive` | no measure, named in `limitations` and `not_carried`: Cube has no median type, and no measure that sums across entities but not across time |
+| `foreign_key` with `references` | a `many_to_one` join, `{CUBE}.<column> = {<parent>}.<parent column>`, to the cube already on the parent's table; none, or a second key to the same cube, means no join and a note |
+| `description` | the cube's and each member's `description` |
+| `population`, `assumptions` | the cube's `meta.dex`, and the population sentence in its description; never a measure filter or a segment |
+| `unit`, `null_rule`, `additivity` | the member's `meta.dex` |
+
+`sql_table` follows the SLayer order (the siblings' `database.schema`, else the
+manifest relation, else the bare name as a limitation), and `data_source` is
+written only where `semantic.cube.data_source` is not `default`. A cube already on
+the mart's table is `skipped`; a cube or view holding its name is `failed`.
+Included and proposed work as for SLayer, against `semantic.cube.files`: listed
+paths are stored as a plan of their own (`plan_id`; apply both), others are
+proposed with the `dex config set semantic.cube.files '[...]'` that adds them.
+
+### Declarations on `semantic slayer` and `semantic cube`
 
 `semantic slayer define|update|plan` take the same `declarations` key beside
 `edits`. There a declaration **annotates** a SLayer model the payload's edits or
@@ -489,7 +514,12 @@ aggregation adds its `<column>_<agg>` saved measure, and `population`,
 `assumptions`, `unit`, `null_rule` and `additivity` land in `meta.dex`. The
 declaration wins field by field and nothing else moves; a declaration naming no
 defined model is refused. `edits` may be omitted. The result is validated by the
-layer's own checks before the plan is stored. `semantic ossie` refuses a
+layer's own checks before the plan is stored. `semantic cube` does the same for a
+cube (`model` is the cube's name; a view is refused, since it has no table of its
+own): grain to `primary_key` on its dimensions, a declared aggregation adds a
+measure named after the column, a `references` adds a `many_to_one` join, and
+only that cube's entry in its file is rewritten, so every other cube, view and
+comment keeps its bytes. `semantic ossie` refuses a
 `declarations` payload by name until its layer implements the hook (#500).
 
 Per model, `status` is one of:
@@ -503,7 +533,7 @@ Per model, `status` is one of:
 | `skipped` | an authored definition already sits on the mart (never overwritten), or the declaration names nothing a definition carries |
 
 The key is absent when the plan touches no declared mart. Under a vendor whose
-layer does not implement the hook (`ossie`, `cube` today) nothing is derived and a
+layer does not implement the hook (`ossie` today) nothing is derived and a
 warning says so.
 
 ## `data.decisions`

@@ -2,7 +2,8 @@
 
 dex can author a semantic layer (`transform` / `semantic define|update` for dbt,
 `semantic ossie define|update` for native Apache Ossie documents, `semantic slayer
-define|update` for SLayer model files) and detect drift
+define|update` for SLayer model files, `semantic cube define|update` for Cube
+model files) and detect drift
 in it (`maintain semantic`). `explore semantic` is the third piece: it *queries*
 the layer, so an agent can discover metrics and, where the layer defines a
 runtime, run governed metric queries. Four layers answer the same commands
@@ -1274,6 +1275,20 @@ In short:
   `unavailable`.
 - **`query` and `values` refuse in this release**, `values` after its PII gate,
   because Cube renders a query only inside a Cube server.
+- **`semantic cube define|update|plan` authors the files** through plan/apply,
+  whole plain-YAML files written byte-for-byte, validated as one prospective set
+  by the same rules the reader runs, with a key Cube does not declare refused in
+  a file the plan writes. JS models, `globals.py`, `cube.py`/`cube.js` and
+  compiled-only files are refused by name. Declarations annotate a cube, rewriting
+  only its own entry in its file.
+- **A declared dbt mart derives a cube** of its own, `<dir>/<mart>.yml`:
+  `primary_key` on the grain dimensions, every other role a dimension, declared
+  aggregations as measures named after the column, `many_to_one` joins from
+  foreign keys to the cube on the parent's table, and the population as
+  `meta.dex` plus one sentence in the description, never a filter or a segment.
+  It is stored as a plan of its own beside the dbt plan where its path is already
+  in `semantic.cube.files`, and proposed with the `dex config set` that adds it
+  otherwise.
 
 What Dex accepts, checks, maps and declines to claim, rule by rule, is in
 [Cube compatibility](cube-compatibility.md).

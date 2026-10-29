@@ -46,7 +46,9 @@ of or on top of hand-authored edits.
   not, validated by MetricFlow's schemas, the metric-input check and dbt's parse
   of a throwaway copy, never skipped. SLayer: a model file stored as a second
   plan (`plan_id`; apply both) where its path is under `semantic.slayer.models`,
-  proposed with the `dex config set` that adopts it otherwise. Per model,
+  proposed with the `dex config set` that adopts it otherwise. Cube: a model
+  file of its own, `<dir>/<mart>.yml`, on the same terms against
+  `semantic.cube.files`. Per model,
   `carried` and `not_carried` account for every declared field. Absent when no
   declared mart was touched. Shape and statuses in `declarations.md`.
 

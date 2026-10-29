@@ -118,6 +118,9 @@ def semantic_native(
         warnings=[*plan_warnings, *validation.warnings],
         defined=validation.defined,
         updated=validation.updated,
+        # Omitted rather than empty, so a layer that never reports one keeps the
+        # envelope it had.
+        unchanged=validation.unchanged or None,
     )
 
 

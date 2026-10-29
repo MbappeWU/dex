@@ -50,6 +50,8 @@ from ..semantic_declarations import (
     account,
     column_metadata,
     model_metadata,
+    placed_table,
+    sibling_prefix,
     with_population,
 )
 
@@ -475,23 +477,11 @@ def _data_source(
 def _sibling_prefix(
     current: Mapping[str, dict[str, Any]], identifiers: Mapping[str, str]
 ) -> str | None:
-    """The ``database.schema`` every SLayer model on this project's models shares.
+    """The ``database.schema`` every SLayer model on this project's models shares."""
 
-    A model whose ``sql_table`` ends in a table this dbt project builds is a
-    sibling; where every sibling agrees on what precedes the table name, a new
-    mart from the same project is read from there too.
-    """
-
-    built = {identifier.lower() for identifier in identifiers.values()}
-    prefixes = set()
-    for entry in current.values():
-        table = entry.get("sql_table")
-        if not isinstance(table, str) or "." not in table:
-            continue
-        head, _, last = table.rpartition(".")
-        if last.strip('"`').lower() in built:
-            prefixes.add(head)
-    return next(iter(prefixes)) if len(prefixes) == 1 else None
+    return sibling_prefix(
+        (entry.get("sql_table") for entry in current.values()), identifiers.values()
+    )
 
 
 def _sql_table(
@@ -499,23 +489,24 @@ def _sql_table(
 ) -> tuple[str, str | None, str | None]:
     """The table, a note saying where it came from, and a limitation if partial."""
 
-    if prefix is not None:
+    table, source = placed_table(identifier, declaration.relation, prefix)
+    if source == "siblings":
         return (
-            f"{prefix}.{identifier}",
-            f"sql_table is {prefix}.{identifier}: the database and schema the "
+            table,
+            f"sql_table is {table}: the database and schema the "
             "SLayer models on this project's other models already read",
             None,
         )
-    if declaration.relation:
+    if source == "manifest":
         return (
-            declaration.relation,
-            f"sql_table is {declaration.relation}, the relation the compiled dbt "
+            table,
+            f"sql_table is {table}, the relation the compiled dbt "
             "manifest names, which is whatever target last compiled the project "
             "(often dev). Point it at the relation SLayer's datasource reads",
             None,
         )
     return (
-        identifier,
+        table,
         None,
         f"sql_table is the bare table name '{identifier}': no SLayer model sits on "
         "another of this project's models and there is no compiled manifest, so "

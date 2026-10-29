@@ -121,6 +121,30 @@ def test_database_allowlist_scopes_inventory(fake_sf_connection):
     assert all(o.identifier.startswith("SHOP.") for o in adapter.list_objects())
 
 
+def test_a_database_scope_never_inventories_information_schema(fake_sf_connection):
+    # SHOW ... IN DATABASE lists the database's INFORMATION_SCHEMA views beside
+    # its own objects; profiling them would scan Snowflake's catalog as data.
+    from fakes.snowflake import FakeSnowflakeTable
+
+    fake_sf_connection.tables.append(
+        FakeSnowflakeTable(
+            database="SHOP",
+            schema="INFORMATION_SCHEMA",
+            name="COLUMNS",
+            columns=[("COLUMN_NAME", "TEXT", True)],
+            kind="view",
+        )
+    )
+    adapter = make_adapter(
+        fake_sf_connection,
+        target=SnowflakeTarget(warehouse="DEX_WH", databases=["SHOP"]),
+    )
+
+    objects = adapter.list_objects()
+    assert objects
+    assert all(o.schema != "INFORMATION_SCHEMA" for o in objects)
+
+
 def test_table_metadata_parses_show_columns_types(fake_sf_connection):
     adapter = make_adapter(fake_sf_connection)
     meta, columns = adapter.table_metadata("SHOP.PUBLIC.EVENTS")

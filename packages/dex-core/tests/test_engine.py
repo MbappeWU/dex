@@ -150,6 +150,7 @@ _METHOD_NAMES = {
     ("explore", "semantic"): "semantic_list",
     ("semantic", "ossie"): "semantic_ossie",
     ("semantic", "slayer"): "semantic_slayer",
+    ("semantic", "cube"): "semantic_cube",
     ("maintain", "schema"): "schema_drift",
     ("maintain", "volume"): "volume_drift",
     ("maintain", "grain"): "grain_drift",

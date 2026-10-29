@@ -1,7 +1,8 @@
 # Cube compatibility
 
 What Dex accepts from a [Cube](https://github.com/cube-js/cube) model file, what it
-checks, what it makes of what it read, and what it does not claim. Read it beside
+checks, what it makes of what it read, how it writes one, and what it does not
+claim. Read it beside
 [Cube models](semantic-layer.md#cube-models-vendor-cube), which describes how to
 configure the layer.
 
@@ -29,6 +30,7 @@ cube changed.
 |---|---|---|
 | `config validate`, `config get` on a `semantic.cube` block | none | always available |
 | reading the layer: `explore semantic list`, `--use-project`, `maintain` | `[cube]` (the dialect engine, which every connector extra already carries) | refused by name, `reason: prerequisite` |
+| authoring: `semantic cube define\|update\|plan`, and a derived cube | `[cube]`, the same extra | refused by name, `reason: prerequisite` |
 
 No Cube package is installed for any of it: no Node, no Cube server, no
 `cube_dbt`, no `apache-ossie-cube`.
@@ -154,9 +156,106 @@ or the fingerprint.
   single-pair join is also a foreign key;
 - `explore map --use-project` marks each relation with the cubes on it.
 
-Model declarations do not reach a Cube layer yet: it does not implement the
-derivation hook (#911), so a declared dbt mart under `vendor: cube` gets a warning
-saying nothing was derived rather than a proposal.
+## Authoring Cube model files
+
+`semantic cube define|update|plan <intent> --edits-file <path|->` authors the
+files through the same plan/apply spine as every other edit. Each edit is one
+whole file of the `semantic_document` kind, keyed exactly as `semantic.cube.files`
+names it, and is written byte-for-byte: comments, key spelling (`sqlTable` or
+`sql_table`), quoting and line endings land as authored.
+
+**What can be written.** Only the plain YAML files the configuration lists. Each
+of these is refused by name, and nothing is stored:
+
+| Path or content | Why |
+|---|---|
+| a path not in `semantic.cube.files` | the list is the write surface; the refusal names the `dex config set` that would add it |
+| a `.js` model | compiled-only: a JavaScript model needs Node to compile |
+| `globals.py`, `cube.py`, `cube.js` | deployment configuration, not a model |
+| a configured file that is a Jinja template on disk, or holds an `extends` | compiled-only, so dex does not replace it with something it can read |
+| authored content carrying Jinja, or a cube or view using `extends` | compiled-only; dex authors only what it can validate |
+
+The compiled-only reasons are the strings the catalog writes under
+`compiled_only`, so a refusal and a catalog entry about the same file agree.
+
+**What is checked.** The whole prospective set (every configured file, with the
+edits laid over it) is validated by the rules the reader runs, so a plan that
+would leave a file the catalog cannot read is never stored. Authoring adds one
+rule: a key Cube does not declare at its level is refused in a file the plan
+writes, where the reader only warns, because dex would be writing the defect. It
+adds one warning too: a cube on the one side of a join (it declares
+`one_to_many`, or another cube declares `many_to_one` to it) that sums or counts
+and declares no `primary_key` is `fan_out`, because Cube has nothing to
+deduplicate those measures on when a query crosses the join.
+
+**What the plan reports.** Each cube and view in an edited file is `defined`,
+`updated` or `unchanged`, compared with key spelling and order normalized, so a
+whole-file edit that touches one cube does not read as a change to its
+neighbours. `define` refuses an existing name and a removal; `update` refuses a
+new name; `plan` takes a mix and names any removed definition in a warning.
+
+**What apply does.** `transform apply` re-validates the set against the files as
+they are now and writes every edited file or none. A file changed after planning
+is a conflict, and the plan has to be remade.
+
+Nothing on this path starts Node, calls a Cube server, or opens a warehouse
+connection. Authoring is the same whatever the deployment: dex writes files in
+git and never writes to Cube Cloud.
+
+## Declarations into Cube
+
+A model declaration reaches a Cube layer through the derivation hook, in two
+ways.
+
+**A declared dbt mart derives a cube.** `transform plan` (and `transform
+declare`) turn a declared mart under `transform.marts_paths` into a Cube model
+file of its own, `<dir>/<mart>.yml`, where `<dir>` is the one directory the
+configured YAML files share (`model/cubes` where they share none):
+
+| Declaration | Cube |
+|---|---|
+| `grain` | `primary_key: true` on each grain dimension, composite included |
+| any role but `measure` | a dimension, `sql: "{CUBE}.<column>"`, typed `time`, `number`, `boolean` or `string` from the SQL or the exploration cache; a `time` role is always `time` |
+| `measure` + `aggregation` | a measure named after the column (`sum`, `count`, `count_distinct`, `min`, `max`, `avg`); the column is not also a dimension |
+| `foreign_key` + `references` | a `many_to_one` join to the cube on the parent's table, `{CUBE}.<column> = {<parent>}.<parent column>` |
+| `description` | the cube's and each member's `description` |
+| `population` | `meta.dex.population`, and one sentence closing the description |
+| `assumptions` | `meta.dex.assumptions` |
+| `unit`, `null_rule`, `additivity` | the member's `meta.dex` |
+
+- `sql_table` is the `database.schema` the cubes on this project's other models
+  share, else the relation the compiled manifest names, else the bare table name
+  (as a limitation).
+- `data_source` is written only where `semantic.cube.data_source` is not
+  `default`.
+- **Never derived:**
+  - a population as a measure filter or a segment, since the mart's SQL already
+    enforces it;
+  - a metric beyond a declared measure (no implicit `count`);
+  - a `median` (Cube has no such type);
+  - a `semi_additive` measure (Cube has no measure that sums across entities but
+    not across time);
+  - a second join to a cube already joined (Cube needs an alias, and dex does
+    not invent one).
+
+  Each is named under `not_carried`.
+- **Never overwritten or renamed:**
+  - a cube already on the mart's table makes the mart `skipped`;
+  - a cube or view holding the name makes it `failed`.
+
+Every derived cube is held to authoring's own checks and read back through the
+catalog. It is *included*, stored as a plan of its own on the Cube layer beside
+the dbt plan (`data.semantic_proposal.plan_id`; apply both), only where its path
+is already in `semantic.cube.files`. Otherwise it is *proposed*, with the
+`dex config set` that adds it.
+
+**Declarations annotate a cube.** `semantic cube define|update|plan` take
+`declarations` beside (or instead of) `edits`. Each names a cube the payload or
+the layer defines, and is rendered into it field by field: grain to
+`primary_key`, descriptions and the population sentence, a declared join and
+measure, the rest in `meta.dex`. Only that cube's entry in its file is rewritten.
+Every other cube, view and comment keeps its bytes, and the author's key spelling
+is kept. A declaration naming no cube, or naming a view, is refused.
 
 ## `query` and `values` are not available yet
 
@@ -179,6 +278,7 @@ definition added, removed or changed, and a dimension, measure, key or join
 column gone from its table (`dangling_reference`, `broken_relationship`);
 `maintain grain` measures every `primary_key`, a composite one whole
 (`declared_grain_not_unique`). Cube's declared types are not yet compared with
-the warehouse's, and `maintain reconcile` plans no Cube edit. A compiled-only definition is
+the warehouse's, and `maintain reconcile` plans no Cube edit (author the fix with
+`semantic cube`). A compiled-only definition is
 not fingerprinted structurally, and the fingerprint's notes say so.
 

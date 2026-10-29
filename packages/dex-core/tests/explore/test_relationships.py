@@ -1604,6 +1604,53 @@ def test_map_verify_also_reports_orphan_findings(tmp_path: Path, capsys):
     assert any("not evidence of a shared key" in n for n in orders.data_quality)
 
 
+def test_a_declared_join_takes_the_spelling_its_profile_records():
+    """A dbt project writes ``customer_id`` where Snowflake stores
+    ``CUSTOMER_ID``; the probe quotes identifiers, so the edge has to carry the
+    profiled spelling or the statement binds to nothing. A column with no
+    match, or with two that differ only by case, is left as written."""
+
+    from exmergo_dex_core.explore.relationships import adopt_profiled_spelling
+
+    orders = _ds("DB.DEV.FCT_ORDERS", [_col("ORDER_ID"), _col("CUSTOMER_ID")])
+    customers = _ds(
+        "DB.DEV.DIM_CUSTOMERS", [_col("CUSTOMER_ID"), _col("Id"), _col("ID")]
+    )
+    declared = _rel(
+        from_dataset="DB.DEV.FCT_ORDERS",
+        from_columns=["customer_id"],
+        to_dataset="DB.DEV.DIM_CUSTOMERS",
+        to_columns=["customer_id"],
+        kind=RelationshipKind.DECLARED,
+        verified=False,
+    )
+    ambiguous = _rel(
+        from_dataset="DB.DEV.FCT_ORDERS",
+        from_columns=["order_id"],
+        to_dataset="DB.DEV.DIM_CUSTOMERS",
+        to_columns=["id"],
+        kind=RelationshipKind.DECLARED,
+        verified=False,
+    )
+    unprofiled = _rel(
+        from_dataset="DB.DEV.FCT_ORDERS",
+        from_columns=["ghost"],
+        to_dataset="DB.DEV.ELSEWHERE",
+        to_columns=["id"],
+        kind=RelationshipKind.DECLARED,
+        verified=False,
+    )
+
+    adopt_profiled_spelling([declared, ambiguous, unprofiled], [orders, customers])
+
+    assert declared.from_columns == ["CUSTOMER_ID"]
+    assert declared.to_columns == ["CUSTOMER_ID"]
+    assert ambiguous.from_columns == ["ORDER_ID"]
+    assert ambiguous.to_columns == ["id"]
+    assert unprofiled.from_columns == ["ghost"]
+    assert unprofiled.to_columns == ["id"]
+
+
 def test_missing_column_findings_names_the_relation_and_column():
     """A declared edge referencing a column its dataset's profile does not
     have carries a finding naming the relation and the missing column; a

@@ -23,7 +23,8 @@ logic.
   rendered locally (any mode but `list`, without `--api`), `[semantic]`, and
   `[slayer]` where `semantic.vendor` is `slayer`, in place of `[semantic]`, since
   SLayer renders its own `query` and `values`. `[cube]` follows the same
-  `semantic.vendor` read for the same commands where the vendor is `cube`, and a
+  `semantic.vendor` read for the same commands where the vendor is `cube`, is
+  always taken by `semantic cube`, and a
   Cube `query` or `values` never takes `[semantic]` either. A repo that runs
   neither resolves neither scikit-learn nor MetricFlow.
 - That environment is uv's own, and `--no-project` is what keeps it so. Without it
@@ -370,6 +371,13 @@ dex semantic slayer define|update|plan
                                      files in semantic.slayer.models, validated as one prospective
                                      set with SLayer's own model, and applied atomically with
                                      transform apply
+dex semantic cube define|update|plan
+                                  -> Cube model files as whole-file diffs; limited to the plain YAML
+                                     files in semantic.cube.files (JS, globals.py, cube.py/cube.js and
+                                     compiled-only files refused by name), validated as one prospective
+                                     set with dex's port of Cube's model rules, each cube and view
+                                     classified defined, updated or unchanged, and applied atomically
+                                     with transform apply
 dex maintain snapshot [--project-only]
                                   -> capture/refresh the known-good baseline in .dex/snapshot.json;
                                      --project-only re-fingerprints only project layers and carries the
@@ -487,13 +495,18 @@ measures `<column>_<agg>`), validated by `semantic slayer`'s own checks and read
 back through its catalog, then stored as a second plan on the SLayer layer
 (`plan_id`, beside the dbt plan; apply both) where its path is already under
 `semantic.slayer.models`, and proposed with the `dex config set` that adopts it
-otherwise. Under `ossie` and `cube`, whose layers do not implement the hook yet,
-nothing is derived and a warning says so. In every layer a population is carried
+otherwise. Under `cube` it is a Cube model file of its own, `<dir>/<mart>.yml`
+beside the configured files (`primary_key` on the grain dimensions, other roles as
+dimensions, declared aggregations as measures named after the column,
+`many_to_one` joins from foreign keys), validated by `semantic cube`'s own checks
+and read back through its catalog, and included or proposed on the same terms
+against `semantic.cube.files`. Under `ossie`, whose layer does not implement the
+hook yet, nothing is derived and a warning says so. In every layer a population is carried
 as metadata (`config.meta.dex` or `meta.dex`, and one sentence in the description)
 and never as a filter, since the mart's SQL already enforces it; per model,
 `carried` and `not_carried` account for every declared field.
-`semantic slayer define|update|plan` take `declarations` too, annotating a model
-the payload or the layer defines; `semantic ossie` refuses them by name. A command that takes no declarations refuses a payload
+`semantic slayer define|update|plan` and `semantic cube define|update|plan` take
+`declarations` too, annotating a model or cube the payload or the layer defines; `semantic ossie` refuses them by name. A command that takes no declarations refuses a payload
 carrying them rather than dropping them. `transform declare [<model>...]` takes the
 same payload for models that already exist: it proposes only the measured facts
 each selected model does not yet declare, lays the supplied `declarations` over
@@ -1142,6 +1155,22 @@ default, or a filter or operator after it is refused. A key naming a location
   refusal names the file, the element, and for an unknown key the pinned
   release. Apply writes the authored bytes, all files or none, and a file
   SLayer's own storage rewrote after planning is a conflict that says so.
+- `semantic cube define|update|plan` is the same route for Cube model files.
+  Each edit is one whole plain-YAML file keyed as `semantic.cube.files` names
+  it, relative to the repository root. A path off that list, a JavaScript
+  model, `globals.py`, `cube.py`/`cube.js`, a configured file that is
+  compiled-only on disk, and authored content that is compiled-only (Jinja, or
+  `extends`) are refused by name, a compiled-only one with the reason the
+  catalog's `compiled_only` gives. The prospective set is validated with the
+  reader's own port of Cube's model rules (structure, unique names across cubes
+  and views, join targets and `{member}` references resolving, view
+  `join_path`s following declared joins, one join between a pair of cubes),
+  and a key Cube does not declare is refused in a file the plan writes rather
+  than warned about. A summing or counting cube on the one side of a join with
+  no `primary_key` is a `fan_out` warning. Each cube and view an edited file
+  carries is reported `defined`, `updated` or `unchanged`. Apply writes the
+  authored bytes, all files or none, and a file changed after planning is a
+  conflict.
 
 
 Skill-to-subcommand mapping: `explore` fronts `connect`/`explore`; `transform`
@@ -1267,7 +1296,8 @@ and joins reach `explore` through the declaration channel instead, at confidence
 1.0. `query` refuses by name, since Cube renders a query only inside a Cube
 server, and `values` refuses the same way after its PII gate has run. `maintain`
 fingerprints the layer under `vendor: cube`, and the layer-neutral definition
-drift reads it. Selecting the vendor without the `[cube]` extra (the dialect
+drift reads it. `semantic cube define|update|plan` authors the files, and a
+declared dbt mart derives a cube of its own (see `transform plan` above). Selecting the vendor without the `[cube]` extra (the dialect
 engine) refuses and names it. See `references/semantic-layer.md`.
 
 `list` costs no warehouse query on either backend, and neither does the reverse

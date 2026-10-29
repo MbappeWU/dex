@@ -253,9 +253,9 @@ REFERENCE_PAGES: tuple[ReferencePage, ...] = (
         "semantic-layers/cube",
         PageMeta(
             "Cube compatibility",
-            "What dex reads from Cube YAML model files with no Cube server: the "
-            "ported model rules, compiled-only files, and how cubes and views map "
-            "onto the catalog.",
+            "How dex reads, validates and authors Cube YAML model files with no "
+            "Cube server: the ported rules, compiled-only files, the catalog "
+            "mapping and derived cubes.",
             "Cube",
         ),
     ),

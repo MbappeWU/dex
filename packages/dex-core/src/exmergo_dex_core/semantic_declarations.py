@@ -308,6 +308,55 @@ def account(
     return out_carried, not_carried
 
 
+# --- where a derived definition reads its table from ---------------------------------
+
+
+def table_name(table: Any) -> str:
+    """The last part of a qualified table, unquoted and lowered; ``""`` if none."""
+
+    if not isinstance(table, str):
+        return ""
+    return table.rpartition(".")[2].strip('"`[]').lower()
+
+
+def sibling_prefix(tables: Iterable[Any], identifiers: Iterable[str]) -> str | None:
+    """The ``database.schema`` every sibling definition reads from, or ``None``.
+
+    A definition whose table ends in one this dbt project builds is a sibling;
+    where every sibling agrees on what precedes the table name, a new mart from
+    the same project is read from there too. The semantic layer's own
+    convention wins over dbt's, because dbt knows a relation per target and a
+    layer usually reads one the derivation cannot see (often prod).
+    """
+
+    built = {identifier.lower() for identifier in identifiers}
+    prefixes = set()
+    for table in tables:
+        if not isinstance(table, str) or "." not in table:
+            continue
+        head, _, _last = table.rpartition(".")
+        if table_name(table) in built:
+            prefixes.add(head)
+    return next(iter(prefixes)) if len(prefixes) == 1 else None
+
+
+def placed_table(
+    identifier: str, relation: str | None, prefix: str | None
+) -> tuple[str, str]:
+    """The table a derived definition reads, and where it came from.
+
+    ``siblings`` (the prefix every sibling shares), then ``manifest`` (the
+    relation dbt last compiled), then ``bare`` (the table name alone). Each
+    vendor says what the choice means in its own words.
+    """
+
+    if prefix is not None:
+        return f"{prefix}.{identifier}", "siblings"
+    if relation:
+        return relation, "manifest"
+    return identifier, "bare"
+
+
 def _column_of(path: str) -> str:
     # `columns.amount.unit` -> `columns.amount`, so one reason covers a column.
     return path.rsplit(".", 1)[0] if path.startswith("columns.") else path

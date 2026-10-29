@@ -452,6 +452,13 @@ _SUBCOMMAND_HELP: dict[tuple[str, str], tuple[str, str]] = {
         "configures, with SLayer's own model, then store a plan. Needs the "
         "[slayer] extra. Repo-only.",
     ),
+    ("semantic", "cube"): (
+        "plan whole-file edits to the configured Cube model files",
+        "Validate whole plain-YAML Cube model files at the paths "
+        "semantic.cube.files configures, with dex's port of Cube's model rules, "
+        "then store a plan. Needs the [cube] extra. No Cube server, no "
+        "warehouse. Repo-only.",
+    ),
     ("maintain", "snapshot"): (
         "capture the known-good baseline in .dex/snapshot.json",
         "Pin the current map and fingerprint the project layers as the "

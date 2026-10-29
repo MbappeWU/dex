@@ -846,6 +846,41 @@ def orphan_findings(
     return findings
 
 
+def adopt_profiled_spelling(
+    relationships: list[Relationship], datasets: list[Dataset]
+) -> None:
+    """Spell each join's columns the way its dataset's profile does, in place.
+
+    A declared join carries its columns as the project wrote them, and a dbt
+    project writes ``customer_id`` where Snowflake stores ``CUSTOMER_ID``. The
+    probe quotes every identifier, so a column spelled in the other case binds
+    to nothing on a warehouse that folds unquoted names, and the statement
+    fails. Where exactly one profiled column matches without regard to case,
+    the edge takes that column's own spelling; a column with no match, or with
+    more than one, is left as written for :func:`missing_column_findings` and
+    the warehouse to judge.
+    """
+
+    by_identifier = {d.identifier.lower(): d for d in datasets}
+
+    def spelled(dataset_id: str, columns: list[str]) -> list[str]:
+        dataset = by_identifier.get(dataset_id.lower())
+        if dataset is None:
+            return columns
+        names: dict[str, list[str]] = {}
+        for column in dataset.columns:
+            names.setdefault(column.name.lower(), []).append(column.name)
+        out: list[str] = []
+        for column in columns:
+            found = names.get(column.lower(), [])
+            out.append(found[0] if len(found) == 1 else column)
+        return out
+
+    for rel in relationships:
+        rel.from_columns = spelled(rel.from_dataset, rel.from_columns)
+        rel.to_columns = spelled(rel.to_dataset, rel.to_columns)
+
+
 def missing_column_findings(
     relationships: list[Relationship],
     datasets: list[Dataset],

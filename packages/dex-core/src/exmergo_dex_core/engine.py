@@ -1769,6 +1769,20 @@ class DexEngine:
             "slayer", mode, intent, edits, declarations=declarations
         )
 
+    def semantic_cube(
+        self,
+        mode: str,
+        intent: str,
+        edits: list[PlanEdit],
+        *,
+        declarations: list[Any] | None = None,
+    ) -> PlanResult:
+        """`semantic cube`: :meth:`semantic_native` for Cube model files."""
+
+        return self.semantic_native(
+            "cube", mode, intent, edits, declarations=declarations
+        )
+
     # --- lifecycle ------------------------------------------------------------
 
     def close(self) -> None:

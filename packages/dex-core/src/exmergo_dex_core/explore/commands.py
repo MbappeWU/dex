@@ -1092,6 +1092,7 @@ def relationships(
     # run set stay the same set.
     missing_column_findings = []
     if verify:
+        rel_mod.adopt_profiled_spelling(rels, datasets)
         missing_column_findings = rel_mod.missing_column_findings(rels, datasets)
         missing_column_ids = {id(rel) for rel, _text in missing_column_findings}
         verify_pool = [rel for rel in rels if id(rel) not in missing_column_ids]
@@ -2504,6 +2505,7 @@ def map(
     # estimate and the run share the filtered pool so they stay the same set.
     missing_column_findings = []
     if verify:
+        rel_mod.adopt_profiled_spelling(relationship_set, all_selected)
         missing_column_findings = rel_mod.missing_column_findings(
             relationship_set, all_selected
         )

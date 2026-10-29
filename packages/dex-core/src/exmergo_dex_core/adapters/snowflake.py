@@ -81,6 +81,13 @@ _BIGINT_TYPE = "BIGINT"
 _RESERVED_SCHEMA = "INFORMATION_SCHEMA"
 _RESERVED_DATABASE = "SNOWFLAKE"
 
+
+def _reserved(row: dict) -> bool:
+    """Whether a SHOW row describes an object in a reserved schema."""
+
+    return str(row.get("schema_name") or "").upper() == _RESERVED_SCHEMA
+
+
 # How many databases a bare schema name may be searched across before dex asks
 # for a qualified <database>.<schema> instead. Each candidate costs one free SHOW
 # SCHEMAS round-trip, and an unscoped enterprise account has hundreds.
@@ -604,15 +611,22 @@ class SnowflakeAdapter:
             return
         for scope in self._scopes():
             in_clause = self._scope_clause(scope)
+            # A database-wide SHOW lists that database's INFORMATION_SCHEMA
+            # views too, which are never a source (see _RESERVED_SCHEMA): kept
+            # out here, or a database scope profiles Snowflake's own catalog.
             for row in self._show(f"SHOW TABLES {in_clause}"):
-                self._register(row, "table")
+                if not _reserved(row):
+                    self._register(row, "table")
             for row in self._show(f"SHOW VIEWS {in_clause}"):
-                self._register(row, "view")
+                if not _reserved(row):
+                    self._register(row, "view")
             # One SHOW COLUMNS per scope (not per table) keeps inventory a
             # handful of round-trips. SHOW output is capped at 10K rows, which
             # a db.schema allowlist keeps comfortably distant.
             by_table: dict[str, list[ColumnMeta]] = {}
             for row in self._show(f"SHOW COLUMNS {in_clause}"):
+                if _reserved(row):
+                    continue
                 identifier = self._identifier_of(row)
                 columns = by_table.setdefault(identifier, [])
                 columns.append(
