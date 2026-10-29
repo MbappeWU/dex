@@ -36,6 +36,10 @@ That extra is pytest and nothing else, and the floor is the point rather than a
 coincidence: nothing here reaches the dialect engine, a warehouse client, or
 either semantic extra. A packaging test holds it true.
 
+:class:`SemanticDerivationContract` (#927) holds a source implementing the
+derivation hook to its promises: one answer per declared model, a population
+carried as metadata and never as a filter, and nothing opened.
+
 **Four contracts, because a source may legitimately answer only some of them.**
 :class:`SemanticSourceFactoryContract` is construction.
 :class:`SemanticDeclarationContract` is the keys and joins a layer contributes to
@@ -70,6 +74,7 @@ if TYPE_CHECKING:
 __all__ = [
     "SemanticCatalogSourceContract",
     "SemanticDeclarationContract",
+    "SemanticDerivationContract",
     "SemanticFingerprintContract",
     "SemanticSourceFactoryContract",
 ]
@@ -779,3 +784,104 @@ class SemanticSourceFactoryContract:
             )
 
         self.build_source(context)
+
+
+class SemanticDerivationContract:
+    """Opt-in: the derivation hook keeps its promises (#927).
+
+    For a source implementing
+    :class:`~.semantic_source.SemanticDerivationSource`. The subclass supplies
+    the source and one ``derive`` request whose declarations include a
+    population; the contract checks what every vendor owes whatever its format:
+    an answer per model in either mode, a population carried as metadata (or
+    named as not carried) and never written as a filter, edits only on the
+    layer's own write surface, and no connection opened along the way.
+
+    ``filter_keys`` names the keys that *apply* a predicate in this vendor's
+    documents, and ``metadata_keys`` the subtrees that only *state* things, so
+    the population a derivation writes into its metadata is not mistaken for a
+    filter.
+    """
+
+    filter_keys: tuple[str, ...] = ("filter", "filters", "where", "segments")
+    metadata_keys: tuple[str, ...] = ("meta", "config", "ai_context")
+
+    def make_derivation_source(self) -> Any:  # pragma: no cover - subclass supplies
+        raise NotImplementedError
+
+    def a_derive_request(self) -> Any:  # pragma: no cover - subclass supplies
+        """A ``derive`` request whose first declaration states a population."""
+
+        raise NotImplementedError
+
+    def _derive(self, request: Any) -> Any:
+        from unittest import mock
+
+        def refuse(*_args: Any, **_kwargs: Any) -> Any:
+            raise AssertionError("a derivation opened a warehouse connection")
+
+        with mock.patch("exmergo_dex_core.connect.open_adapter", refuse):
+            return self.make_derivation_source().derive_semantic(request)
+
+    def test_satisfies_the_derivation_capability(self) -> None:
+        from .semantic_source import SemanticDerivationSource
+
+        assert isinstance(self.make_derivation_source(), SemanticDerivationSource)
+
+    def test_every_declared_model_gets_an_answer_in_either_mode(self) -> None:
+        from dataclasses import replace
+
+        request = self.a_derive_request()
+        models = {d.model for d in request.declarations}
+        for mode in ("derive", "annotate"):
+            result = self._derive(replace(request, mode=mode))
+            assert set(result.definitions) == models, mode
+            assert result.edit_target in ("project", "semantic")
+
+    def test_a_population_is_carried_or_named_as_not_carried(self) -> None:
+        request = self.a_derive_request()
+        declared = request.declarations[0]
+        assert declared.declared.get("population"), (
+            "a_derive_request() must declare a population on its first model"
+        )
+        definition = self._derive(request).definitions[declared.model]
+        if definition.status in ("skipped", "unsupported"):
+            return
+        assert (
+            "population" in definition.carried or "population" in definition.not_carried
+        )
+
+    def test_a_population_is_never_written_as_a_filter(self) -> None:
+        import yaml
+
+        result = self._derive(self.a_derive_request())
+        texts = [d.content for d in result.definitions.values() if d.content]
+        texts += [e.new_content for e in result.edits if e.new_content]
+        for text in texts:
+            found = self._filters(yaml.safe_load(text))
+            assert not found, f"a derivation wrote a filter: {found}"
+
+    def test_semantic_edits_stay_on_the_write_surface(self) -> None:
+        from .edits import SemanticEditTarget
+
+        source = self.make_derivation_source()
+        result = self._derive(self.a_derive_request())
+        if result.edit_target != "semantic" or not isinstance(
+            source, SemanticEditTarget
+        ):
+            return
+        surface = set(source.semantic_editing_surface())
+        assert {e.path for e in result.edits} <= surface
+
+    def _filters(self, node: Any) -> list[Any]:
+        if isinstance(node, dict):
+            found = [v for k, v in node.items() if k in self.filter_keys and v]
+            return found + [
+                f
+                for k, v in node.items()
+                if k not in self.metadata_keys
+                for f in self._filters(v)
+            ]
+        if isinstance(node, list):
+            return [f for v in node for f in self._filters(v)]
+        return []

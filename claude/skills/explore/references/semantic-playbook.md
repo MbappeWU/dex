@@ -169,6 +169,29 @@ dataset source, or a field written only in a non-SQL dialect. In every one of th
 Dex declined to guess a column rather than failed to find one, so do not go looking
 for the column yourself and do not treat the absence as a data problem.
 
+## When the layer is Cube models
+
+`vendor: cube` means the layer is Cube YAML model files in the repository, read
+statically with no Cube server. `list` reads the same shape as anywhere else:
+
+- **A dimension token is `cube.member`**, and a view's member is
+  `view.member`. A view has no `relation`; each of its members carries the cube
+  member it exposes in `vendor_params.source`, and that cube's `relation` is the
+  table to profile.
+- **A measure is listed twice on purpose.** An aggregating measure (`sum`,
+  `count`, ...) is a `measure` and a `simple` metric named `cube.member`. A
+  calculated `number` measure is a `ratio` or `derived` metric only. Measure
+  names are scoped to their cube, so two cubes may each have `count`: read
+  `semantic_model` with the name.
+- **There are no entities.** `primary_key` and joins reach `explore map`,
+  `explore relationships` and `explore profile` through `--use-project`.
+- **`compiled_only` lists what Dex did not read**: a JS model, a templated
+  (Jinja) YAML file, or a cube using `extends`. Those definitions exist; do not
+  report them as missing, and do not guess at their contents.
+- **`query` and `values` refuse in this release.** Cube renders a query only
+  inside a Cube server. Use `explore profile` and `explore query` on the
+  relations the catalog names instead.
+
 ## When the layer is SLayer models
 
 `vendor: slayer` means the layer is SLayer model files in the repository. `list`,

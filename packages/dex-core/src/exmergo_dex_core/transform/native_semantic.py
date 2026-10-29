@@ -39,18 +39,39 @@ MODES = ("define", "update", "plan")
 
 
 def semantic_native(
-    engine: DexEngine, vendor: str, intent: str, edits: list[PlanEdit], *, mode: str
+    engine: DexEngine,
+    vendor: str,
+    intent: str,
+    edits: list[PlanEdit],
+    *,
+    mode: str,
+    declarations: list[Any] | None = None,
 ) -> PlanResult:
     """Author the configured vendor's native documents without involving dbt.
 
     ``vendor`` is the one the caller named, as ``semantic <vendor>`` spells it,
     and it has to be the configured one. Validation belongs to the layer, so
     nothing here knows what any vendor's documents look like.
+
+    ``declarations`` (#927) are rendered into the definitions they name by the
+    layer's own :class:`~..semantic_source.SemanticDerivationSource`, in
+    ``annotate`` mode, before the layer validates the result: each names a model
+    the payload's edits or the layer already define, and the declaration wins
+    field by field. A layer that does not implement the hook refuses them, so a
+    declaration is never dropped while the plan reads as declared.
     """
 
     if mode not in MODES:
         raise ValueError(f"unknown semantic {vendor} mode '{mode}'")
     require_configured_vendor(engine, vendor)
+    annotated_notes: list[str] = []
+    if declarations is not None:
+        edits, annotated_notes = _annotate(engine, vendor, edits, declarations)
+        if not edits:
+            raise ValueError(
+                f"semantic {vendor} {mode}: the documents already state every "
+                "declared fact, so there is nothing to plan"
+            )
     if not edits:
         raise ValueError(
             f"semantic {vendor} {mode} needs content: pass --edits-file <path|-> "
@@ -93,11 +114,82 @@ def semantic_native(
             stored.plan_id
         ),
         diffs=diffs,
-        notes=validation.notes,
+        notes=[*annotated_notes, *validation.notes],
         warnings=[*plan_warnings, *validation.warnings],
         defined=validation.defined,
         updated=validation.updated,
     )
+
+
+def _annotate(
+    engine: DexEngine, vendor: str, edits: list[PlanEdit], entries: list[Any]
+) -> tuple[list[PlanEdit], list[str]]:
+    """``edits`` with each declaration rendered into the document it names.
+
+    Refuses, storing nothing, when the layer cannot carry declarations or a
+    declaration names a model no document defines.
+    """
+
+    from ..semantic_declarations import declared_shape, parse_declarations
+    from ..semantic_source import (
+        SemanticDeclaration,
+        SemanticDerivationRequest,
+        SemanticDerivationSource,
+    )
+
+    layer = engine.semantic_catalog_source()
+    if not isinstance(layer, SemanticDerivationSource) or not isinstance(
+        layer, SemanticEditTarget
+    ):
+        raise ValueError(
+            f"`semantic {vendor}` does not take declarations yet: the {vendor} "
+            "layer does not implement the derivation hook "
+            "(SemanticDerivationSource), so a declaration would be dropped while "
+            "the plan reads as declared. Author the facts in the documents "
+            "themselves, or pass only edits"
+        )
+    parsed = parse_declarations(entries)
+    if not parsed:
+        return edits, []
+    documents = {
+        path: entry.content for path, entry in layer.semantic_edit_view().files.items()
+    }
+    for edit in edits:
+        if edit.new_content is not None:
+            documents[edit.path] = edit.new_content
+    result = layer.derive_semantic(
+        SemanticDerivationRequest(
+            mode="annotate",
+            declarations=tuple(
+                SemanticDeclaration(model=d.model, declared=declared_shape(d))
+                for d in parsed
+            ),
+            documents=documents,
+            cache=readable_cache(engine.store),
+            connector=engine.connector or engine.config.connector,
+        )
+    )
+    refused = [
+        f"{name}: {definition.reason or definition.status}"
+        for name, definition in result.definitions.items()
+        if definition.status in ("failed", "unsupported")
+    ]
+    if refused:
+        raise ValueError(
+            f"declarations the {vendor} layer cannot carry, so no plan was stored: "
+            + "; ".join(refused)
+            + ". A declaration on this route annotates a model the payload or the "
+            "layer already defines"
+        )
+    by_path = {e.path: e for e in result.edits}
+    merged = [by_path.pop(e.path, e) for e in edits] + list(by_path.values())
+    notes: list[str] = []
+    for name, definition in result.definitions.items():
+        if definition.not_carried:
+            listed = "; ".join(f"{k} ({v})" for k, v in definition.not_carried.items())
+            notes.append(f"{name}: declared but not carried: {listed}")
+        notes.extend(f"{name}: {note}" for note in definition.notes)
+    return merged, notes
 
 
 def require_configured_vendor(engine: DexEngine, vendor: str) -> None:
@@ -153,15 +245,17 @@ def cmd_semantic_native(args: argparse.Namespace, engine: DexEngine) -> env.Enve
     try:
         # Before the payload, so a mismatch is refused without reading a file.
         require_configured_vendor(engine, vendor)
+        edits, declarations = payload_from_file(
+            getattr(args, "edits_file", None),
+            default_kind=EditKind.SEMANTIC_DOCUMENT,
+        )
         result = semantic_native(
             engine,
             vendor,
             getattr(args, "argument", None) or "",
-            edits_from_payload(
-                getattr(args, "edits_file", None),
-                default_kind=EditKind.SEMANTIC_DOCUMENT,
-            ),
+            edits,
             mode=args.mode,
+            declarations=declarations,
         )
         return to_envelope(result, hints=plan_hint(result))
     except (DexError, ValueError) as exc:
@@ -169,6 +263,14 @@ def cmd_semantic_native(args: argparse.Namespace, engine: DexEngine) -> env.Enve
 
 
 def plan_hint(result: PlanResult) -> dict[str, str]:
+    companion = (getattr(result, "semantic_proposal", None) or {}).get("plan_id")
+    if companion:
+        # Named both explicitly: a bare `transform apply` takes the latest
+        # unapplied plan, which is the companion, and would leave the mart.
+        return {
+            "next": f"review the diffs, then `transform apply {result.plan_id}` and "
+            f"`transform apply {companion}` (the derived semantic models)"
+        }
     return {"next": f"review the diffs, then `transform apply {result.plan_id}`"}
 
 

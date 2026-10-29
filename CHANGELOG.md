@@ -14,6 +14,61 @@ pending fragments into a new section below. See
 
 <!-- towncrier release notes start -->
 
+## [1.16.5] - 2026-10-29
+
+### Added
+
+- **`transform plan` drafts `semi_additive` for running totals.** A model column computed using `sum()` or `count()` over an ordered window with default frame or `unbounded preceding` is now drafted with `additivity: semi_additive` and evidence naming the partition and ordering columns. ([#919](https://github.com/exmergo/dex/pull/919))
+- **A declared mart derives its SLayer model, and `semantic slayer` takes declarations.** Under `semantic.vendor: slayer`, `transform plan` and `transform declare` on a declared mart propose the SLayer model file it states: a primary key from the grain, `many_to_one` joins from foreign keys, and saved measures `<column>_<agg>` from declared aggregations. The file passes `semantic slayer`'s own validation and is read back through its catalog. Where the file's path is already listed under `semantic.slayer.models`, it is stored as a second plan beside the dbt plan, named by `data.semantic_proposal.plan_id`; otherwise the proposal names the `dex config set` that adds the path. `semantic slayer define|update|plan` accept `declarations`, which annotate a model the payload or the layer defines. Every vendor's derivation now sits behind one hook, `SemanticDerivationSource`, with a shipped `SemanticDerivationContract`. Ossie and Cube do not implement it yet: under them, `transform plan` warns that nothing was derived, and `semantic ossie` refuses a declarations payload by name.
+- **Dex has terms of service.** The terms at
+  [www.exmergo.com/terms/dex](https://www.exmergo.com/terms/dex) cover Exmergo's
+  distribution, documentation, support and trademarks, and leave the software
+  itself under Apache-2.0, which prevails over them. The Claude and Codex plugin
+  manifests carry the link beside the privacy policy, as do the package metadata
+  and the README. The README also now states correctly that the dbt processes
+  Dex starts send dbt Labs no usage statistics, since Dex runs them with
+  `DO_NOT_TRACK=1`.
+- **`semantic.vendor: cube` reads Cube model files as the semantic layer.** Name
+  the files in `semantic.cube.files` and `explore semantic list` (with `--metric`,
+  `--for-dimension` and `--search`) answers from plain-YAML cubes and views, read
+  statically with no Node and no Cube server, and validated by dex's own port of
+  Cube's model rules. Every refusal names the file and the element. Cubes and
+  views are semantic models, dimensions are keyed `cube.member`, and aggregating
+  measures are measures and metrics. `explore relationships|map|profile --use-project` 
+  carry Cube's primary keys and joins at confidence 1.0, and `maintain snapshot` fingerprints the layer. 
+  A JS model, a templated (Jinja) file and an `extends` are named as compiled-only under a new `compiled_only` catalog
+  field, never translated. Governed `query` and `values` are not available yet
+  and refuse by name. Install with `exmergo-dex-core[cube]`.
+
+### Changed
+
+- **A declared population reaches the derived semantic model as metadata, never as a filter.** The derived MetricFlow semantic model now carries the declaration's population and assumptions under `config.meta.dex`, and each column's unit and NULL rule (plus `non_additive`) under its element's `config.meta.dex`. The population also closes the model's description as one sentence. No filter is written, because the mart's SQL already enforces the population. Each model in `data.semantic_proposal` now reports `carried` and `not_carried`, accounting for every declared field, and the proposal names its `vendor`.
+
+### Fixed
+
+- **`maintain verify` now accepts `--target dev` to judge models built into the dev namespace.** Models existing only in dev are no longer reported as false high-severity `no_relation` findings when verify runs against the default namespace. Instead, they are reported as unchecked with a note pointing to `maintain verify --target dev`, and the result envelope records the judged namespace and manifest target. ([#885](https://github.com/exmergo/dex/pull/885))
+- **`maintain check` reports which metrics a definition change hits.** A metric whose content hash drifted produced a `definition_changed` finding with an empty `impacted_metrics` list, so blast-radius ranking treated a known changed metric as affecting nothing. The finding now names the metric itself and any ratio or derived metrics that depend on it; a changed semantic model names the metrics that draw on its measures. ([#889](https://github.com/exmergo/dex/pull/889))
+- **Phase checkpoint hints accurately describe unconfirmed commands.** Commands
+  that reach a mid-command phase checkpoint (such as `--verify` or
+  `--infer-by-overlap` over an already-fresh exploration cache) without earlier spend
+  state that the phase needs confirming instead of referencing "what remains of
+  the confirmed budget", and drop the note about re-profiling on re-run. ([#908](https://github.com/exmergo/dex/pull/908))
+- **`transform init` renders the committed build identity, not the role dex reads with.** Where a committed `postgres.user`/`redshift.user` names a build role different from the one dex's own connection discovery found (a read-only `dex_ro` in `DATABASE_URL`, say), init used to render dex's read role into `profiles.yml`, and the first `transform build` then refused with a hint to grant that read-only role CREATE; that quietly removed the read/write split the docs ask for. The committed user now wins, init notes where the two identities differ, and a build preflight refusal about a role the profile names but the config does not points at the committed identity before offering any grant. ([#909](https://github.com/exmergo/dex/pull/909))
+- Recognize literal dbt `config(alias=…)` names when drafting references, so alias-only warehouse relations resolve to the model that declares them. ([#920](https://github.com/exmergo/dex/pull/920))
+- `dex explore relationships --verify` and `dex explore map --verify` no longer abort with a binder error when a declared join references a column the warehouse no longer has; the offending edge is reported as a finding while sound joins are still measured. ([#928](https://github.com/exmergo/dex/pull/928))
+- **Ossie and SLayer record declared columns the way the warehouse folded them.**
+  `maintain semantic` compared each fingerprinted column with the warehouse's
+  columns by exact string match, so a semantic layer that recorded a column
+  exactly as its file wrote it reported every column as gone wherever the
+  warehouse folds unquoted identifiers: upper case on Snowflake, lower case on
+  Postgres, Redshift, Databricks and Trino for mixed-case authored names. Cube
+  already folded; Ossie and SLayer now fold their bare-identifier columns, keys
+  and joins through the same `adapters.fold_identifier` rule. A quoted identifier
+  is exact, so it still resolves to nothing rather than to a guess.
+- **The Explore skill stays read-only.** The procedure the three skills share now says that planning, applying, committing and building happen only when the task asks for a change, so a question about what is in the data ends after exploration rather than continuing into the project.
+- **`explore profile --use-project` answers from the project, not from whichever command last filled the cache.** Declaration notes and `semantic_models` are computed when the profile is read, for a cached profile and a rescan alike. The cache keeps the measurement, so removing a declaration or a semantic model clears the annotation on the next run without `--refresh`.
+
+
 ## [1.16.4] - 2026-10-28
 
 ### Added

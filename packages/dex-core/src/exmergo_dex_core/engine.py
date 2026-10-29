@@ -1719,31 +1719,55 @@ class DexEngine:
         )
 
     def semantic_native(
-        self, vendor: str, mode: str, intent: str, edits: list[PlanEdit]
+        self,
+        vendor: str,
+        mode: str,
+        intent: str,
+        edits: list[PlanEdit],
+        *,
+        declarations: list[Any] | None = None,
     ) -> PlanResult:
         """Plan native semantic-document edits on the semantic-layer axis.
 
         ``vendor`` must be the configured ``semantic.vendor``, and its layer
-        validates the edits in its own format.
+        validates the edits in its own format. ``declarations`` (#927) annotate
+        the models they name through the layer's derivation hook, and are
+        refused by a layer that has none.
         """
 
         from .transform import native_semantic
 
-        return native_semantic.semantic_native(self, vendor, intent, edits, mode=mode)
+        return native_semantic.semantic_native(
+            self, vendor, intent, edits, mode=mode, declarations=declarations
+        )
 
     def semantic_ossie(
-        self, mode: str, intent: str, edits: list[PlanEdit]
+        self,
+        mode: str,
+        intent: str,
+        edits: list[PlanEdit],
+        *,
+        declarations: list[Any] | None = None,
     ) -> PlanResult:
         """`semantic ossie`: :meth:`semantic_native` for a native Ossie layer."""
 
-        return self.semantic_native("ossie", mode, intent, edits)
+        return self.semantic_native(
+            "ossie", mode, intent, edits, declarations=declarations
+        )
 
     def semantic_slayer(
-        self, mode: str, intent: str, edits: list[PlanEdit]
+        self,
+        mode: str,
+        intent: str,
+        edits: list[PlanEdit],
+        *,
+        declarations: list[Any] | None = None,
     ) -> PlanResult:
         """`semantic slayer`: :meth:`semantic_native` for SLayer model files."""
 
-        return self.semantic_native("slayer", mode, intent, edits)
+        return self.semantic_native(
+            "slayer", mode, intent, edits, declarations=declarations
+        )
 
     # --- lifecycle ------------------------------------------------------------
 

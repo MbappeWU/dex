@@ -16,7 +16,9 @@ until `transform apply`, and any build runs against a dev target only.
 
 Dex works in one loop: explore, transform, maintain. Every step runs one engine
 command, reads the single JSON envelope it prints, and decides the next step
-from that envelope.
+from that envelope. Step 1 only reads. Steps 2 to 4 write project files, commit
+and build on dev, so take them only when the task asks for a change; a task that
+asks what is in the data stops after step 1 and reports what it found.
 
 1. **Explore before you write.** Before writing or fixing SQL against a table
    whose columns, types, grain, or join keys you have not verified in this
@@ -127,9 +129,11 @@ fetches the engine's dependencies from PyPI or your configured index.
    still owed. Supply the intent, confirm or override each drafted fact in the
    `declarations` entry, and re-plan until `missing` holds only what you decided
    to leave open. For a declared mart, also read `data.semantic_proposal`: the
-   semantic model the declaration implies, already in the plan
-   (`mode: included`) or offered for `semantic plan --definitions-file`
-   (`mode: proposed`), with every gap it could not fill named. When the user
+   semantic definition the declaration implies in the repository's own layer
+   (`vendor`: a MetricFlow model, or a SLayer model file stored as a second plan
+   whose id is `plan_id`), already planned (`mode: included`) or offered with
+   the commands that adopt it (`mode: proposed`), with every gap it could not
+   fill named and every declared field it could not carry in `not_carried`. When the user
    wants models that already exist declared, run `transform declare <models>`
    (none selects every model, 25 per plan). It proposes only what each model's
    YAML does not state and lists every model it skipped; relay `data.skipped`
@@ -245,8 +249,11 @@ a field, flag, or macro you need is not described here.
   one (a day-grain date model plus a `time_spine:` config) in the same or a
   separate plan, when the user has chosen to adopt a semantic layer.
 - Do not hand-write the semantic model for a declared mart: `transform plan`
-  derives it from the declaration (`data.semantic_proposal`). Where the project
-  has no semantic layer the derivation is only offered; ask before adopting one.
+  derives it from the declaration (`data.semantic_proposal`), for MetricFlow or
+  SLayer. Where the project has no semantic layer the derivation is only
+  offered; ask before adopting one. When it names a second plan (`plan_id`),
+  apply both. A population reaches it as metadata and is never a filter: do not
+  add one.
   Metrics are never derived: author each metric yourself, on the derived
   measures, with `semantic plan --definitions-file`.
 - Semantic YAML is validated against MetricFlow's schemas, so the wrapper

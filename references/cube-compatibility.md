@@ -154,6 +154,10 @@ or the fingerprint.
   single-pair join is also a foreign key;
 - `explore map --use-project` marks each relation with the cubes on it.
 
+Model declarations do not reach a Cube layer yet: it does not implement the
+derivation hook (#911), so a declared dbt mart under `vendor: cube` gets a warning
+saying nothing was derived rather than a proposal.
+
 ## `query` and `values` are not available yet
 
 Cube has no Python SQL renderer: its planner ships only inside a Cube server.

@@ -537,4 +537,7 @@ or join the [community](https://www.exmergo.com/discord). To contribute, see
 and the [code of conduct](https://github.com/exmergo/dex/blob/main/CODE_OF_CONDUCT.md).
 
 Apache-2.0. See the [license](https://github.com/exmergo/dex/blob/main/LICENSE)
-and [NOTICE](https://github.com/exmergo/dex/blob/main/NOTICE).
+and [NOTICE](https://github.com/exmergo/dex/blob/main/NOTICE). Exmergo's
+distribution, documentation, support, and trademarks are covered by the
+[terms of service](https://www.exmergo.com/terms/dex), and Dex sends Exmergo
+nothing, as the [privacy policy](https://www.exmergo.com/privacy/dex) explains.

@@ -116,8 +116,9 @@ Under `semantic.vendor: cube`, the configured Cube YAML files are the semantic
 layer, and Dex reads them (`explore semantic list`, `--use-project`, `maintain`)
 but does not author them in this release: there is no `semantic cube` command
 yet. Edit a Cube model file by hand and let the reviewer see the diff, and do not
-generate one with `cube_dbt`. A declared mart's `data.semantic_proposal` is a
-MetricFlow derivation and is not offered under `vendor: cube`.
+generate one with `cube_dbt`. A declared mart gets no `data.semantic_proposal`
+under `vendor: cube` yet: the Cube layer does not implement the derivation hook
+(#911), and a warning says so.
 
 ## SLayer models: `semantic slayer define|update|plan`
 
@@ -201,6 +202,15 @@ and re-plan.
 
 The refusal is a backstop, not a guide: the gaps below are what to write
 instead.
+
+**A declared mart derives its SLayer model.** Under `vendor: slayer`,
+`transform plan` on a declared mart proposes `models/<data_source>/<mart>.yaml`
+(primary key from the grain, joins from foreign keys, saved measures
+`<column>_<agg>` from declared aggregations, population and units in `meta.dex`),
+stored as a second plan when that path is already under `semantic.slayer.models`.
+`semantic slayer define|update|plan` also take `declarations`, which annotate a
+model the payload or the layer defines. See
+[declarations.md](declarations.md#slayer-semanticvendor-slayer).
 
 ### What SLayer does not declare
 

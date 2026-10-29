@@ -470,16 +470,30 @@ the side that looks stale and both fixes; it never refuses. It reads the cache a
 the repository only and opens no connection; a contradicted population cites the
 delta row attribution measured, and measures nothing of its own. A model under
 `transform.marts_paths` (default `[models/marts]`) whose post-change YAML carries a
-declaration also gets `data.semantic_proposal`: the MetricFlow semantic model the
-declaration states (primary entity from a single-column grain, foreign entities,
-categorical and time dimensions, measures with their declared aggregation, and
-`non_additive_dimension` for a `semi_additive` measure), with every gap named
-rather than guessed and no metric ever derived. In a project with a dbt semantic
-layer (a semantic model and a time spine) a derivation that passes MetricFlow's
-schemas, the metric-input check and dbt's parse of a throwaway copy is added to the
-same plan; in one without, nothing is added and the object is ready to pass to
-`semantic plan --definitions-file`. The parse is never skipped for a derivation,
-whatever `--no-parse` says. A command that takes no declarations refuses a payload
+declaration also gets `data.semantic_proposal`: the semantic definition the
+declaration states in the configured layer, through the one per-vendor derivation
+hook (`SemanticDerivationSource`), with `vendor` naming which. Under `dbt` it is a
+MetricFlow semantic model (primary entity from a single-column grain, foreign
+entities, categorical and time dimensions, measures with their declared
+aggregation, and `non_additive_dimension` for a `semi_additive` measure), with every
+gap named rather than guessed and no metric ever derived. In a project with a dbt
+semantic layer (a semantic model and a time spine) a derivation that passes
+MetricFlow's schemas, the metric-input check and dbt's parse of a throwaway copy is
+added to the same plan; in one without, nothing is added and the object is ready to
+pass to `semantic plan --definitions-file`. The parse is never skipped for a
+derivation, whatever `--no-parse` says. Under `slayer` it is a SLayer model file
+(`primary_key` from the grain, `many_to_one` joins from foreign keys, saved
+measures `<column>_<agg>`), validated by `semantic slayer`'s own checks and read
+back through its catalog, then stored as a second plan on the SLayer layer
+(`plan_id`, beside the dbt plan; apply both) where its path is already under
+`semantic.slayer.models`, and proposed with the `dex config set` that adopts it
+otherwise. Under `ossie` and `cube`, whose layers do not implement the hook yet,
+nothing is derived and a warning says so. In every layer a population is carried
+as metadata (`config.meta.dex` or `meta.dex`, and one sentence in the description)
+and never as a filter, since the mart's SQL already enforces it; per model,
+`carried` and `not_carried` account for every declared field.
+`semantic slayer define|update|plan` take `declarations` too, annotating a model
+the payload or the layer defines; `semantic ossie` refuses them by name. A command that takes no declarations refuses a payload
 carrying them rather than dropping them. `transform declare [<model>...]` takes the
 same payload for models that already exist: it proposes only the measured facts
 each selected model does not yet declare, lays the supplied `declarations` over

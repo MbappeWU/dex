@@ -145,6 +145,7 @@ against a column that is not behind it. The policy that linkage feeds is in
 | `maintain snapshot` baseline over the layer | yes | `drift_baseline` |
 | free definition, key, and relationship drift against that baseline | yes | `drift_baseline`, `drift_changed` |
 | `semantic ossie define\|update\|plan`, applied with `transform apply` | yes, confined to the exact paths in `semantic.ossie.files` | see [Authoring native documents](semantic-layer.md#authoring-native-documents) |
+| model declarations derived into the layer, or annotating a dataset | not yet: the layer does not implement the derivation hook (#500), so `transform plan` warns rather than deriving and `semantic ossie` refuses a `declarations` payload by name | none |
 
 `adversarial_composite` is the case worth reading. Its child tuples are
 `(1, 10, 100)` and `(2, 20, 200)`, its parent tuples `(1, 20, 200)` and

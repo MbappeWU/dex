@@ -41,11 +41,23 @@ from pathlib import PurePosixPath
 from typing import Any
 
 import yaml
-from pydantic import BaseModel, ConfigDict, ValidationError
 
 from ..dbt_project import DbtProjectView
-from ..errors import DexError
 from ..guards.pii_meta import entry_meta
+
+# The declaration model and its parser live in a leaf (#927), so a semantic
+# layer's own authoring route can read a declaration without importing the dbt
+# rewriter and sqlglot behind it. Re-exported here, where the dbt callers look.
+from ..semantic_declarations import Additivity as Additivity
+from ..semantic_declarations import Assumption as Assumption
+from ..semantic_declarations import ColumnDeclaration as ColumnDeclaration
+from ..semantic_declarations import Declaration as Declaration
+from ..semantic_declarations import DeclarationError as DeclarationError
+from ..semantic_declarations import Evidence as Evidence
+from ..semantic_declarations import Population as Population
+from ..semantic_declarations import PopulationFilter as PopulationFilter
+from ..semantic_declarations import Role as Role
+from ..semantic_declarations import parse_declarations as parse_declarations
 from .plans import EditKind, EditOp, PlanEdit, select_columns
 from .rewrite import (
     RewriteError,
@@ -64,130 +76,6 @@ from .rewrite import (
 #: The namespace under ``config.meta`` that dex owns. Everything a declaration
 #: says that dbt has no construct for lands here, and nothing else does.
 DEX_META_KEY = "dex"
-
-
-class DeclarationError(DexError, ValueError):
-    """A declaration dex refuses, with the fix named in the message.
-
-    A ``ValueError`` as well, so it reaches the same request-error envelope every
-    other malformed payload does on the commands that already catch that.
-    """
-
-
-class Role(str, Enum):
-    KEY = "key"
-    FOREIGN_KEY = "foreign_key"
-    DIMENSION = "dimension"
-    TIME = "time"
-    MEASURE = "measure"
-    ATTRIBUTE = "attribute"
-
-
-class Additivity(str, Enum):
-    ADDITIVE = "additive"
-    # Does not add across time: a balance, a running or season-to-date total.
-    SEMI_ADDITIVE = "semi_additive"
-    # Does not add at all: a ratio, a share, a distinct count.
-    NON_ADDITIVE = "non_additive"
-
-
-class Evidence(str, Enum):
-    """Where a decision came from, strongest first."""
-
-    REQUEST = "request"
-    CONTRACT = "contract"
-    PRECEDENT = "precedent"
-    DATA = "data"
-    DEFAULT = "default"
-
-
-class _Strict(BaseModel):
-    # An unknown key is a typo far more often than a deliberate extension, and a
-    # typo silently dropped is a declaration that says less than its author meant.
-    model_config = ConfigDict(extra="forbid")
-
-
-class PopulationFilter(_Strict):
-    column: str
-    includes: list[str | int | float | bool] | None = None
-    excludes: list[str | int | float | bool] | None = None
-
-
-class Population(_Strict):
-    rule: str | None = None
-    filters: list[PopulationFilter] = []
-
-
-class ColumnDeclaration(_Strict):
-    role: Role | None = None
-    description: str | None = None
-    references: str | None = None
-    # `never`, or a sentence saying what NULL means in this column.
-    null_rule: str | None = None
-    aggregation: str | None = None
-    additivity: Additivity | None = None
-    # `currency:<ISO code>`, `fraction`, `percent`, `count`, or a plain unit.
-    unit: str | None = None
-
-
-class Assumption(_Strict):
-    decision: str | None = None
-    chosen: str | None = None
-    evidence: Evidence | None = None
-    detail: str | None = None
-
-
-class Declaration(_Strict):
-    model: str
-    description: str | None = None
-    grain: list[str] | None = None
-    population: Population | None = None
-    columns: dict[str, ColumnDeclaration] = {}
-    assumptions: list[Assumption] = []
-
-
-# --- reading the payload ------------------------------------------------------
-
-
-def parse_declarations(entries: Any) -> list[Declaration]:
-    """The payload's ``declarations`` list, validated, or a refusal naming the fix."""
-
-    if entries is None:
-        return []
-    if not isinstance(entries, list):
-        raise DeclarationError(
-            'declarations must be a list: {"declarations": [{"model": ...}, ...]}'
-        )
-    parsed: list[Declaration] = []
-    for index, entry in enumerate(entries):
-        try:
-            parsed.append(Declaration.model_validate(entry))
-        except ValidationError as exc:
-            raise DeclarationError(_validation_message(index, entry, exc)) from exc
-    seen: set[str] = set()
-    for declaration in parsed:
-        if declaration.model in seen:
-            raise DeclarationError(
-                f"'{declaration.model}' is declared twice in this payload; merge the "
-                "two into one declaration"
-            )
-        seen.add(declaration.model)
-    return parsed
-
-
-def _validation_message(index: int, entry: Any, exc: ValidationError) -> str:
-    model = entry.get("model") if isinstance(entry, dict) else None
-    where = f"declarations[{index}]" + (f" ('{model}')" if model else "")
-    problems = []
-    for error in exc.errors():
-        loc = ".".join(str(part) for part in error["loc"])
-        if error["type"] == "extra_forbidden":
-            problems.append(f"{loc} is not a declaration field")
-        elif error["type"] == "missing":
-            problems.append(f"{loc} is required")
-        else:
-            problems.append(f"{loc}: {error['msg']}")
-    return f"{where} is malformed: " + "; ".join(problems)
 
 
 # --- where a model is declared --------------------------------------------------

@@ -309,6 +309,21 @@ class SlayerSemanticLayer:
 
         return validate_plan(self, list(edits), mode)
 
+    # --- the derivation channel (#927) ------------------------------------------
+
+    def derive_semantic(self, request: Any) -> Any:
+        """Declared marts as SLayer model files; see :mod:`.derivation`.
+
+        Reads only the request and the configured files, and validates with the
+        same checks authoring runs, so no SLayer storage, datasource or warehouse
+        is opened.
+        """
+
+        ensure_available()
+        from .derivation import derive
+
+        return derive(self, request)
+
     def _load(self) -> LoadResult:
         if self._loaded is None:
             ensure_available()

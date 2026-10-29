@@ -15,7 +15,9 @@ engineer does: rank what matters, drill selectively, and persist a draft map in
 
 Dex works in one loop: explore, transform, maintain. Every step runs one engine
 command, reads the single JSON envelope it prints, and decides the next step
-from that envelope.
+from that envelope. Step 1 only reads. Steps 2 to 4 write project files, commit
+and build on dev, so take them only when the task asks for a change; a task that
+asks what is in the data stops after step 1 and reports what it found.
 
 1. **Explore before you write.** Before writing or fixing SQL against a table
    whose columns, types, grain, or join keys you have not verified in this

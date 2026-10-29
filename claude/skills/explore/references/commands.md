@@ -478,6 +478,16 @@ it as `execution` (`dex` or `vendor`).
   carries its `semantic_model`, that model carries its `relation`, and
   `explore profile` then `explore query` reach the values. `--api` is refused
   too, since Ossie has no hosted deployment.
+- `semantic.vendor: cube` reads the plain-YAML Cube model files named in
+  `semantic.cube.files` statically (needs the `[cube]` extra; no Node, no Cube
+  server, no warehouse connection), each validated by Dex's own port of Cube's
+  model rules. `list` and `--for-dimension` answer: a dimension token is
+  `cube.member`, an aggregating measure is a measure and a metric named
+  `cube.member`, and a view is a semantic model with no relation whose members
+  carry their source in `vendor_params.source`. A JS model, a templated YAML
+  file and an `extends` are named under `data.compiled_only` and never
+  translated. `query` refuses by name, and `values` refuses after its PII gate,
+  because Cube renders a query only inside a Cube server.
 - `semantic.vendor: slayer` reads the SLayer model files named in
   `semantic.slayer.models` (needs the `[slayer]` extra). `list` and
   `--for-dimension` answer: a metric is a saved measure named `model.measure`,

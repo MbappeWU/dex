@@ -1,6 +1,6 @@
 ---
 name: explore
-description: 'Use this whenever you need to know what is actually in a database, warehouse, or DuckDB file before you trust it: inventory, column profiles, PII detection, grain and data-quality problems, verified joins, ER diagrams, ad-hoc SQL probes, segmentation, and the semantic layer a repo declares (dbt, Apache Ossie, or SLayer). Trigger it on an unmet precondition, not on phrasing: if you are about to write or fix SQL against tables whose columns, types, grain, or join keys you have not verified in this session, use this FIRST. That includes dbt work (building a model, fixing one, debugging wrong numbers) whenever the ticket names source tables without spelling out their schema. It applies mid-task too: on reaching a table you have not inspected, stop and use this rather than guess column names. Also for "what''s in my duckdb", "is this data any good", "how do these tables relate". Read-only; writes only the .dex/ cache. It does not author the model: transform does, and maintain reconciles a project that has drifted.'
+description: 'Use this whenever you need to know what is actually in a database, warehouse, or DuckDB file before you trust it: inventory, column profiles, PII detection, grain and data-quality problems, verified joins, ER diagrams, ad-hoc SQL probes, segmentation, and the semantic layer a repo declares (dbt, Ossie, SLayer, or Cube). Trigger it on an unmet precondition, not on phrasing: if you are about to write or fix SQL against tables whose columns, types, grain, or join keys you have not verified in this session, use this FIRST. That includes dbt work (building a model, fixing one, debugging wrong numbers) whenever the ticket names source tables without spelling out their schema. It applies mid-task too: on reaching a table you have not inspected, stop and use this rather than guess column names. Also for "what''s in my duckdb", "is this data any good", "how do these tables relate". Read-only; writes only the .dex/ cache. It does not author the model: transform does, and maintain reconciles a project that has drifted.'
 compatibility: 'Needs a local shell and uv. On first use, uv builds the exmergo-dex-core engine from the source bundled with the plugin, or installs it from PyPI at the version scripts/run.py pins when no source is bundled. Runs in Claude Code or another agent that loads Agent Skills and has a shell, not in claude.ai chat.'
 ---
 
@@ -15,7 +15,9 @@ engineer does: rank what matters, drill selectively, and persist a draft map in
 
 Dex works in one loop: explore, transform, maintain. Every step runs one engine
 command, reads the single JSON envelope it prints, and decides the next step
-from that envelope.
+from that envelope. Step 1 only reads. Steps 2 to 4 write project files, commit
+and build on dev, so take them only when the task asks for a change; a task that
+asks what is in the data stops after step 1 and reports what it found.
 
 1. **Explore before you write.** Before writing or fixing SQL against a table
    whose columns, types, grain, or join keys you have not verified in this

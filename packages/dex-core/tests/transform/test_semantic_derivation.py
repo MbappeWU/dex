@@ -210,7 +210,14 @@ def test_a_non_additive_measure_with_a_non_summing_aggregation_is_derived():
     )
 
     assert found.body["measures"] == [
-        {"name": "share", "agg": "average", "expr": "share"}
+        {
+            "name": "share",
+            "agg": "average",
+            "expr": "share",
+            # MetricFlow reads any measure as one it may add up, so the
+            # declaration's word against that travels as metadata.
+            "config": {"meta": {"dex": {"additivity": "non_additive"}}},
+        }
     ]
 
 
@@ -771,3 +778,86 @@ def test_a_non_dbt_semantic_vendor_gets_a_note_and_no_derivation(
     assert "semantic_proposal" not in envelope["data"]
     assert any("semantic.vendor is 'ossie'" in w for w in envelope["warnings"])
     assert not any(any("semantic" in p for p in c) for c in calls)
+
+
+# --- population and the other declared metadata (#927) ------------------------------
+
+POPULATED = {
+    **MART,
+    "population": {
+        "rule": "Paid and shipped orders",
+        "filters": [{"column": "status", "includes": ["paid", "shipped"]}],
+    },
+    "assumptions": [
+        {"decision": "what counts", "chosen": "paid or shipped", "evidence": "request"}
+    ],
+    "columns": {
+        **MART["columns"],
+        "status": {**MART["columns"]["status"], "null_rule": "never"},
+        "order_total": {**MART["columns"]["order_total"], "unit": "currency:EUR"},
+    },
+}
+
+
+def _filters_anywhere(node: Any) -> list[Any]:
+    """Every filter the definition applies; metadata (``config``) states, it
+    does not apply, so the population's own ``filters`` there are not one."""
+
+    if isinstance(node, dict):
+        found = [v for k, v in node.items() if k in ("filter", "filters")]
+        return found + [
+            f for k, v in node.items() if k != "config" for f in _filters_anywhere(v)
+        ]
+    if isinstance(node, list):
+        return [f for v in node for f in _filters_anywhere(v)]
+    return []
+
+
+def test_a_population_is_carried_as_metadata_and_never_as_a_filter():
+    found = _derive(POPULATED)
+
+    body = found.body
+    assert body["config"]["meta"]["dex"]["population"] == POPULATED["population"]
+    assert body["config"]["meta"]["dex"]["assumptions"] == POPULATED["assumptions"]
+    assert body["description"] == (
+        "One row per order. Population: Paid and shipped orders; status is one "
+        "of 'paid' or 'shipped'."
+    )
+    # Never a filter: the mart's SQL already enforces the population.
+    assert _filters_anywhere(body) == []
+    (status,) = [d for d in body["dimensions"] if d["name"] == "status"]
+    assert status["config"] == {"meta": {"dex": {"null_rule": "never"}}}
+    (total,) = [m for m in body["measures"] if m["name"] == "order_total"]
+    assert total["config"] == {"meta": {"dex": {"unit": "currency:EUR"}}}
+    assert {"population", "assumptions", "columns.order_total.unit"} <= set(
+        found.carried
+    )
+
+
+def test_every_declared_field_is_either_carried_or_named_with_why():
+    declared = _declared(
+        ordered_at=ORDERED_AT,
+        note={"role": "attribute", "description": "Free text."},
+    )
+    declared["grain"] = ["order_id", "ordered_at"]
+
+    found = _derive(declared)
+
+    assert found.not_carried["grain"].startswith("composite")
+    assert "no element for" in found.not_carried["columns.note.description"]
+    stated = {"description", "grain", "columns.order_id.role"}
+    assert stated <= set(found.carried) | set(found.not_carried)
+
+
+def test_dbt_parses_the_metadata_a_derivation_carries(
+    dbt_project_dir: Path, tmp_path: Path, capsys, real_dbt
+):
+    _add_time_spine(dbt_project_dir)
+    _add_layer(dbt_project_dir)
+
+    rc, envelope = _plan(tmp_path, capsys, declaration=POPULATED)
+
+    assert rc == 0, envelope
+    model = envelope["data"]["semantic_proposal"]["models"]["fct_orders"]
+    assert model["status"] == "included", model
+    assert model["validation"]["parse"]["result"] == "passed"

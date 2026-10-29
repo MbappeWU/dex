@@ -346,6 +346,8 @@ Documentation = "https://docs.exmergo.com/dex"
 Repository = "https://github.com/exmergo/dex"
 Changelog = "https://github.com/exmergo/dex/blob/main/CHANGELOG.md"
 Issues = "https://github.com/exmergo/dex/issues"
+"Privacy Policy" = "https://www.exmergo.com/privacy/dex"
+"Terms of Service" = "https://www.exmergo.com/terms/dex"
 
 # The uv that resolves this project must trust the CA bundle certifi now ships:
 # uv vendors its own roots, and 0.13.4 is the first release without the emSign
@@ -371,7 +373,7 @@ source = "vcs"
 [tool.hatch.version.raw-options]
 # This package lives in a subdirectory; the repository .git is two levels up.
 root = "../.."
-fallback_version = "1.16.4"
+fallback_version = "1.16.5"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

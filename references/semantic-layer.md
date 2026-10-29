@@ -968,6 +968,40 @@ of them reaches the catalog, the declarations, or the fingerprint, since values
 reach agent context only through `explore query`'s firewall. `meta` is not carried
 either.
 
+### Derived from a declared dbt mart
+
+In a repository that keeps dbt for its models and SLayer for its semantics, a
+model declaration (`transform plan` with `declarations`, or `transform declare`) on
+a mart under `transform.marts_paths` derives the SLayer model it states, through
+the same per-vendor hook that derives a MetricFlow semantic model under
+`vendor: dbt`:
+
+- the grain is `primary_key: true` on each grain column, a composite grain
+  included;
+- a `foreign_key` with `references` is a `many_to_one` join to the SLayer model
+  already sitting on the parent's table, and where none does, no join is invented;
+- every declared column is a column, typed from the SQL's casts or the profiled
+  cache, and the first `time` column is the `default_time_dimension`;
+- a declared aggregation is a saved measure `<column>_<agg>` (formula
+  `<column>:<agg>`); a `semi_additive` measure is left to the author, since SLayer's
+  `last` is not a total across entities on the last period;
+- the population and assumptions sit in the model's `meta.dex`, units, NULL rules
+  and additivity in each column's, and the population also closes the model's
+  description as one sentence. It is never a `filters` entry: the mart's SQL
+  already enforces it.
+
+`sql_table` takes the `database.schema` the SLayer models on the project's other
+models share, else the relation the compiled dbt manifest names (with a note,
+since that is whatever target compiled it last), else the bare table name as a
+named limitation. The model is validated by exactly the checks `semantic slayer
+define` runs and read back through the SLayer catalog. Where its path,
+`models/<data_source>/<mart>.yaml`, is already under `semantic.slayer.models`, it is
+stored as a plan of its own on the SLayer layer beside the dbt plan
+(`data.semantic_proposal.plan_id`; apply both); otherwise it is proposed with the
+`dex config set` that adds the path. `semantic slayer define|update|plan` take
+`declarations` too, and there they annotate a model the payload or the layer
+already defines. Nothing opens SLayer storage, a datasource, or a warehouse.
+
 ### What SLayer's declarations reach in `explore`
 
 - a sole primary-key column, or a `unique` column, becomes a declared unique key;
