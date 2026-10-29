@@ -726,14 +726,17 @@ def profile(
     # query` on that table must work without a second warehouse scan. Only the
     # freshly profiled are merged; the reused already live in the cache untouched,
     # and prior relationships are preserved because profile runs no inference pass.
+    # Measurement only. Declared grain and semantic exposure are read from the
+    # project at output time, on a copy, so the cache does not keep a claim the
+    # next run would have to refresh to drop (#926).
     profiled, cache, locator, persist_note = _profile_into_cache(
-        store, adapter, config, defs, stale, prior, now, withhold=values_free
+        store, adapter, config, None, stale, prior, now, withhold=values_free
     )
 
     # Freshly profiled plus fresh-cached: the full requested set, whether scanned
-    # this run or served from the cache. Only the freshly profiled needed
-    # annotation; the fresh-cached carry their keys and grain from the write that
-    # stored them.
+    # this run or served from the cache. The cache holds the measurement. Project
+    # grain claims and semantic exposure are applied to both halves below, when
+    # --use-project asks, so a cache hit and a rescan answer the same way (#926).
     datasets = profiled + list(fresh_reused.values())
 
     notes = [persist_note]
@@ -815,6 +818,20 @@ def profile(
                 )
 
     if use_project:
+        # Copies: the objects in `datasets` include the ones just saved. Project
+        # claims must not land back in the cache.
+        datasets = [dataset.model_copy(deep=True) for dataset in datasets]
+        _apply_declared_profile(
+            datasets,
+            defs,
+            high_null_fraction=config.profile_high_null_fraction,
+        )
+        catalog = _semantic_catalog(engine, True)
+        if catalog is not None:
+            _annotate_semantic_exposure(datasets, catalog)
+        else:
+            for dataset in datasets:
+                dataset.semantic_models = []
         datasets, declaration_notes = _apply_declarations(
             datasets,
             defs,
@@ -1000,14 +1017,23 @@ def relationships(
     )
 
     # Annotate before persisting so cached datasets carry candidate_keys and
-    # grain, the same shape a `map`-written cache has. Only the freshly profiled
-    # need it; the fresh-cached already carry theirs from the cache write.
+    # grain, the same shape a `map`-written cache has. Measurement is only
+    # recomputed for a fresh scan; a cache hit already has it.
     _annotate_grain(
         profiled,
         defs,
         high_null_fraction=config.profile_high_null_fraction,
         dialect=adapter.dialect,
     )
+    # A cache hit was measured by whoever wrote it. `profile` no longer bakes
+    # project grain into that write (#926), so a reused profile still has to
+    # take the claim before this command saves.
+    if use_project and fresh_reused:
+        _apply_declared_profile(
+            list(fresh_reused.values()),
+            defs,
+            high_null_fraction=config.profile_high_null_fraction,
+        )
 
     # Fold same-lineage duplicates before the merge, as `map` does, so the folded
     # set flows into both the cache and the result. Relationships profiles the
@@ -2376,8 +2402,8 @@ def map(
         raise _budget_exhausted(store, adapter, accumulated, len(stale))
 
     # Freshly profiled plus fresh-cached: the full selected set, whether
-    # scanned this run or reused. Only the freshly profiled need annotation;
-    # the reused already carry theirs from the cache write that stored them.
+    # scanned this run or reused. Measurement is only recomputed for a fresh
+    # scan; a cache hit already has it.
     all_selected = profiled + list(fresh_reused.values())
     _annotate_grain(
         profiled,
@@ -2387,6 +2413,15 @@ def map(
         high_null_fraction=config.profile_high_null_fraction,
         dialect=adapter.dialect,
     )
+    # Same as relationships: a profile cached by `explore profile` holds the
+    # measurement only, so a reused object still needs the project's grain
+    # before this map saves it (#926).
+    if use_project and fresh_reused:
+        _apply_declared_profile(
+            list(fresh_reused.values()),
+            defs,
+            high_null_fraction=config.profile_high_null_fraction,
+        )
     suppressed: list[rel_mod.SuppressedMatch] = []
     affix_matches: list[rel_mod.AffixMatch] = []
     inferred = rel_mod.infer_relationships(
@@ -4530,36 +4565,41 @@ def _merged_hints(user_hints: list[str], metric_models: list[str]) -> list[str]:
     return merged
 
 
-def _annotate_grain(
-    datasets: list[Dataset],
-    defs: dbt_project.ProjectDefinitions | None = None,
-    *,
-    orphaned: set[str] | None = None,
-    baselined: set[str] | None = None,
-    high_null_fraction: float = 0.95,
-    dialect: str | None = None,
-) -> None:
-    """Attach the interpretation layer to raw profiles: candidate keys, the likely
-    grain, the data-quality warnings an analyst would write (non-unique own
-    key, unknown grain), and the severity-ordered column findings (#291,
-    ``high_null_fraction`` is ``profile_high_null_fraction`` in
-    ``.dex/config.yml``). Shared by profile and map so a single-table profile
-    surfaces a broken grain without requiring a full map.
+def _is_declared_profile_note(text: str) -> bool:
+    """A data-quality note this module added from a project grain claim.
 
-    With project definitions, the declared truth refines the heuristics: a
-    semantic model's primary entity overrides the detected grain (noting any
-    disagreement), and a profiled column contradicting its declared ``unique``
-    test gets a data-quality note. A declared composite key (a model-level
-    ``unique_combination_of_columns`` test -- the one grain shape measurement
-    alone can miss or a column-level test cannot express at all) overrides the
-    detected grain too, unless the detected grain is already a measurement-
-    proven single column, in which case the proven single wins and the
-    composite is only noted. ``candidate_keys`` stays measurement-only: an
-    unmeasured declared key is a claim, and the cache is a drift baseline.
-    ``orphaned`` (map only) badges a relation no current model/source builds:
-    as likely residue when ``baselined`` (the snapshot's identifiers) knew it,
-    and otherwise as a new relation no source declares yet. ``dialect`` (the
-    connector's) notes columns whose names it reserves (#651).
+    Measured notes stay. These are the ones a later read has to drop before
+    applying the project as it reads now, or a removed declaration survives in
+    the output for as long as the cache is fresh.
+    """
+
+    return (
+        "declared primary entity" in text
+        or "declared unique" in text
+        or "declared composite" in text
+        or "composite keys are declared" in text
+        or "also declared for this table" in text
+    )
+
+
+def _apply_declared_profile(
+    datasets: list[Dataset],
+    defs: dbt_project.ProjectDefinitions | None,
+    *,
+    high_null_fraction: float,
+) -> None:
+    """Project grain claims on ``datasets``, starting from the measured grain.
+
+    A semantic model's primary entity, a declared ``unique`` test, and a
+    declared composite key refine the heuristic the scan stored. They are not
+    part of the scan. ``explore profile`` applies this at read time, to cached
+    and fresh profiles alike, and does not write the result back (#926). Map
+    and relationships still persist it, because their cache is the artifact
+    those commands return.
+
+    Notes this function owns are removed first and the grain is put back to the
+    measurement, so running it again, or running it after the declaration was
+    deleted, cannot keep the old claim. ``candidate_keys`` stays measurement-only.
     """
 
     declared_grain: dict[str, str] = {}
@@ -4599,33 +4639,11 @@ def _annotate_grain(
                 bucket.append(list(composite.columns))
 
     for ds in datasets:
+        ds.data_quality = [
+            note for note in ds.data_quality if not _is_declared_profile_note(note)
+        ]
         ds.candidate_keys = rel_mod.candidate_keys(ds)
         ds.grain = rel_mod.detect_grain(ds)
-        # After candidate_keys, because the reported half has to come back in
-        # exactly its order; the probe's suppressed entries ride through.
-        ds.key_evidence = rel_mod.key_evidence(ds)
-        ds.data_quality.extend(rel_mod.data_quality_notes(ds))
-        if dialect is not None:
-            reserved = reserved_column_names(dialect, [c.name for c in ds.columns])
-            if reserved:
-                ds.data_quality.append(
-                    f"column(s) {', '.join(reserved)} are reserved words in "
-                    f"{dialect}; declare them with `quote: true` in dbt, or its "
-                    "generic tests on them fail to compile"
-                )
-        if orphaned and ds.identifier in orphaned:
-            if baselined and ds.identifier.lower() in baselined:
-                ds.data_quality.append(
-                    "no current dbt model or source builds this relation, though "
-                    "the project builds/sources others in this schema; likely "
-                    "orphaned residue of a rename or removal"
-                )
-            else:
-                ds.data_quality.append(
-                    "no dbt source declares this relation yet; add it to the "
-                    "sources file before modelling it"
-                )
-
         grain_column = declared_grain.get(ds.identifier.lower())
         if grain_column is not None:
             profiled = next(
@@ -4724,6 +4742,70 @@ def _annotate_grain(
         ds.findings = rel_mod.profile_findings(
             ds, high_null_fraction=high_null_fraction
         )
+
+
+def _annotate_grain(
+    datasets: list[Dataset],
+    defs: dbt_project.ProjectDefinitions | None = None,
+    *,
+    orphaned: set[str] | None = None,
+    baselined: set[str] | None = None,
+    high_null_fraction: float = 0.95,
+    dialect: str | None = None,
+) -> None:
+    """Attach the interpretation layer to raw profiles: candidate keys, the likely
+    grain, the data-quality warnings an analyst would write (non-unique own
+    key, unknown grain), and the severity-ordered column findings (#291,
+    ``high_null_fraction`` is ``profile_high_null_fraction`` in
+    ``.dex/config.yml``). Shared by profile and map so a single-table profile
+    surfaces a broken grain without requiring a full map.
+
+    With project definitions, the declared truth refines the heuristics: a
+    semantic model's primary entity overrides the detected grain (noting any
+    disagreement), and a profiled column contradicting its declared ``unique``
+    test gets a data-quality note. A declared composite key (a model-level
+    ``unique_combination_of_columns`` test -- the one grain shape measurement
+    alone can miss or a column-level test cannot express at all) overrides the
+    detected grain too, unless the detected grain is already a measurement-
+    proven single column, in which case the proven single wins and the
+    composite is only noted. ``candidate_keys`` stays measurement-only: an
+    unmeasured declared key is a claim, and the cache is a drift baseline.
+    ``orphaned`` (map only) badges a relation no current model/source builds:
+    as likely residue when ``baselined`` (the snapshot's identifiers) knew it,
+    and otherwise as a new relation no source declares yet. ``dialect`` (the
+    connector's) notes columns whose names it reserves (#651). Project grain
+    claims are :func:`_apply_declared_profile`, which this calls once the
+    measurement is on the dataset.
+    """
+
+    for ds in datasets:
+        ds.candidate_keys = rel_mod.candidate_keys(ds)
+        ds.grain = rel_mod.detect_grain(ds)
+        # After candidate_keys, because the reported half has to come back in
+        # exactly its order; the probe's suppressed entries ride through.
+        ds.key_evidence = rel_mod.key_evidence(ds)
+        ds.data_quality.extend(rel_mod.data_quality_notes(ds))
+        if dialect is not None:
+            reserved = reserved_column_names(dialect, [c.name for c in ds.columns])
+            if reserved:
+                ds.data_quality.append(
+                    f"column(s) {', '.join(reserved)} are reserved words in "
+                    f"{dialect}; declare them with `quote: true` in dbt, or its "
+                    "generic tests on them fail to compile"
+                )
+        if orphaned and ds.identifier in orphaned:
+            if baselined and ds.identifier.lower() in baselined:
+                ds.data_quality.append(
+                    "no current dbt model or source builds this relation, though "
+                    "the project builds/sources others in this schema; likely "
+                    "orphaned residue of a rename or removal"
+                )
+            else:
+                ds.data_quality.append(
+                    "no dbt source declares this relation yet; add it to the "
+                    "sources file before modelling it"
+                )
+    _apply_declared_profile(datasets, defs, high_null_fraction=high_null_fraction)
 
 
 def _relationship_notes(
