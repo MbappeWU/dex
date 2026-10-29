@@ -69,6 +69,7 @@ _EXPORTS = {
     "ConnectorError": "errors",
     "Cost": "envelope",
     "CostGuardError": "guards.cost_guard",
+    "CubeDependencyError": "cube.dependency",
     "CredentialDiscoveryError": "connect",
     "DEMO_FILENAME": "demo",
     "Dataset": "cache",
@@ -145,6 +146,7 @@ if TYPE_CHECKING:  # what a type checker and an IDE see; never run
         ScopeError,
         SemanticSource,
     )
+    from .cube.dependency import CubeDependencyError
     from .demo import (
         DEMO_FILENAME,
         DemoDependencyError,
@@ -250,6 +252,7 @@ __all__ = [
     "Cost",
     "CostGuardError",
     "CredentialDiscoveryError",
+    "CubeDependencyError",
     "Dataset",
     "DeclarationError",
     "DemoDependencyError",

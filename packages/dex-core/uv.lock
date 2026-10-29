@@ -1116,6 +1116,9 @@ clickhouse = [
 cluster = [
     { name = "scikit-learn" },
 ]
+cube = [
+    { name = "sqlglot" },
+]
 databricks = [
     { name = "databricks-sdk" },
     { name = "databricks-sql-connector" },
@@ -1259,6 +1262,7 @@ requires-dist = [
     { name = "sqlglot", marker = "extra == 'all'", specifier = ">=28.6,<31" },
     { name = "sqlglot", marker = "extra == 'bigquery'", specifier = ">=28.6,<31" },
     { name = "sqlglot", marker = "extra == 'clickhouse'", specifier = ">=28.6,<31" },
+    { name = "sqlglot", marker = "extra == 'cube'", specifier = ">=28.6,<31" },
     { name = "sqlglot", marker = "extra == 'databricks'", specifier = ">=28.6,<31" },
     { name = "sqlglot", marker = "extra == 'dev'", specifier = ">=28.6,<31" },
     { name = "sqlglot", marker = "extra == 'duckdb'", specifier = ">=28.6,<31" },
@@ -1285,7 +1289,7 @@ requires-dist = [
     { name = "urllib3", marker = "extra == 'trino'", specifier = ">=2.8.0" },
     { name = "urllib3", marker = "extra == 'values-free-conformance'", specifier = ">=2.8.0" },
 ]
-provides-extras = ["all", "bigquery", "clickhouse", "cluster", "databricks", "dev", "duckdb", "ossie", "postgres", "project-conformance", "redshift", "semantic", "semantic-api", "semantic-conformance", "slayer", "snowflake", "sql", "storage-conformance", "trino", "values-free-conformance"]
+provides-extras = ["all", "bigquery", "clickhouse", "cluster", "cube", "databricks", "dev", "duckdb", "ossie", "postgres", "project-conformance", "redshift", "semantic", "semantic-api", "semantic-conformance", "slayer", "snowflake", "sql", "storage-conformance", "trino", "values-free-conformance"]
 
 [[package]]
 name = "faker"

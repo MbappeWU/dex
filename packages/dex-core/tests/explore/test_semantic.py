@@ -448,7 +448,7 @@ def test_a_semantic_vendor_dex_does_not_ship_is_refused():
     # Refused at the config seam, by name, rather than resolving to whatever
     # happens to be the default backend.
     with pytest.raises(ValidationError, match=r"semantic\.vendor"):
-        DexConfig(semantic={"vendor": "cube"})
+        DexConfig(semantic={"vendor": "lookml"})
 
 
 def test_the_backend_declares_who_executes():

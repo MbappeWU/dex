@@ -3689,6 +3689,16 @@ def _relationship_matches(
     )
 
 
+#: How a contradiction note names a semantic layer that declared a key, by the
+#: declaration channel's `source`. A dbt key (`yaml`, `manifest`) is "the dbt
+#: project".
+_DECLARING_LAYER = {
+    "ossie": "the Ossie layer",
+    "slayer": "the SLayer layer",
+    "cube": "the Cube layer",
+}
+
+
 def _project_definitions(
     engine: DexEngine, use_project: bool
 ) -> dbt_project.ProjectDefinitions:
@@ -4553,7 +4563,9 @@ def _annotate_grain(
     """
 
     declared_grain: dict[str, str] = {}
-    declared_unique: dict[str, set[str]] = {}
+    # relation -> column -> the channel that declared it unique, so the
+    # contradiction note names where the claim lives.
+    declared_unique: dict[str, dict[str, str]] = {}
     declared_composite: dict[str, list[list[str]]] = {}
     if defs is not None and (
         defs.primary_entities or defs.declared_keys or defs.declared_composite_keys
@@ -4572,7 +4584,9 @@ def _annotate_grain(
                 key.relation, key.model, identifiers
             )
             if ident is not None:
-                declared_unique.setdefault(ident.lower(), set()).add(key.column.lower())
+                declared_unique.setdefault(ident.lower(), {}).setdefault(
+                    key.column.lower(), key.source
+                )
         for composite in defs.declared_composite_keys:
             ident, _ambiguous = rel_mod.resolve_declared(
                 composite.relation, composite.model, identifiers
@@ -4637,13 +4651,13 @@ def _annotate_grain(
                         f"primary entity ({origin})"
                     )
                 ds.grain = declared
+        declared_here = declared_unique.get(ds.identifier.lower(), {})
         for col in ds.columns:
-            if (
-                col.name.lower() in declared_unique.get(ds.identifier.lower(), set())
-                and col.is_unique is False
-            ):
+            source = declared_here.get(col.name.lower())
+            if source is not None and col.is_unique is False:
                 ds.data_quality.append(
-                    f"{col.name} is declared unique in the dbt project but "
+                    f"{col.name} is declared unique in "
+                    f"{_DECLARING_LAYER.get(source, 'the dbt project')} but "
                     "profiling found duplicates"
                 )
 

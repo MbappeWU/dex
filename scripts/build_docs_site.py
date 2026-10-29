@@ -249,6 +249,17 @@ REFERENCE_PAGES: tuple[ReferencePage, ...] = (
         ),
     ),
     ReferencePage(
+        "cube-compatibility.md",
+        "semantic-layers/cube",
+        PageMeta(
+            "Cube compatibility",
+            "What dex reads from Cube YAML model files with no Cube server: the "
+            "ported model rules, compiled-only files, and how cubes and views map "
+            "onto the catalog.",
+            "Cube",
+        ),
+    ),
+    ReferencePage(
         "ossie-walkthrough.md",
         "guides/ossie-semantic-layer",
         PageMeta(

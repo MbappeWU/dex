@@ -308,6 +308,17 @@ _SLAYER_BACKED_COMMANDS = (("explore", "semantic"), ("transform", "apply"))
 _SLAYER_BACKED_FLAG = "--use-project"
 _SLAYER_VENDOR = "slayer"
 
+# Cube follows the same config read for the same commands, though for the
+# opposite reason: its extra is light (the dialect engine every connector extra
+# already carries), and it is named explicitly so the commands that read a Cube
+# layer keep resolving what that layer needs as the extra grows. Cube renders a
+# metric query itself, so MetricFlow is never installed for a Cube `query` or
+# `values`.
+_CUBE_VENDOR = "cube"
+
+# The vendors that render a metric query without MetricFlow.
+_RENDERS_WITHOUT_METRICFLOW = (_SLAYER_VENDOR, _CUBE_VENDOR)
+
 
 def _positionals(argv: list[str]) -> list[str]:
     """The bare tokens of an invocation: group, subcommand, and whatever follows.
@@ -358,7 +369,8 @@ def _feature_extras(argv: list[str], vendor: str | None = None) -> list[str]:
     `semantic.vendor`, because it is too heavy to take on a guess (see
     `_SLAYER_COMMANDS`). The same read keeps MetricFlow out of a SLayer `query` or
     `values`: SLayer renders those itself, so `semantic` would be installed for
-    nothing.
+    nothing. `cube` follows the same read for the same commands (see
+    `_CUBE_VENDOR`), and keeps MetricFlow out the same way.
     """
 
     positionals = _positionals(argv)
@@ -374,12 +386,16 @@ def _feature_extras(argv: list[str], vendor: str | None = None) -> list[str]:
     )
     if command in _SLAYER_COMMANDS or (vendor == _SLAYER_VENDOR and reads_layer):
         extras.append("slayer")
+    if vendor == _CUBE_VENDOR and reads_layer:
+        extras.append("cube")
     if command in _SEMANTIC_AUTHORING_COMMANDS:
         extras.append("semantic")
     if command != ("explore", "semantic"):
         return extras
     mode = positionals[2] if len(positionals) > 2 else "list"
-    renders_with_metricflow = vendor != _SLAYER_VENDOR and "--api" not in argv
+    renders_with_metricflow = (
+        vendor not in _RENDERS_WITHOUT_METRICFLOW and "--api" not in argv
+    )
     if mode in _SEMANTIC_RENDERING_MODES and renders_with_metricflow:
         return [*extras, "semantic-api", "semantic"]
     return [*extras, "semantic-api"]

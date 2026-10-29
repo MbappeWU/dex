@@ -1487,7 +1487,8 @@ def test_a_base_install_imports_no_reader_and_no_optional_dependency(wheel: str)
         "watched = ('jsonschema', 'sqlglot', 'dbt', 'metricflow', 'slayer')\n"
         "print(sorted({m.split('.')[0] for m in sys.modules "
         "if m.startswith(watched)}))\n"
-        "assert 'exmergo_dex_core.ossie' not in sys.modules\n",
+        "assert 'exmergo_dex_core.ossie' not in sys.modules\n"
+        "assert 'exmergo_dex_core.cube' not in sys.modules\n",
     )
 
     assert done.returncode == 0, done.stderr
@@ -1776,6 +1777,101 @@ def test_the_slayer_extra_installs_the_pinned_release_inside_the_dialect_bounds(
 
     assert done.returncode == 0, done.stderr
     assert done.stdout.strip() == "SlayerSemanticLayer"
+
+
+# --- the Cube install boundary, from an actual wheel ---------------------------
+#
+# `[cube]` is the dialect engine and nothing Cube ships: the reader is dex's own.
+# A base install refuses `vendor: cube` by name without importing sqlglot, and
+# still validates the configuration; the extra catalogs a layer with no server.
+
+CUBE_CONFIG = """connector: duckdb
+semantic:
+  vendor: cube
+  cube:
+    files:
+      - model/orders.yml
+"""
+
+CUBE_MODEL = """cubes:
+  - name: orders
+    sql_table: demo.main.orders
+    dimensions:
+      - name: order_id
+        sql: "{CUBE}.order_id"
+        type: number
+        primary_key: true
+    measures:
+      - name: order_count
+        type: count
+"""
+
+
+def _cube_repo(tmp_path: Path) -> Path:
+    root = tmp_path / "cube_repo"
+    (root / ".dex").mkdir(parents=True)
+    (root / "model").mkdir()
+    (root / ".dex" / "config.yml").write_text(CUBE_CONFIG, encoding="utf-8")
+    (root / "model" / "orders.yml").write_text(CUBE_MODEL, encoding="utf-8")
+    return root
+
+
+def test_a_base_install_refuses_cube_by_name_and_imports_no_dialect_engine(
+    wheel: str, tmp_path: Path
+):
+    root = _cube_repo(tmp_path)
+    done = _run_isolated(
+        wheel,
+        "import sys\n"
+        "from exmergo_dex_core import CubeDependencyError, DexEngine\n"
+        "from exmergo_dex_core.envelope import Reason, reason_for\n"
+        f"engine = DexEngine.from_repo({str(root)!r})\n"
+        "assert engine.config.semantic.cube.files\n"
+        "try:\n"
+        "    engine.semantic_catalog_source()\n"
+        "except CubeDependencyError as exc:\n"
+        "    assert 'exmergo-dex-core[cube]' in str(exc), exc\n"
+        "    assert reason_for(exc) is Reason.PREREQUISITE\n"
+        "    print('refused')\n"
+        "assert 'sqlglot' not in sys.modules\n",
+    )
+
+    assert done.returncode == 0, done.stderr
+    assert done.stdout.strip() == "refused"
+
+
+def test_config_validate_reads_a_cube_block_on_a_base_install(
+    wheel: str, tmp_path: Path
+):
+    root = _cube_repo(tmp_path)
+    done = _run_isolated(
+        wheel,
+        "import json, subprocess, sys\n"
+        "out = subprocess.run([sys.executable, '-m', 'exmergo_dex_core', "
+        f"'--repo-root', {str(root)!r}, 'config', 'validate'], "
+        "capture_output=True, text=True).stdout\n"
+        "print(json.loads(out)['status'])\n",
+    )
+
+    assert done.returncode == 0, done.stderr
+    assert done.stdout.strip() == "ok"
+
+
+def test_the_cube_extra_catalogs_a_layer_with_no_server(wheel: str, tmp_path: Path):
+    root = _cube_repo(tmp_path)
+    done = _run_isolated(
+        wheel,
+        "import json, subprocess, sys\n"
+        "out = subprocess.run([sys.executable, '-m', 'exmergo_dex_core', "
+        f"'--repo-root', {str(root)!r}, 'explore', 'semantic', 'list'], "
+        "capture_output=True, text=True).stdout\n"
+        "data = json.loads(out)['data']\n"
+        "print(data['vendor'], [m['name'] for m in data['metrics']])\n",
+        extras=["cube"],
+    )
+
+    assert done.returncode == 0, done.stderr
+    assert done.stdout.strip() == "cube ['orders.order_count']"
 
 
 def test_the_bundled_source_builds_at_the_pinned_release(tmp_path: Path):

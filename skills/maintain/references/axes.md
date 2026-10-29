@@ -12,7 +12,7 @@ fingerprints of the dbt project and of the semantic layer.
 - **The two project layers are fingerprinted independently.** The transform
   layer comes from the dbt project; the semantic layer comes from whichever vendor
   `semantic.vendor` names, which may be dbt's own or a native format such as
-  Apache Ossie or SLayer. A repository with a semantic layer and no dbt project still gets
+  Apache Ossie, SLayer or Cube. A repository with a semantic layer and no dbt project still gets
   a baseline and runs every free axis: `transform_layer` comes back null. The
   warning that no project was fingerprinted is reserved for the case where
   neither layer answered.
@@ -233,6 +233,22 @@ proposed as though nothing declared it.
 - Type changes: nothing Dex writes declares a type, and the type it holds is the
   connector's own spelling (Snowflake reports `NUMBER(38,0)` and `NUMBER(10,2)`
   both as `FIXED`), so the proposal names both spellings.
+
+## Cube layers (`semantic.vendor: cube`)
+
+Cube's own drift axes are not in this release. What runs today:
+
+| Axis | On Cube |
+|---|---|
+| `snapshot` | fingerprints each cube and view, each measure (as `cube.member`), each primary key (a composite one whole), and each join with its ordered pairs and arity; records `vendor: cube` and the validator release |
+| `semantic` | definition drift, free, as everywhere: a cube, view or measure added, removed or changed, and a dimension, measure, key or join column gone from the table (`dangling_reference`, `broken_relationship`) |
+| `grain` | measures every `primary_key` (a composite one whole): `declared_grain_not_unique` |
+| `schema`, `reconcile` | the layer-neutral checks only: Cube's declared types are not compared with the warehouse's, and no Cube removal is planned |
+
+A compiled-only file or element (JS, Jinja, `extends`) is not fingerprinted
+structurally, and the snapshot's notes say so: a change inside one is not
+detected. The wrapper installs the `[cube]` extra for every `maintain` command
+where the vendor is `cube`.
 
 ## SLayer layers (`semantic.vendor: slayer`)
 

@@ -567,7 +567,8 @@ callers, how a vendor and a deployment resolve, and how a backend declares the
 fields its format structurally cannot carry instead of returning them empty. The
 shipped native Ossie source binds every applicable contract in
 `packages/dex-core/tests/ossie/test_conformance.py`, which is the worked example
-to read.
+to read. `packages/dex-core/tests/cube_vendor/test_reader.py` binds them for the
+Cube source, including a Cube rendering of the reference layer.
 
 ## Linting and formatting (Ruff)
 

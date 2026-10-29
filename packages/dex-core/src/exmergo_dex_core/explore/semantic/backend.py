@@ -161,6 +161,7 @@ _EXECUTION_DEPLOYMENTS: dict[str, dict[str, str]] = {
     "dbt": {EXECUTION_DEX: "local", EXECUTION_VENDOR: "dbt_cloud"},
     "ossie": {EXECUTION_DEX: "local"},
     "slayer": {EXECUTION_DEX: "local"},
+    "cube": {EXECUTION_DEX: "local"},
 }
 
 
@@ -190,6 +191,12 @@ def _local_slayer(engine: Any) -> SemanticLayer:
     return LocalSlayerLayer.from_engine(engine)
 
 
+def _local_cube(engine: Any) -> SemanticLayer:
+    from .cube import LocalCubeLayer
+
+    return LocalCubeLayer.from_engine(engine)
+
+
 # Which backend answers for a resolved (vendor, deployment) pair. A table rather
 # than a chain of conditions, so a vendor is a row here and nowhere else, and so
 # a deployment that resolved is a deployment that gets used: the previous shape
@@ -204,6 +211,7 @@ _BACKENDS: dict[tuple[str, str], Callable[[Any], SemanticLayer]] = {
     ("dbt", "dbt_cloud"): _hosted_dbt_cloud,
     ("ossie", "local"): _local_ossie,
     ("slayer", "local"): _local_slayer,
+    ("cube", "local"): _local_cube,
 }
 
 # Deployments dex executes itself, so a hosted semantic source (a dbt Cloud
@@ -226,6 +234,12 @@ _SOURCE_REFUSALS: dict[tuple[str, str], str] = {
     ("slayer", "local"): (
         "a semantic source supplies a hosted dbt Cloud token and has no "
         "meaning for SLayer model files, which are files in this repository. "
+        "Drop the source, or select a hosted dbt semantic layer with "
+        "semantic.vendor: dbt and semantic.deployment: dbt_cloud"
+    ),
+    ("cube", "local"): (
+        "a semantic source supplies a hosted dbt Cloud token and has no "
+        "meaning for Cube model files, which are files in this repository. "
         "Drop the source, or select a hosted dbt semantic layer with "
         "semantic.vendor: dbt and semantic.deployment: dbt_cloud"
     ),

@@ -45,7 +45,8 @@
             "group": "Semantic layers",
             "pages": [
               "semantic-layers/overview",
-              "semantic-layers/ossie"
+              "semantic-layers/ossie",
+              "semantic-layers/cube"
             ]
           },
           {

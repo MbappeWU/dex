@@ -22,8 +22,10 @@ logic.
   `explore semantic` adds `[semantic-api]` plus, where a statement might be
   rendered locally (any mode but `list`, without `--api`), `[semantic]`, and
   `[slayer]` where `semantic.vendor` is `slayer`, in place of `[semantic]`, since
-  SLayer renders its own `query` and `values`. A repo that runs neither resolves
-  neither scikit-learn nor MetricFlow.
+  SLayer renders its own `query` and `values`. `[cube]` follows the same
+  `semantic.vendor` read for the same commands where the vendor is `cube`, and a
+  Cube `query` or `values` never takes `[semantic]` either. A repo that runs
+  neither resolves neither scikit-learn nor MetricFlow.
 - That environment is uv's own, and `--no-project` is what keeps it so. Without it
   uv discovers whatever Python project the caller is standing in, builds it, leaves
   a `.venv/` and a `uv.lock` in their repo, and puts their dependencies on the
@@ -1231,6 +1233,28 @@ format version, declared keys and join `cardinality` are measured on the grain
 axis, and the schema axis runs SLayer's own `validate-models` comparison on the
 metadata dex captured, whose removals `maintain reconcile` plans through the
 `semantic slayer update` route.
+
+**`vendor: cube` reads Cube model files from the repository**, the exact paths
+named in `semantic.cube.files`, statically and with no Node runtime, no Cube
+server and no warehouse connection. Each plain-YAML cube and view is validated by
+dex's own port of Cube's model rules (`CubeValidator.ts`, pinned to one Cube
+release), and every refusal names the file and the element. A `.js` file, a YAML
+file carrying Jinja, and a cube or view using `extends` are compiled-only: named
+in the catalog's `notes` and its `compiled_only` list (`file`, `reason`,
+`element`), never translated. `list` answers. Each cube is a semantic model on
+the relation its `sql_table` (or a plain single-table `sql`) names, and each view
+a semantic model with no relation whose members keep the cube member they expose.
+Each dimension is keyed `cube.member`. Each aggregating measure is a measure and
+a `simple` (or, with `rolling_window`, `cumulative`) metric, and each calculated
+measure is a `ratio` or `derived` metric over the measures it references. A
+metric is groupable by its cube's dimensions and those its declared joins reach,
+so `--for-dimension` answers. Entities are declared `unavailable`: `primary_key`
+and joins reach `explore` through the declaration channel instead, at confidence
+1.0. `query` refuses by name, since Cube renders a query only inside a Cube
+server, and `values` refuses the same way after its PII gate has run. `maintain`
+fingerprints the layer under `vendor: cube`, and the layer-neutral definition
+drift reads it. Selecting the vendor without the `[cube]` extra (the dialect
+engine) refuses and names it. See `references/semantic-layer.md`.
 
 `list` costs no warehouse query on either backend, and neither does the reverse
 lookup, which inverts the dimension list each metric already carries rather than
