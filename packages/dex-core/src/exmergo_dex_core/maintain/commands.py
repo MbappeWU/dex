@@ -1737,6 +1737,7 @@ def check(engine: DexEngine, objects: list[str] | None = None) -> DriftResult:
         return result
 
     probes = drift_mod.run_batched_probes(adapter, batched)
+    planned_notes = len(plan.notes)
     grain_findings = drift_mod.grain_drift(
         adapter,
         plan,
@@ -1744,6 +1745,8 @@ def check(engine: DexEngine, objects: list[str] | None = None) -> DriftResult:
         min_rows=config.maintain.grain_min_rows,
         probes=probes,
     )
+    # What the run itself could not judge, said after the plan's own notes.
+    warnings.extend(plan.notes[planned_notes:])
     semantic_findings = semantic_findings + _semantic_scope(
         drift_mod.cardinality_drift(adapter, checks, current_semantic, probes),
         scope_names,
@@ -1828,6 +1831,10 @@ def reconcile(engine: DexEngine, drift_class: str | None = None) -> ReconcileRes
     project, no_project = _read_project(engine)
     editable = project if isinstance(project, EditableProject) else None
     view = None
+    # A semantic vendor answers for the schema findings it produced itself,
+    # because only it knows how to take a column out of its own document and
+    # what else goes with it. Everything else takes the project's route.
+    semantic_source, _ = _semantic_schema_source(engine)
     if no_project is not None:
         # Its own sentence rather than the write-tier one below: a format that
         # could not be built declined nothing, and telling someone their format
@@ -1869,7 +1876,19 @@ def reconcile(engine: DexEngine, drift_class: str | None = None) -> ReconcileRes
         try:
             view = editable.load()
         except (ProjectError, ValueError) as exc:
-            raise ProjectError(f"reconcile edits a project: {exc}") from exc
+            # A repository whose only layer is a semantic one (#912) still has
+            # that layer's own findings to reconcile, through its own route;
+            # only the project's half has nowhere to land.
+            if not any(
+                semantic_source is not None and semantic_source.handles_finding(f)
+                for f in findings
+            ):
+                raise ProjectError(f"reconcile edits a project: {exc}") from exc
+            warnings.append(
+                f"no transformation project to edit ({exc}), so every proposal "
+                "for it below is advisory; the semantic layer's own findings are "
+                "planned through its own route"
+            )
 
     # Hoisted rather than inlined into the call: this load can now refuse, and a
     # refusal raised from inside an argument list reads as though `build` did it.
@@ -1884,10 +1903,6 @@ def reconcile(engine: DexEngine, drift_class: str | None = None) -> ReconcileRes
     # Ossie already covers via a declared composite is not suggested as if
     # nothing declared it.
     definitions = _composed_definitions(engine, project)
-    # A semantic vendor answers for the schema findings it produced itself,
-    # because only it knows how to take a column out of its own document and
-    # what else goes with it. Everything else takes the project's route.
-    semantic_source, _ = _semantic_schema_source(engine)
     semantic_findings = [
         f
         for f in findings

@@ -537,8 +537,9 @@ dex maintain semantic
 Two more findings at `low` record that the definitions themselves changed. All
 of it is free: this axis reads the documents and the cache and opens no
 warehouse connection. The command's paid half, dimension cardinality, needs a
-semantic model that names a transformation model, and Ossie names none, so
-`data.offer` is null and there is nothing to confirm.
+semantic model that records which of its dimensions are categorical, and an
+Ossie dataset records none, so `data.offer` is null and there is nothing to
+confirm.
 
 `maintain grain` is where the declaration is measured:
 

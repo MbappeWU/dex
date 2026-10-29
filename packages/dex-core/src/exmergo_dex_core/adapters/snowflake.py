@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import re
 import time
 from collections.abc import Callable
 from datetime import datetime
@@ -211,6 +212,32 @@ def _epoch(value: object) -> float | None:
     return None
 
 
+def _sql_name(name: str) -> str:
+    """A Snowflake object name as a statement takes it: bare when it is a plain
+    upper-case identifier, double-quoted otherwise."""
+
+    if re.fullmatch(r"[A-Z_][A-Z0-9_$]*", name):
+        return name
+    return '"' + name.replace('"', '""') + '"'
+
+
+def _grant(warehouse: str, role: str | None) -> str:
+    """The exact grant ``suspend_after_command`` needs, with this session's role
+    filled in where the connection reported it."""
+
+    who = _sql_name(role) if role else "<dex role>"
+    return f"GRANT OPERATE ON WAREHOUSE {_sql_name(warehouse)} TO ROLE {who}"
+
+
+def _adoption(warehouse: str, role: str | None) -> str:
+    """The two steps that stop the idle tail, as commands to copy."""
+
+    return (
+        "`dex config set snowflake.suspend_after_command true` and, run by a "
+        f"role that may grant it, `{_grant(warehouse, role)}`"
+    )
+
+
 class _WarehouseUptime:
     """What one command costs the pinned warehouse beyond its statements' own
     time, from the rules Snowflake bills by.
@@ -267,8 +294,11 @@ class _WarehouseUptime:
         suspend: Callable[[], str] | None = None,
         prior_claims: Callable[[], list[dict]] | None = None,
         record_claim: Callable[[dict], None] | None = None,
+        role: str | None = None,
     ):
         self._read_state = read_state
+        #: The session's role, for advice that names the grant to run.
+        self._role = role
         self._clock = clock
         # Monotonic and wall clocks tick together for the life of one command,
         # so one offset converts a statement's monotonic end into epoch seconds.
@@ -466,8 +496,7 @@ class _WarehouseUptime:
             f"this command's own work is about {work:.0f} warehouse-seconds, and "
             f"{name}'s {auto_suspend}-second AUTO_SUSPEND makes it bill about "
             f"{work + quoted:.0f}. A dedicated warehouse with AUTO_SUSPEND = 60, "
-            "or snowflake.suspend_after_command: true with OPERATE granted on "
-            f"{name}, would bring it to about "
+            f"or {_adoption(name, self._role)}, would bring it to about "
             f"{max(work, _RESUME_MINIMUM_SECONDS):.0f}. "
             "Dex never changes AUTO_SUSPEND itself"
         )
@@ -573,8 +602,7 @@ class _WarehouseUptime:
                 notes.append(
                     f"snowflake.suspend_after_command is on, but this role may not "
                     f"suspend {name}, so it was left to idle out its AUTO_SUSPEND "
-                    f"tail: grant it with GRANT OPERATE ON WAREHOUSE {name} TO "
-                    "ROLE <dex role>"
+                    f"tail: grant it with `{_grant(name, self._role)}`"
                 )
             elif outcome is not None and outcome != "suspended":
                 notes.append(
@@ -851,10 +879,11 @@ class SnowflakeAdapter:
             )
         if self.target.suspend_after_command:
             if self._suspend_report()["last_outcome"] == "refused_grant":
+                grant = _grant(name, self._session_role())
                 return (
                     "snowflake.suspend_after_command is on, but the last suspend "
-                    f"was refused: grant it with GRANT OPERATE ON WAREHOUSE {name} "
-                    "TO ROLE <dex role>. Until then every command that resumes "
+                    f"was refused: grant it with `{grant}`. "
+                    "Until then every command that resumes "
                     f"{name} bills its {auto_suspend}-second AUTO_SUSPEND tail"
                 )
             return None
@@ -865,9 +894,8 @@ class SnowflakeAdapter:
             f"suspends, so a command that resumes it bills about {auto_suspend} "
             "warehouse-seconds even when its own work takes one or two. A "
             "dedicated warehouse with AUTO_SUSPEND = 60, or "
-            "snowflake.suspend_after_command: true with OPERATE granted on "
-            f"{name}, brings that to about 60. Dex never changes AUTO_SUSPEND "
-            "itself"
+            f"{_adoption(name, self._session_role())}, brings that to about 60. "
+            "Dex never changes AUTO_SUSPEND itself"
         )
 
     # --- introspection (free SHOW metadata; no warehouse, no billing) ----------
@@ -1308,10 +1336,18 @@ class SnowflakeAdapter:
                 ),
                 prior_claims=getattr(gate, "warehouse_claims", None),
                 record_claim=getattr(gate, "record_claim", None),
+                role=self._session_role(),
             )
             self._uptime_gate = self.cost_gate
             self.cost_gate.settle_overhead = self._uptime.settle
         return self._uptime
+
+    def _session_role(self) -> str | None:
+        """The role this session runs as, from the login response: no statement.
+        ``None`` where the connection does not say (a test double)."""
+
+        role = getattr(self._conn, "role", None)
+        return role if isinstance(role, str) and role else None
 
     def _to_credits(self, seconds: float) -> float | None:
         info = self._warehouse_info or (

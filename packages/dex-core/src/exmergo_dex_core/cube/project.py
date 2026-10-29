@@ -7,13 +7,15 @@ model files are the repository's one semantic layer. The engine builds this
 source from `semantic.cube` through :data:`..config.SEMANTIC_SOURCE_FACTORIES`,
 so MetricFlow semantic models are not read while Cube is configured.
 
-It implements the two source capabilities in :mod:`..semantic_source`:
+It implements three source capabilities in :mod:`..semantic_source`:
 :class:`~..semantic_source.SemanticCatalogSource` for the read catalog and
 :class:`~..semantic_source.SemanticSnapshotSource` for the drift fingerprint,
-plus the declaration channel (`declared_definitions()`) that carries declared
-keys and joins to exploration. It is also a
-:class:`~..edits.SemanticEditTarget`, which `semantic cube define|update|plan`
-authors through (:mod:`.authoring`), and a
+and :class:`~..semantic_source.SemanticSchemaSource`, which holds the cubes and
+views to dex's warehouse metadata and turns what drifted into removals
+(:mod:`.schema`, :mod:`.removal`), plus the declaration channel
+(`declared_definitions()`) that carries declared keys and joins to
+exploration. It is also a :class:`~..edits.SemanticEditTarget`, which
+`semantic cube define|update|plan` authors through (:mod:`.authoring`), and a
 :class:`~..semantic_source.SemanticDerivationSource`, which turns a declared dbt
 mart into a cube (:mod:`.derivation`). What maps and what does not is in
 :mod:`.catalog`; which rules a file is held to is in :mod:`.validator` and
@@ -39,11 +41,15 @@ from ..errors import ConfigurationError, ProjectError, RepoRootRequiredError
 from .dependency import CubeDependencyError, ensure_available
 
 if TYPE_CHECKING:
+    from ..cache import Dataset
     from ..edits import ApplyResult, SemanticDocumentView, SemanticEditValidation
+    from ..maintain.drift import DriftFinding
+    from ..maintain.reconcile import Proposal
     from ..maintain.snapshot import SemanticLayerSnapshot
     from ..project_definitions import ProjectDefinitions
     from ..semantic_catalog import SemanticCatalogView
     from ..semantic_source import SemanticSourceContext
+    from ..transform.plans import PlanEdit
     from .catalog import Resolution
     from .loader import LoadResult
 
@@ -209,7 +215,55 @@ class CubeSemanticLayer:
             return SemanticLayerSnapshot(
                 notes=[f"Cube models could not be read: {exc}"]
             )
-        return snapshot_mod.semantic_layer(loaded, resolved)
+        return snapshot_mod.semantic_layer(loaded, resolved, self.repo_root)
+
+    # --- the schema channel (#912) ------------------------------------------------
+
+    def declared_schema_drift(
+        self, current: list[Dataset], baseline: list[Dataset]
+    ) -> tuple[list[DriftFinding], list[str]]:
+        """The cubes and views held to dex's warehouse metadata; see :mod:`.schema`.
+
+        Degrades the way :meth:`semantic_layer` does: a set that cannot be read
+        compares nothing and says why.
+        """
+
+        try:
+            loaded, resolved = self._load(), self._resolution()
+            from .schema import declared_schema_drift
+        except CubeDependencyError as exc:
+            return [], [str(exc)]
+        except (ImportError, OSError, ValueError) as exc:
+            return [], [f"Cube models were not compared to the warehouse: {exc}"]
+        return declared_schema_drift(
+            loaded, resolved, current, baseline, connector=self.connector
+        )
+
+    def handles_finding(self, finding: DriftFinding) -> bool:
+        from .removal import CODES
+
+        return finding.code in CODES and finding.data.get("model_file") is not None
+
+    def schema_reconcile(
+        self, findings: list[DriftFinding]
+    ) -> tuple[list[Proposal], list[PlanEdit], list[str]]:
+        """Each removal the schema axis recorded, as an edit of its model file."""
+
+        from .authoring import STRICT_RULES
+        from .removal import proposals_and_edits
+
+        own = [finding for finding in findings if self.handles_finding(finding)]
+        if not own:
+            return [], [], []
+        contents = {
+            name: source.content
+            for name, source in self.semantic_edit_view().files.items()
+        }
+        strict: dict[str, list[str]] = {}
+        for diagnostic in self._load().diagnostics:
+            if diagnostic.rule in STRICT_RULES:
+                strict.setdefault(diagnostic.file, []).append(diagnostic.element)
+        return proposals_and_edits(own, contents, strict)
 
     # --- native semantic-document authoring (#911) ------------------------------
 

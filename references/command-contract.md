@@ -392,21 +392,27 @@ dex maintain schema [<objects>]   -> structural drift: columns/tables added, dro
                                      nullability; dangling sources; a model added, removed, or
                                      content-changed since the baseline (metadata, free everywhere);
                                      under semantic.vendor: slayer, the models held to the warehouse
-                                     by SLayer's own validate-models rules on dex's metadata
+                                     by SLayer's own validate-models rules on dex's metadata; under
+                                     semantic.vendor: cube, the cubes and views held to it by dex's
+                                     own rules (declared_column_missing|type_conflict|
+                                     relation_missing|dependency_dropped)
 dex maintain volume [<objects>]   -> freshness drift: row counts that collapsed, emptied, or spiked (free)
 dex maintain grain [<objects>]    -> cardinality/identity drift: lost key uniqueness, changed grain, join
                                      fanout, the grains the project declares re-verified, and declared
-                                     join arity measured (join_cardinality_exceeded)
+                                     join arity (SLayer cardinality, Cube relationship) measured
+                                     (join_cardinality_exceeded)
                                      (aggregates; gated by --confirm --budget on billed connectors)
 dex maintain semantic [<objects>] -> definition drift and dangling refs (free) + declaration drift
                                      (declaration_added|removed|changed naming the model, column and
                                      field, population/grain/additivity/unit ranked above a description;
                                      free; data.declaration_drift says whether it was checked) +
-                                     categorical dimension cardinality change (a scan; gated on billed
-                                     connectors)
+                                     categorical dimension cardinality change on any model naming its
+                                     table (a scan; gated on billed connectors); a compiled-only Cube
+                                     definition is compared by content alone (compiled_only_changed)
 dex maintain reconcile [<class>]  -> propose the edits that reconcile detected drift, as a stored plan
                                      of diffs tagged mechanical/advisory (applied with transform apply);
-                                     a SLayer layer's own removals as a second plan, semantic_plan_id;
+                                     a SLayer or Cube layer's own removals as a second plan,
+                                     semantic_plan_id;
                                      cardinality advisories distinguish expansion from contraction
                                      using available counts, and flag approximate counts as uncertain
 dex maintain verify [<selector>]  -> is the project correct right now, no .dex/snapshot.json baseline
@@ -1297,8 +1303,13 @@ so `--for-dimension` answers. Entities are declared `unavailable`: `primary_key`
 and joins reach `explore` through the declaration channel instead, at confidence
 1.0. `query` refuses by name, since Cube renders a query only inside a Cube
 server, and `values` refuses the same way after its PII gate has run. `maintain`
-fingerprints the layer under `vendor: cube`, and the layer-neutral definition
-drift reads it. `semantic cube define|update|plan` authors the files, and a
+runs every axis on the layer without starting a Cube server: the baseline records
+`vendor: cube` and each compiled-only definition by its content (a change is
+`compiled_only_changed`, never compared structurally, and a warning says so on
+every run), `primary_key`s and each join's `relationship` are measured on the
+grain axis, categorical dimensions are re-counted on the semantic axis, and the
+schema axis holds each member's columns and type to dex's own metadata, whose
+removals `maintain reconcile` plans through the `semantic cube update` route. `semantic cube define|update|plan` authors the files, and a
 declared dbt mart derives a cube of its own (see `transform plan` above). Selecting the vendor without the `[cube]` extra (the dialect
 engine) refuses and names it. See `references/semantic-layer.md`.
 

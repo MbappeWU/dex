@@ -879,10 +879,23 @@ def test_capabilities_recommend_a_short_auto_suspend_without_changing_it(tail_60
     (warning,) = caps["warnings"]
     assert "idles 600 seconds" in warning
     assert "AUTO_SUSPEND = 60" in warning
-    assert "snowflake.suspend_after_command: true" in warning
+    assert "`dex config set snowflake.suspend_after_command true`" in warning
+    assert "`GRANT OPERATE ON WAREHOUSE DEX_WH TO ROLE <dex role>`" in warning
     assert "never changes AUTO_SUSPEND" in warning
     assert not any("OPERATE" in g for g in caps["required_grants"])
     assert _suspends(tail_600) == []
+
+
+@pytest.mark.parametrize(
+    ("role", "spelled"),
+    [("DEX_READER", "DEX_READER"), ("analytics team", '"analytics team"')],
+)
+def test_the_tail_advice_names_the_session_role_in_the_grant(tail_600, role, spelled):
+    """The login response carries the role, so the grant to copy is complete."""
+
+    tail_600.role = role
+    (warning,) = make_adapter(tail_600).capabilities()["warnings"]
+    assert f"`GRANT OPERATE ON WAREHOUSE DEX_WH TO ROLE {spelled}`" in warning
 
 
 def test_capabilities_report_the_last_suspend_and_name_a_missing_grant(tail_600):

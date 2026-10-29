@@ -269,16 +269,59 @@ under the cost guard, comes next.
 
 ## What `maintain` makes of the layer
 
-`maintain snapshot` fingerprints each cube and view, each measure (as
-`cube.member`), and each join with its pairs and arity, under `vendor: cube` and
-the validator release. Content hashes cover each element as written, keys
-normalized, `meta` excluded, so respelling `sqlTable` as `sql_table` is not a
-change. The layer-neutral axes read it today: `maintain semantic` reports a
-definition added, removed or changed, and a dimension, measure, key or join
-column gone from its table (`dangling_reference`, `broken_relationship`);
-`maintain grain` measures every `primary_key`, a composite one whole
-(`declared_grain_not_unique`). Cube's declared types are not yet compared with
-the warehouse's, and `maintain reconcile` plans no Cube edit (author the fix with
-`semantic cube`). A compiled-only definition is
-not fingerprinted structurally, and the fingerprint's notes say so.
+Every axis runs on a Cube layer, beside a dbt project or with none. No
+`maintain` command starts a Cube server or Node: each reads the configured
+model files and the metadata Dex captured through its own connection.
+
+- **Snapshot.** `maintain snapshot` fingerprints each cube and view, each measure
+  (as `cube.member`), each `primary_key` (a composite one whole) and each join
+  with its pairs and arity, under `vendor: cube` and the validator release.
+  Content hashes cover each element as written, keys normalized, `meta`
+  excluded, so respelling `sqlTable` as `sql_table` is not a change.
+- **Compiled-only definitions** (a `.js` model, a Jinja-templated file, an
+  `extends`) are recorded by their content under `opaque_definitions`: a whole
+  file by its bytes, an `extends` element by its own body, so editing a sibling
+  cube in the same file does not mark it changed. A change is
+  `compiled_only_changed`, what changed is not read, and a warning that these
+  were compared by content alone, never structurally, rides every
+  `maintain semantic` and `maintain check` while the layer holds one. A layer
+  with one never reads clean.
+- **Semantic.** A cube, view or measure added, removed or changed, with
+  `definition_changed` on a cube naming the table it sits on; a dimension,
+  measure, key or join column gone from its table (`dangling_reference`,
+  `broken_relationship`). The scanned half re-counts every non-time dimension
+  that is one column (`dimension_cardinality_changed`).
+- **Grain.** Every `primary_key`, a composite one whole
+  (`declared_grain_not_unique`, `key_lost_uniqueness`), and every join's
+  `relationship`: a `many_to_one` join whose target's key is not unique, or a
+  `one_to_one` join with either side not unique, is `join_cardinality_exceeded`.
+  A `one_to_many` join is checked on its one side. Cube requires a
+  `relationship`, so every join that loads has one; a join whose `sql` is not an
+  equality of columns has no pairs to measure, and is named in `warnings`.
+- **Schema.** Cube compares a model with the warehouse only by compiling it
+  inside a Cube server, so Dex holds the declarations to its own metadata:
+
+  | Code | When |
+  |---|---|
+  | `declared_relation_missing` | a cube's table was in the baseline and is gone. One neither the connection nor the baseline lists (a derived cube still pointing at a dev schema, say) is a note, not a finding |
+  | `declared_column_missing` | a dimension, measure (its `sql` or a `filters[].sql`) or segment reads a column the table no longer has. Columns match case-insensitively where exactly one does |
+  | `declared_type_conflict` | a `time` dimension on a column that is not temporal; a `number` dimension, or a `sum`, `avg` or `running_total` measure, on text. A warehouse type Dex cannot place never conflicts |
+  | `declared_dependency_dropped` | a member, join or view include or exclude that reads something that goes, followed to a fixpoint, through `{member}` references and join paths |
+
+  An expression Dex cannot read (a per-query value such as `FILTER_PARAMS`, a
+  reference into another cube's table, a `case`, unparseable SQL) is named in
+  `warnings` as unchecked, never passed.
+- **Reconcile.** `maintain reconcile` cuts the removals out of the model files,
+  every other byte (other cubes, views and comments) as it was, and stores them
+  as a plan of their own through the `semantic cube update` route and its
+  validation, under `data.semantic_plan_id`. A flow-style list of plain names
+  (`includes: [revenue, status]`) is rewritten in place with the survivors in
+  their own spelling; anything else that cannot be cut by its lines is advisory.
+  A measure whose filter reads a dropped column goes with it rather than
+  silently losing the filter. Always advisory: a cube whose table is gone (a
+  vanished table is as often a rename as a retirement); a view source whose join
+  path walks a removed join, and the join it walks; a `sql` cube whose own query
+  selects the dropped column; and every removal in a file that already holds a
+  key Cube does not declare, since `semantic cube update` refuses any edit to
+  that file.
 

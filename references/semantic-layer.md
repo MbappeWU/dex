@@ -726,8 +726,8 @@ relation that is gone; a dimension or declared key naming a column that is gone;
 and a relationship whose endpoint or column pairs no longer resolve, which is
 `high` because a join nothing can resolve is a broken layer rather than a stale
 one. All of it is free. The command's billed half, dimension cardinality, needs a
-semantic model naming a transformation model, and an Ossie dataset names none, so
-that axis never offers a scan here.
+semantic model that records which of its dimensions are categorical, and an
+Ossie dataset records none, so that axis never offers a scan here.
 
 `maintain grain` is the one place Ossie's declarations meet the warehouse for
 money. A declared composite is measured as one composite through the identical
@@ -1289,6 +1289,13 @@ In short:
   It is stored as a plan of its own beside the dbt plan where its path is already
   in `semantic.cube.files`, and proposed with the `dex config set` that adds it
   otherwise.
+
+- **Every `maintain` axis runs on the layer**, beside a dbt project or with
+  none, without a Cube server: compiled-only definitions recorded by their
+  content and never reported clean, `primary_key`s and each join's
+  `relationship` measured on the grain axis, categorical dimensions re-counted,
+  members' columns and types held to Dex's metadata on the schema axis, and the
+  removals planned through `semantic cube update` under `data.semantic_plan_id`.
 
 What Dex accepts, checks, maps and declines to claim, rule by rule, is in
 [Cube compatibility](cube-compatibility.md).

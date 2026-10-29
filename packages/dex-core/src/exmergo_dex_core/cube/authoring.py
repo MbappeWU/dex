@@ -69,7 +69,7 @@ _DEPLOYMENT_FILES = {
 }
 
 #: Reader warnings that refuse an element in a file this plan writes.
-_STRICT_RULES = frozenset({"unknown_key"})
+STRICT_RULES = frozenset({"unknown_key"})
 
 #: Measure types a fan-out multiplies: each joined row adds the value again.
 _FANNED_OUT = frozenset({"count", "sum"})
@@ -267,7 +267,7 @@ def refusals_for(
             # it is the reason nothing is written.
             replace(d, message=d.message.replace("dex ignores it, and ", ""))
             for d in validated.diagnostics
-            if d.file in edited and d.rule in _STRICT_RULES
+            if d.file in edited and d.rule in STRICT_RULES
         ),
     ]
     return validated, refusals

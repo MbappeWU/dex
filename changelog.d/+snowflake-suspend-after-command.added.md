@@ -13,3 +13,7 @@ command completes, names the grant to add, and settles the tail as before.
 `AUTO_SUSPEND` is longer than 60 seconds with no suspend in place, recommends a
 60-second `AUTO_SUSPEND` or the setting; Dex never changes `AUTO_SUSPEND`
 itself.
+
+Every warning about the idle tail now prints the two commands that stop it:
+`dex config set snowflake.suspend_after_command true`, and the `GRANT OPERATE`
+with the warehouse and the session's own role filled in.

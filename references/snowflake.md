@@ -301,7 +301,11 @@ GRANT OPERATE ON WAREHOUSE DEX_WH TO ROLE DEX_ROLE;
 ```
 
 Without the grant the suspend is refused, the command completes and warns with
-the grant to add, and it settles the tail as before. dex cannot test the grant
+the grant to add, and it settles the tail as before. Every warning about the
+tail, from `connect test`, an estimate's note or a refused suspend, prints the
+grant with the warehouse and the session's own role filled in (the role comes
+from the login response, so reading it runs no statement), and the `dex config
+set` that turns the setting on, so adopting it is two copied commands. dex cannot test the grant
 without suspending something, so the quote counts on a suspend only once one has
 worked: the first command after the setting is turned on is quoted the tail and
 settled at what the suspend did, and later ones are quoted the resume minimum,

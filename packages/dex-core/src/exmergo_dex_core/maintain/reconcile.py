@@ -423,6 +423,11 @@ def _advisory(finding: DriftFinding) -> Proposal:
             "than the baseline, so its definitions could not be compared; "
             "re-run `maintain snapshot` to baseline the upgraded format"
         ),
+        "compiled_only_changed": (
+            "a definition only the vendor's compiler can read changed since the "
+            "baseline, and dex cannot say how: review the change by hand, then "
+            "re-run `maintain snapshot --project-only` to accept it"
+        ),
     }
     return Proposal(
         axis=finding.axis,

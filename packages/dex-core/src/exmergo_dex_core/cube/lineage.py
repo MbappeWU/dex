@@ -29,10 +29,12 @@ from sqlglot import exp
 
 from ..adapters import normalize_relation
 from .model import Cube, Join, Member
-from .references import resolve, scan
+from .references import Resolved, resolve, scan
 
 __all__ = [
     "CubeRelation",
+    "Reads",
+    "columns_read",
     "cube_relation",
     "join_pairs",
     "member_column",
@@ -247,6 +249,67 @@ def member_column(
     if found is None:
         return None
     return relation.source_column(found.group(1))
+
+
+@dataclass(frozen=True)
+class Reads:
+    """What one expression reads: its cube's physical columns, and the members
+    it references, in its own cube or reached through a join."""
+
+    columns: frozenset[str] = frozenset()
+    members: tuple[Resolved, ...] = ()
+
+
+def columns_read(
+    sql: str | None,
+    cube: Cube,
+    cubes: Mapping[str, Cube],
+    relation: CubeRelation,
+    connector: str | None,
+) -> Reads | None:
+    """Every physical column of ``cube``'s relation ``sql`` reads, or None.
+
+    The schema axis asks this of every expression a cube holds (a computed
+    dimension, a measure's filter, a segment), because a column dropped from
+    the table breaks any of them, not only a member that is one column. None
+    where dex cannot tell: a per-query value, a reference into another cube's
+    table, a quoted or qualified name, or SQL that does not parse. Nothing
+    there is guessed, so the caller names it as unchecked.
+    """
+
+    if sql is None:
+        return Reads()
+    holes, problem = scan(sql)
+    if problem:
+        return None
+    members: list[Resolved] = []
+    text = sql
+    for hole in reversed(holes):
+        resolved, _ = resolve(hole, cube, cubes)
+        if resolved is None or resolved.kind == "context":
+            return None
+        if resolved.kind == "table":
+            if resolved.via or resolved.cube != cube.name:
+                return None
+            replacement = _SELF
+        else:
+            members.append(resolved)
+            # A member is a value here; what it reads is its own question.
+            replacement = "NULL"
+        text = text[: hole.start] + replacement + text[hole.end :]
+    try:
+        parsed = sqlglot.parse_one(_unescaped(text), read=_dialect(connector))
+    except (sqlglot.errors.ParseError, sqlglot.errors.TokenError, ValueError):
+        return None
+    columns: set[str] = set()
+    for column in parsed.find_all(exp.Column):
+        if column.this.quoted or column.table not in ("", _SELF) or column.db:
+            return None
+        physical = relation.source_column(column.name)
+        if physical is None:
+            return None
+        columns.add(physical)
+    return Reads(columns=frozenset(columns), members=tuple(reversed(members)))
 
 
 def _output_for(relation: CubeRelation, column: str) -> str:

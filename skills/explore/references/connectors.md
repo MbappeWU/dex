@@ -64,6 +64,9 @@ charged only the gap since it, not a second tail. When `connect test` warns that
 `AUTO_SUSPEND` is long, relay its recommendation to the user (a dedicated
 warehouse with `AUTO_SUSPEND = 60`, or `snowflake.suspend_after_command: true`
 with `OPERATE` granted); do not change the warehouse or the setting yourself.
+The warning and the estimate's note both carry the exact commands to copy:
+`dex config set snowflake.suspend_after_command true`, and the `GRANT OPERATE ON
+WAREHOUSE ... TO ROLE ...` with the session's own role filled in.
 
 ### The calibration line
 

@@ -64,6 +64,7 @@ from ..semantic_declarations import (
     table_name,
     with_population,
 )
+from .yaml_items import locate
 
 if TYPE_CHECKING:
     from ..semantic_source import (
@@ -789,7 +790,7 @@ def annotate(
                 "and has no table of its own; declare the cubes it reads instead"
             )
             continue
-        located = _locate(texts[path], declaration.model)
+        located = locate(texts[path], declaration.model)
         if located is None:
             definition.status = "failed"
             definition.reason = (
@@ -830,44 +831,6 @@ def annotate(
         proposal=None,
         warnings=[],
     )
-
-
-def _locate(text: str, name: str) -> tuple[int, int, int, dict[str, Any]] | None:
-    """Where the cube ``name``'s list item starts and ends, its dash column, and
-    its parsed body; ``None`` where it is not a block-style item."""
-
-    from ..yaml_spans import before_trailing_blanks, block_end
-
-    try:
-        root = yaml.compose(text)
-    except yaml.YAMLError:
-        return None
-    if not isinstance(root, yaml.MappingNode):
-        return None
-    for key, value in root.value:
-        if key.value != "cubes" or not isinstance(value, yaml.SequenceNode):
-            continue
-        if value.flow_style:
-            return None
-        for item in value.value:
-            if not isinstance(item, yaml.MappingNode) or item.flow_style:
-                continue
-            names = [v.value for k, v in item.value if k.value == "name"]
-            if names != [name]:
-                continue
-            line_start = text.rfind("\n", 0, item.start_mark.index) + 1
-            dash = text.find("-", line_start, item.start_mark.index)
-            if dash < 0 or text[line_start:dash].strip():
-                return None
-            indent = dash - line_start
-            end = before_trailing_blanks(text, block_end(text, line_start, indent))
-            # The item's own lines parse as a one-item list, which keeps its
-            # indentation consistent where a slice from the first key would not.
-            parsed = yaml.safe_load(text[line_start:end])
-            if not isinstance(parsed, list) or not isinstance(parsed[0], dict):
-                return None
-            return line_start, end, indent, parsed[0]
-    return None
 
 
 def _item(entry: Mapping[str, Any], indent: int) -> str:
