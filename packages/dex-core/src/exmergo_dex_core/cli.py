@@ -1398,6 +1398,15 @@ def _build_parser() -> argparse.ArgumentParser:
                             else "object to check (default: the whole project)"
                         ),
                     )
+                if group == "maintain" and name == "verify":
+                    sp.add_argument(
+                        "--target",
+                        default=None,
+                        help=(
+                            "dbt dev target to verify against; "
+                            "prod-looking targets are refused"
+                        ),
+                    )
                 if group == "maintain" and name == "reconcile":
                     sp.add_argument(
                         "drift_class",
