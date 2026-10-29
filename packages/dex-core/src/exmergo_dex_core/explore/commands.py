@@ -3776,6 +3776,40 @@ _DECLARING_LAYER = {
 }
 
 
+
+def _drop_metricflow_under_native_vendor(
+    engine: DexEngine, defs: dbt_project.ProjectDefinitions
+) -> dbt_project.ProjectDefinitions:
+    """Drop MetricFlow grain and metric lineage when a native vendor owns the layer.
+
+    Under ``semantic.vendor: ossie|slayer|cube`` the vendor layer is the
+    repository's one semantic layer (#922). ``explore`` still reads the dbt
+    project for transformation declarations (``config.meta.dex``, unique and
+    relationships tests), but MetricFlow-derived ``primary_entities`` and
+    ``metric_models`` must not fold into exploration beside that vendor. Under
+    ``vendor: dbt`` (or an unset vendor) the definitions are unchanged.
+    """
+
+    from ..config import SEMANTIC_SOURCE_FACTORIES
+
+    vendor = (getattr(engine.config.semantic, "vendor", None) or "dbt").lower()
+    if vendor not in SEMANTIC_SOURCE_FACTORIES:
+        return defs
+    if (
+        not defs.primary_entities
+        and not defs.metric_models
+        and not defs.semantic_source
+    ):
+        return defs
+    return defs.model_copy(
+        update={
+            "primary_entities": {},
+            "metric_models": [],
+            "semantic_source": None,
+        }
+    )
+
+
 def _project_definitions(
     engine: DexEngine, use_project: bool
 ) -> dbt_project.ProjectDefinitions:
@@ -3818,6 +3852,7 @@ def _project_definitions(
     # explore path, and `definitions()` is the channel declared keys and joins
     # reach dex through at all. Whichever format configuration named answers here.
     defs = engine.project_format().definitions()
+    defs = _drop_metricflow_under_native_vendor(engine, defs)
     return _fold_semantic_layer_keys(engine, defs)
 
 
