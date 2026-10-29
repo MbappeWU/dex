@@ -1,0 +1,1 @@
+**`explore profile --use-project` answers from the project, not from whichever command last filled the cache.** Declaration notes and `semantic_models` are computed when the profile is read, for a cached profile and a rescan alike. The cache keeps the measurement, so removing a declaration or a semantic model clears the annotation on the next run without `--refresh`.
