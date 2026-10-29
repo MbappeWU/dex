@@ -1036,7 +1036,6 @@ def test_plan_does_not_name_union_cte_as_unprofiled_relation(shop, capsys):
     assert "fct_daily" in envelope["data"]["declarations"]
 
 
-
 def test_a_literal_alias_is_recognized_as_a_project_model():
     """A warehouse relation named by config(alias=…) maps back to the model."""
     from exmergo_dex_core.cache import (

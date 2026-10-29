@@ -1003,7 +1003,6 @@ def _literal(node: Any) -> str | Decimal | None:
 # --- cache reads --------------------------------------------------------------------
 
 
-
 _SQL_CONFIG_ALIAS = re.compile(
     r"""\{\{[\s\S]*?\bconfig\s*\([\s\S]*?\balias\s*=\s*(['\"])([^'\"]+)\1""",
     re.IGNORECASE,
