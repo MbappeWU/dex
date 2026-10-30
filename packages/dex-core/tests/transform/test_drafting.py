@@ -197,7 +197,24 @@ def test_a_key_is_followed_through_a_chain_of_ctes_named_like_their_sources():
     )
 
     assert entry["drafted"]["grain"]["value"] == ["order_id"]
+
+    assert entry["drafted"]["grain"]["evidence"].count("carried through unchanged") == 1
     assert entry["drafted"]["columns"]["order_amount"]["from"] == "stg_orders.amount"
+
+
+def test_drafted_grain_evidence_says_carried_through_unchanged_once():
+    """CTE hops must not re-append the carry phrase (#987)."""
+    entry, _ = _draft(
+        "with source as (select * from {{ ref('stg_orders') }}),\n"
+        "renamed as (select order_id, customer_id, status from source)\n"
+        "select * from renamed\n"
+    )
+    evidence = entry["drafted"]["grain"]["evidence"]
+    assert entry["drafted"]["grain"]["value"] == ["order_id"]
+    assert evidence == (
+        "order_id is a proven unique key of stg_orders, carried through unchanged"
+    )
+    assert evidence.count("carried through unchanged") == 1
 
 
 def test_an_unaliased_relation_never_leaks_the_parse_placeholder():
