@@ -5054,6 +5054,170 @@ def test_the_dev_target_is_read_only_by_the_command_that_asked(
     assert all(o.identifier.startswith("SHOP.PUBLIC.") for o in explored.list_objects())
 
 
+def _dev_built_engine(monkeypatch, fake_sf_connection):
+    """A Snowflake engine whose allowlist reads SHOP.PUBLIC while dbt builds
+    into SHOP.DBT_DEV, holding the one model only a dev build wrote (#893)."""
+
+    from fakes.snowflake import FakeSnowflakeTable
+
+    import exmergo_dex_core.connect as connect_mod
+    from exmergo_dex_core.config import DexConfig, SnowflakeTarget
+    from exmergo_dex_core.engine import DexEngine
+    from exmergo_dex_core.storage import MemoryStore
+
+    fake_sf_connection.tables.append(
+        FakeSnowflakeTable(
+            database="SHOP",
+            schema="DBT_DEV",
+            name="STG_ORDERS",
+            columns=[("ID", "FIXED", False)],
+            rows=10,
+        )
+    )
+    adapter = _sf_adapter(fake_sf_connection, databases=["SHOP.PUBLIC"])
+    monkeypatch.setattr(connect_mod, "open_adapter", lambda **_kwargs: adapter)
+    return DexEngine(
+        config=DexConfig(
+            connector="snowflake",
+            snowflake=SnowflakeTarget(
+                warehouse="DEX_WH",
+                databases=["SHOP.PUBLIC"],
+                dev_database="SHOP",
+                dev_schema="DBT_DEV",
+            ),
+        ),
+        store=MemoryStore(),
+    )
+
+
+def test_profile_reaches_a_dev_only_build_for_one_command(
+    monkeypatch, fake_sf_connection
+):
+    # Family 2 (#893): a model whose only build is the dev one is outside the
+    # allowlist, so a plain profile cannot name it. `--target dev` reads the dev
+    # namespace for that command, and the cost guard still prices the scan
+    # before anything runs; the next command reads the committed scope again.
+    from exmergo_dex_core.errors import RequestError
+    from exmergo_dex_core.explore.commands import profile
+    from exmergo_dex_core.guards.cost_guard import ConfirmationRequiredError
+
+    engine = _dev_built_engine(monkeypatch, fake_sf_connection)
+    with pytest.raises(RequestError, match="no object named"):
+        profile(engine, ["DBT_DEV.STG_ORDERS"])
+    with pytest.raises(ConfirmationRequiredError):
+        profile(engine, ["DBT_DEV.STG_ORDERS"], target="dev")
+    assert fake_sf_connection.data_statements == []
+    assert engine.config.snowflake.databases == ["SHOP.PUBLIC"]
+    with pytest.raises(RequestError, match="no object named"):
+        profile(engine, ["DBT_DEV.STG_ORDERS"])
+
+
+def test_a_dev_profile_never_clears_an_ordinary_query(monkeypatch, fake_sf_connection):
+    # Family 2 (#893): `explore profile --target dev` caches what it profiled so
+    # drafting can read it, but `explore query` reads the committed allowlist,
+    # and a cached dev profile must not clear a relation that allowlist does not
+    # reach. Nothing runs against the dev namespace.
+    from exmergo_dex_core.cache import ColumnProfile, Dataset, DexCache
+    from exmergo_dex_core.errors import DexError
+    from exmergo_dex_core.explore.commands import query
+
+    engine = _dev_built_engine(monkeypatch, fake_sf_connection)
+    engine.store.save_cache(
+        DexCache(
+            datasets=[
+                Dataset(
+                    identifier="SHOP.DBT_DEV.STG_ORDERS",
+                    columns=[ColumnProfile(name="ID", data_type="NUMBER")],
+                )
+            ]
+        )
+    )
+    with pytest.raises(DexError):
+        query(engine, "SELECT ID FROM SHOP.DBT_DEV.STG_ORDERS")
+    assert fake_sf_connection.data_statements == []
+    cached = engine.store.load_cache()
+    assert cached is not None
+    assert [d.identifier for d in cached.datasets] == ["SHOP.DBT_DEV.STG_ORDERS"]
+
+
+@pytest.mark.parametrize(
+    ("connector", "target", "scopes", "held_back"),
+    [
+        # A `--scope` that narrows past the dev namespace holds its profiles
+        # back, though the committed allowlist reaches it.
+        (
+            "snowflake",
+            {"databases": ["SHOP"], "dev_database": "SHOP", "dev_schema": "DBT_DEV"},
+            ["SHOP.PUBLIC"],
+            ["SHOP.DBT_DEV.STG_ORDERS"],
+        ),
+        (
+            "snowflake",
+            {"databases": ["SHOP"], "dev_database": "SHOP", "dev_schema": "DBT_DEV"},
+            None,
+            [],
+        ),
+        # A bare BigQuery dev dataset is the configured project's; the same
+        # dataset name in another allowlisted project is a source.
+        (
+            "bigquery",
+            {
+                "project": "shop",
+                "datasets": ["other.dbt_dev"],
+                "dev_dataset": "dbt_dev",
+            },
+            None,
+            ["shop.dbt_dev.stg_orders"],
+        ),
+    ],
+)
+def test_dev_profiles_are_held_back_from_the_scope_a_query_reads(
+    connector, target, scopes, held_back
+):
+    # Family 2 (#893): the cache a query adjudicates on reads what this
+    # command's scope reads, and `--scope` only ever narrows it.
+    from exmergo_dex_core.cache import ColumnProfile, Dataset, DexCache
+    from exmergo_dex_core.config import DexConfig
+    from exmergo_dex_core.engine import DexEngine
+    from exmergo_dex_core.explore.commands import _without_dev_profiles
+    from exmergo_dex_core.storage import MemoryStore
+
+    dev = (
+        "SHOP.DBT_DEV.STG_ORDERS"
+        if connector == "snowflake"
+        else ("shop.dbt_dev.stg_orders")
+    )
+    source = (
+        "SHOP.PUBLIC.ORDERS" if connector == "snowflake" else ("other.dbt_dev.orders")
+    )
+    cache = DexCache(
+        datasets=[
+            Dataset(
+                identifier=name, columns=[ColumnProfile(name="id", data_type="INT")]
+            )
+            for name in (dev, source)
+        ]
+    )
+    engine = DexEngine(
+        config=DexConfig.model_validate({"connector": connector, connector: target}),
+        store=MemoryStore(),
+        scopes=scopes,
+    )
+    kept = [d.identifier for d in _without_dev_profiles(engine, cache).datasets]
+    assert sorted({dev, source} - set(kept)) == held_back
+    assert source in kept
+
+
+def test_profile_refuses_a_prod_target(monkeypatch, fake_sf_connection):
+    from exmergo_dex_core.explore.commands import profile
+    from exmergo_dex_core.transform.build import ProdTargetRefusedError
+
+    engine = _dev_built_engine(monkeypatch, fake_sf_connection)
+    with pytest.raises(ProdTargetRefusedError):
+        profile(engine, ["DBT_DEV.STG_ORDERS"], target="prod")
+    assert fake_sf_connection.data_statements == []
+
+
 def test_snowflake_generated_sql_is_select_only(fake_sf_connection):
     # Family 1: every data statement the adapter generates passes the
     # SELECT-only guard in the snowflake dialect (asserted at build time).
