@@ -37,9 +37,7 @@ def _mf_repo(tmp_path: Path) -> tuple[Path, Path]:
 
     db = tmp_path / "wh.duckdb"
     conn = duckdb.connect(str(db))
-    conn.execute(
-        "CREATE TABLE orders (id INTEGER, order_code INTEGER, status VARCHAR)"
-    )
+    conn.execute("CREATE TABLE orders (id INTEGER, order_code INTEGER, status VARCHAR)")
     conn.execute(
         "INSERT INTO orders VALUES (1, 101, 'open'), (2, 102, 'open'), "
         "(3, 103, 'closed')"
@@ -87,9 +85,7 @@ def _mf_repo(tmp_path: Path) -> tuple[Path, Path]:
                     {
                         "name": "orders",
                         "type": "simple",
-                        "type_params": {
-                            "input_measures": [{"name": "order_count"}]
-                        },
+                        "type_params": {"input_measures": [{"name": "order_count"}]},
                     }
                 ],
             }
@@ -176,10 +172,13 @@ def test_vendor_dbt_still_folds_metricflow_grain_and_metric_rank(
     )
     orders = _orders_map(mapped)
     assert orders["grain"] == ["order_code"]
-    assert any(
-        "back metric definitions" in n or "metric" in n.lower()
-        for n in _notes(mapped)
-    ) or orders.get("rank_score") is not None  # metric fold still ran
+    assert (
+        any(
+            "back metric definitions" in n or "metric" in n.lower()
+            for n in _notes(mapped)
+        )
+        or orders.get("rank_score") is not None
+    )  # metric fold still ran
 
     profiled = _run(
         [
@@ -199,9 +198,7 @@ def test_vendor_dbt_still_folds_metricflow_grain_and_metric_rank(
     assert any("declared primary entity" in n for n in hit.get("data_quality") or [])
 
 
-def test_ossie_vendor_drops_metricflow_grain_keeps_unique_test(
-    tmp_path: Path, capsys
-):
+def test_ossie_vendor_drops_metricflow_grain_keeps_unique_test(tmp_path: Path, capsys):
     """Acceptance for ossie: MF grain/metric gone; unique-test declaration stays."""
     from tests.ossie.conftest import dataset, document, field, model, write
 
