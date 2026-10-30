@@ -3,6 +3,8 @@ applied through `transform apply`, never written by reconcile itself."""
 
 from __future__ import annotations
 
+import pytest
+
 
 def _proposals_by_axis(payload: dict) -> dict[str, list[dict]]:
     grouped: dict[str, list[dict]] = {}
@@ -1145,3 +1147,39 @@ def test_a_declaration_spelled_in_another_case_is_still_the_column(maintain_repo
 
     assert payload["data"]["mechanical_count"] == 1
     assert "-      - name: STATUS" in _diff(payload, _STG_YML)["unified"]
+
+
+@pytest.mark.parametrize(
+    ("vendor", "command"),
+    [
+        ("dbt", "semantic update"),
+        (None, "semantic update"),
+        ("ossie", "semantic ossie update"),
+        ("slayer", "semantic slayer update"),
+        ("cube", "semantic cube update"),
+    ],
+)
+def test_dangling_reference_names_the_vendor_authoring_command(vendor, command):
+    """#974: name the vendor's own authoring command, not dbt's."""
+    from exmergo_dex_core.maintain.drift import DriftFinding
+    from exmergo_dex_core.maintain.reconcile import _advisory
+
+    finding = DriftFinding(
+        axis="semantic",
+        code="dangling_reference",
+        identifier="orders.revenue",
+        detail="metric references a measure that is gone",
+    )
+    action = _advisory(finding, semantic_vendor=vendor).action
+    assert f"`{command}`" in action
+    if command != "semantic update":
+        assert "`semantic update`" not in action
+    assert "restore the model/column it references" in action
+
+
+def test_semantic_update_command_helper():
+    from exmergo_dex_core.maintain.reconcile import _semantic_update_command
+
+    assert _semantic_update_command("dbt") == "semantic update"
+    assert _semantic_update_command("OSSIE") == "semantic ossie update"
+    assert _semantic_update_command(None) == "semantic update"

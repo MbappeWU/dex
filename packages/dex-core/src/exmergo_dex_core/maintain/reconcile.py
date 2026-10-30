@@ -72,6 +72,20 @@ _PATCHABLE = {"column_added", "column_dropped", "column_retyped", "nullability_c
 _MECHANICAL = {"column_added", "column_dropped", "nullability_changed"}
 
 
+def _semantic_update_command(vendor: str | None) -> str:
+    """Authoring command for the configured semantic vendor (#974).
+
+    MetricFlow/dbt keeps ``semantic update``. Ossie, SLayer and Cube each have
+    their own ``semantic <vendor> update`` route; naming the dbt command under
+    those vendors sends the operator to the wrong place.
+    """
+
+    name = (vendor or "dbt").lower()
+    if name == "dbt":
+        return "semantic update"
+    return f"semantic {name} update"
+
+
 def _placed(placement: PlacingProject | None, kind: EditKind, table: str) -> str | None:
     """Where an edit of ``kind`` for ``table`` goes, asking the format first.
 
@@ -130,6 +144,12 @@ def build(
     edits: list[PlanEdit] = []
     warnings: list[str] = []
 
+    semantic_vendor = (
+        snap.semantic_layer.vendor
+        if snap.semantic_layer is not None and snap.semantic_layer.vendor
+        else "dbt"
+    )
+
     schema_patches: dict[str, list[DriftFinding]] = {}
     definition_churn = False
     orphan_identifiers: list[str] = []
@@ -150,7 +170,7 @@ def build(
         else:
             if finding.code == "orphan_relation" and finding.identifier is not None:
                 orphan_identifiers.append(finding.identifier)
-            proposals.append(_advisory(finding))
+            proposals.append(_advisory(finding, semantic_vendor=semantic_vendor))
 
     declarations = DeclarationEdits(view, placement)
     for identifier, table_findings in sorted(schema_patches.items()):
@@ -159,7 +179,7 @@ def build(
         # rebuild anything: nothing dex writes carries a type, so a plan built for
         # one would propose the file it already has.
         proposals.extend(
-            _retype_advisory(finding)
+            _retype_advisory(finding, semantic_vendor=semantic_vendor)
             for finding in table_findings
             if finding.code not in _MECHANICAL
         )
@@ -302,7 +322,11 @@ def _run_operation_args(identifiers: list[str]) -> str:
     return f"{{relations: [{relations}], dry_run: false}}"
 
 
-def _advisory(finding: DriftFinding) -> Proposal:
+def _advisory(
+    finding: DriftFinding,
+    *,
+    semantic_vendor: str | None = None,
+) -> Proposal:
     if finding.code == "orphan_relation":
         operation_args = _run_operation_args(
             [finding.identifier] if finding.identifier else []
@@ -386,8 +410,9 @@ def _advisory(finding: DriftFinding) -> Proposal:
             "make the orphaned keys visible in builds"
         ),
         "dangling_reference": (
-            "update the semantic definition with `semantic update`, or restore "
-            "the model/column it references"
+            "update the semantic definition with `"
+            + _semantic_update_command(semantic_vendor)
+            + "`, or restore the model/column it references"
         ),
         "join_cardinality_exceeded": (
             "the semantic layer declares an arity this join does not have, so "
@@ -454,7 +479,11 @@ def _schema_advisory(identifier: str, finding: DriftFinding, reason: str) -> Pro
     )
 
 
-def _retype_advisory(finding: DriftFinding) -> Proposal:
+def _retype_advisory(
+    finding: DriftFinding,
+    *,
+    semantic_vendor: str | None = None,
+) -> Proposal:
     """A type change, surfaced rather than written.
 
     Nothing dex authors carries a type, and there is no type it could carry: the
@@ -465,7 +494,7 @@ def _retype_advisory(finding: DriftFinding) -> Proposal:
     """
 
     if finding.code != "column_retyped":
-        return _advisory(finding)
+        return _advisory(finding, semantic_vendor=semantic_vendor)
     before = finding.data.get("type_before", "?")
     after = finding.data.get("type_after", "?")
     return Proposal(
