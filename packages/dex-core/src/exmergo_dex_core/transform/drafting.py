@@ -780,6 +780,8 @@ class _Lineage:
                 f"the key of {self._display(driving)} ({base_evidence}) is not "
                 "selected unchanged"
             )
+        if base_evidence.endswith("carried through unchanged"):
+            return carried, base_evidence
         return carried, f"{base_evidence}, carried through unchanged"
 
     def relation_keys(
