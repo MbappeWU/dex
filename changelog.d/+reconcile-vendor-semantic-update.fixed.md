@@ -1,0 +1,1 @@
+**Reconcile dangling-reference advice names the configured vendor's authoring command.** Under Ossie, SLayer or Cube the advisory now points at `semantic <vendor> update` instead of MetricFlow's `semantic update`.
