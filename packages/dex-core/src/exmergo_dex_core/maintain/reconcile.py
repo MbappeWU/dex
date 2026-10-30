@@ -323,7 +323,8 @@ def _run_operation_args(identifiers: list[str]) -> str:
 
 
 def _advisory(
-    finding: DriftFinding, *,
+    finding: DriftFinding,
+    *,
     semantic_vendor: str | None = None,
 ) -> Proposal:
     if finding.code == "orphan_relation":
@@ -479,7 +480,8 @@ def _schema_advisory(identifier: str, finding: DriftFinding, reason: str) -> Pro
 
 
 def _retype_advisory(
-    finding: DriftFinding, *,
+    finding: DriftFinding,
+    *,
     semantic_vendor: str | None = None,
 ) -> Proposal:
     """A type change, surfaced rather than written.
