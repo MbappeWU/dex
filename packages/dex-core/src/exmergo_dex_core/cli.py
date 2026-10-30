@@ -1105,7 +1105,7 @@ def _build_parser() -> argparse.ArgumentParser:
                         dest="full_refresh",
                         action="store_true",
                         default=False,
-                        help="pass --full-refresh through to dbt (needed for seed column changes)",
+                        help="pass --full-refresh through to dbt build",
                     )
                     # Opt-in on every connector, free ones included. Verifying
                     # on DuckDB costs nothing, so defaulting it on there was
