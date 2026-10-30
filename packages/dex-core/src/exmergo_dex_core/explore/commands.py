@@ -3776,7 +3776,6 @@ _DECLARING_LAYER = {
 }
 
 
-
 def _drop_metricflow_under_native_vendor(
     engine: DexEngine, defs: dbt_project.ProjectDefinitions
 ) -> dbt_project.ProjectDefinitions:
